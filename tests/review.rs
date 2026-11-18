@@ -418,7 +418,7 @@ fn head_reviews_an_earlier_commit_of_the_pr() {
         &["--head", &fx.head],
         &with(
             claude_says(&envelope("later.txt").to_string()),
-            &[commits.clone()],
+            std::slice::from_ref(&commits),
         ),
     );
     assert_eq!(run.code, Some(2), "{run:?}");
@@ -432,7 +432,7 @@ fn head_reviews_an_earlier_commit_of_the_pr() {
         &["--head", &fx.head],
         &with(
             claude_says(&envelope("src/lib.rs").to_string()),
-            &[commits.clone()],
+            std::slice::from_ref(&commits),
         ),
     );
     assert_eq!(run.code, Some(0), "{run:?}");
@@ -2377,4 +2377,41 @@ fn the_default_gate_keeps_a_p2_at_confidence_0_6() {
     let fx = fixture();
     let run = fx.full(&["--gate", "conf>=0.8"], &scenario);
     assert_eq!(run.code, Some(0), "{run:?}");
+}
+
+/// `--head` reaches the Orca runner too: its worktree is made at the earlier head.
+#[test]
+fn orca_runner_reviews_the_head_given() {
+    let fx = fixture();
+    git(&fx.upstream, &["checkout", "-q", "--detach", &fx.head]);
+    fs::write(fx.upstream.join("later.txt"), "later\n").unwrap();
+    git(&fx.upstream, &["add", "."]);
+    git(&fx.upstream, &["commit", "-q", "-m", "later push"]);
+    let later = git(&fx.upstream, &["rev-parse", "HEAD"]);
+    git(&fx.upstream, &["update-ref", "refs/pull/7/head", &later]);
+    git(&fx.upstream, &["checkout", "-q", "main"]);
+    let mut pr = fx.pr();
+    pr["headRefOid"] = later.clone().into();
+    let run = fx.run_pr(
+        &pr,
+        &["--runner", "orca", "--head", &fx.head],
+        &[
+            ("ORCA_TERMINAL_HANDLE", "term_caller".to_string()),
+            ("FAKE_ORCA", "ok".into()),
+            ("FAKE_REPLY", envelope("src/lib.rs").to_string()),
+            ("FAKE_GH_COMMITS", format!("{}\n{later}", fx.head)),
+        ],
+    );
+    assert_eq!(run.code, Some(0), "{run:?}");
+    assert!(
+        run.log.contains(&format!("--base-branch {} ", fx.head)),
+        "{run:?}"
+    );
+    let meta: Value =
+        serde_json::from_str(&fs::read_to_string(fx.runroot().join("meta.json")).unwrap()).unwrap();
+    assert_eq!(
+        (meta["head"].as_str(), meta["runner"].as_str()),
+        (Some(fx.head.as_str()), Some("orca"))
+    );
+    fx.assert_orca_worktree_removed();
 }
