@@ -63,9 +63,9 @@ export type Run = {
   runner: Runner
   startedAt: number
   runDir: string | null
-  /** `dev:ino` of the run dir when the run named it: a later run for the same PR head replaces
-   * the dir, and the worker then stops reading it. */
-  runDirId?: string
+  /** The id rreview printed and wrote into the run dir's meta.json: a later run for the same PR
+   * head replaces the dir (same path, maybe the same inode), and the worker then stops reading it. */
+  runId?: string
   events: PassEvent[]
   /** Set when the run is done; the result itself comes from `review.result`. */
   summary: Summary | null

@@ -1,7 +1,7 @@
 // The worker against fake `gh` and `rreview` executables (test/fixtures/bin) first on PATH, over
 // a mock Orca host. Each fake logs its cwd and argv to $FAKE_LOG.
 import { assert, beforeEach, hostError, mockHost, mountWorker, test } from 'orca/testing'
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -309,9 +309,10 @@ test('a result read back after a worker restart comes from its own run dir only'
   const run = await ended(first)
   const again = await mountWorker(main, { host: host({ storage: { run } }) })
   assert.equal((await again.request('review.result'))?.ungated_findings.length, 2)
-  // Another run for the same head replaced the dir: its result is not this run's.
-  rmSync(run.runDir!, { recursive: true })
-  mkdirSync(run.runDir!)
+  // Another run for the same head replaced the dir: its result is not this run's. The dir keeps
+  // its inode, as Linux gives a dir made right after one removed.
+  for (const f of readdirSync(run.runDir!)) rmSync(join(run.runDir!, f), { recursive: true })
+  writeFileSync(join(run.runDir!, 'meta.json'), JSON.stringify({ run_id: 'foreign' }))
   writeFileSync(join(run.runDir!, 'result.json'), JSON.stringify({ ...RESULT, ungated_findings: [] }))
   const third = await mountWorker(main, { host: host({ storage: { run } }) })
   assert.equal(await third.request('review.result'), null)

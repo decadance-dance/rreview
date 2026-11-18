@@ -201,8 +201,18 @@ pub fn run(args: &Args) -> Result<u8> {
     }
     fs::create_dir_all(runroot.join("out")).with_context(|| format!("{}", runroot.display()))?;
     let runroot = fs::canonicalize(&runroot)?;
+    // The run's own id, also in meta.json: a later run that replaces this dir may get the same
+    // path and inode, so the Orca plugin compares this id before it trusts the dir's files.
+    let run_id = format!(
+        "{}-{}",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos()
+    );
     // Printed now, not only at the end: the Orca plugin tails progress.jsonl here during the run.
-    eprintln!("run dir: {}", runroot.display());
+    eprintln!("run id: {run_id}\nrun dir: {}", runroot.display());
     // The guard exists before the checkout: a failed one (a post-checkout hook) can leave a
     // registered, half-made worktree behind.
     let ran = |r: &str| panel.iter().any(|p| p.id == r) || args.only.is_none();
@@ -270,6 +280,7 @@ pub fn run(args: &Args) -> Result<u8> {
         .map(|(r, a)| (*r, a.to_string()))
         .collect();
     let meta = json!({
+        "run_id": run_id,
         "pr": { "number": pr.number, "title": pr.title, "url": pr.url, "repo": format!("{owner}/{name}"),
                 "head_ref": pr.head_ref_name, "base_ref": pr.base_ref_name },
         "base": base, "head": head, "runner": if args.orca { "orca" } else { "headless" }, "roles": roles,

@@ -3,8 +3,7 @@
 // exit code and its JSON on stdout, never from its human-readable text.
 import type { OrcaWorkerApi } from 'orca/worker'
 import { execFile, spawn } from 'node:child_process'
-import { statSync } from 'node:fs'
-import { open, stat, writeFile } from 'node:fs/promises'
+import { open, writeFile } from 'node:fs/promises'
 import { isAbsolute, join } from 'node:path'
 import { findingKey, type Finding, type PassEvent, type Pr, type Result, type Run, type Runner, type Target } from './protocol'
 
@@ -18,6 +17,8 @@ const STDOUT_CAP = 16 << 20
 const STDERR_KEEP = 16 << 10
 /** progress.jsonl holds a few lines per pass; a poll reads at most this much of it. */
 const PROGRESS_CAP = 256 << 10
+/** meta.json, read to check the run dir is still this run's. */
+const META_CAP = 64 << 10
 /** result.json read back after a worker restart. */
 const RESULT_FILE_CAP = STDOUT_CAP
 /** What `review.result` answers, well under Orca's 1 MiB answer and 512 KiB panel render limits. */
@@ -119,11 +120,6 @@ export function boundResult(r: Result): Result {
   return omitted ? { ...base, omitted } : base
 }
 
-/** `dev:ino` of a dir, which a replaced dir does not keep. */
-function dirId(dir: string, st = statSync(dir)): string {
-  return `${st.dev}:${st.ino}`
-}
-
 /** The complete lines of progress.jsonl as events; a line still being written is left for later. */
 export function parseProgress(text: string): PassEvent[] {
   const lines = text.split('\n').slice(0, -1)
@@ -190,11 +186,16 @@ export default function activate(orca: OrcaWorkerApi): void {
     run = run ?? stored
   })()
 
-  /** The run dir while it is still this run's, else null. */
-  async function ownDir(r: Run): Promise<string | null> {
-    if (!r.runDir || !r.runDirId) return null
-    const st = await stat(r.runDir).catch(() => null)
-    return st && dirId(r.runDir, st) === r.runDirId ? r.runDir : null
+  /** Whether the run dir is still this run's: its meta.json names the run id rreview printed. A
+   * file read before this check is this run's too, since a replaced dir never gets the id back. */
+  async function own(r: Run): Promise<boolean> {
+    if (!r.runDir || !r.runId) return false
+    const text = await readCapped(join(r.runDir, 'meta.json'), META_CAP)
+    try {
+      return JSON.parse(text ?? '').run_id === r.runId
+    } catch {
+      return false
+    }
   }
 
   /** The finished run's full result: in memory, or result.json in its own run dir. */
@@ -202,11 +203,10 @@ export default function activate(orca: OrcaWorkerApi): void {
     await loaded
     if (run?.status !== 'done') return null
     if (full) return full
-    const dir = await ownDir(run)
-    if (!dir) return null
-    const text = await readCapped(join(dir, 'result.json'), RESULT_FILE_CAP)
+    const text = run.runDir && (await readCapped(join(run.runDir, 'result.json'), RESULT_FILE_CAP))
+    if (!text || !(await own(run))) return null
     try {
-      full = text === null ? null : parseResult(text)
+      full = parseResult(text)
     } catch {
       full = null
     }
@@ -290,13 +290,10 @@ export default function activate(orca: OrcaWorkerApi): void {
         // Only a whole line: stderr is unbuffered, so the path may arrive in several chunks.
         const dir = /^run dir: (.+)\n/m.exec(stderr)?.[1]
         if (dir && isAbsolute(dir)) {
-          try {
-            r.runDirId = dirId(dir)
-            r.runDir = dir
-            publish(true)
-          } catch {
-            // The dir is already gone: there is no progress to follow.
-          }
+          // rreview prints its run id just before the run dir line.
+          r.runId = /^run id: (\S+)\n/m.exec(stderr)?.[1]
+          r.runDir = dir
+          publish(true)
         }
       }
     })
@@ -306,9 +303,8 @@ export default function activate(orca: OrcaWorkerApi): void {
       if (reading) return
       reading = true
       try {
-        const dir = await ownDir(r)
-        const text = dir && (await readCapped(join(dir, 'progress.jsonl'), PROGRESS_CAP))
-        const events = text ? parseProgress(text) : []
+        const text = r.runDir && (await readCapped(join(r.runDir, 'progress.jsonl'), PROGRESS_CAP))
+        const events = text && (await own(r)) ? parseProgress(text) : []
         if (events.length > r.events.length) {
           r.events = events
           publish()
@@ -363,7 +359,7 @@ export default function activate(orca: OrcaWorkerApi): void {
     if (!agent?.agent || (agent.sessionId ?? null) !== sessionId) {
       throw fail('agent_gone', 'the chosen agent no longer runs in the reviewed workspace; choose the author again')
     }
-    const dir = await ownDir(run)
+    const dir = (await own(run)) ? run.runDir : null
     if (!dir || !SAFE_LINE.test(dir)) throw fail('no_run_dir', `the run dir ${run.runDir} is gone or replaced`)
     // Reviewer text goes into a file; the terminal only gets a fixed line of safe characters, so
     // nothing untrusted is typed even if the agent has just exited to a shell.

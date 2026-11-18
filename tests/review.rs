@@ -288,6 +288,9 @@ fn claude_pass_end_to_end() {
     );
     let meta: Value =
         serde_json::from_str(&fs::read_to_string(runroot.join("meta.json")).unwrap()).unwrap();
+    let id = run.stderr.lines().find_map(|l| l.strip_prefix("run id: "));
+    assert_eq!(meta["run_id"].as_str(), id, "{run:?}");
+    assert!(id.is_some_and(|i| i.len() > 10), "{run:?}");
     assert_eq!(meta["pr"]["number"], 7);
     assert_eq!(meta["pr"]["repo"], "acme/widget");
     assert_eq!(

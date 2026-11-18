@@ -8,9 +8,10 @@ focused workspace's pull request, shows each pass while it runs, and lists the f
   panel, reviewed in that workspace's repository.
 - **Run review** starts `rreview <pr-url> --runner headless|orca --json` as a child process of the
   plugin's worker. One run at a time.
-- **Progress**: the worker learns the run dir from rreview's first `run dir:` line on stderr and
-  tails `<runroot>/progress.jsonl`, one row per pass: one bounded read at a time, and only while
-  the dir is still this run's (another rreview run for the same PR head replaces it).
+- **Progress**: the worker learns the run id and dir from rreview's first `run id:` and `run dir:`
+  lines on stderr and tails `<runroot>/progress.jsonl`, one row per pass: one bounded read at a
+  time, and only while the dir's `meta.json` names this run's id (another rreview run for the same
+  PR head replaces the dir, possibly with the same path and inode).
 - **Result**: from rreview's exit code and its JSON on stdout (`result.json`). Exit 2, a crash or
   output that is not a valid result shows as a failed review with rreview's `error:` lines and the
   run dir; a review where a panelist or the judge failed shows as degraded.

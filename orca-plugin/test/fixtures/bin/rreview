@@ -1,6 +1,6 @@
 #!/bin/sh
 # Fake `rreview` for the plugin's tests. Logs its cwd, argv and a GH_TOKEN to $FAKE_LOG, makes a run
-# dir under $FAKE_STATE, names it on stderr as rreview does, writes progress.jsonl, writes the result
+# dir under $FAKE_STATE with a meta.json, prints its run id and dir on stderr as rreview does, writes progress.jsonl, writes the result
 # ($FAKE_RESULT_FILE, else $FAKE_RESULT) to result.json and stdout, and plays FAKE_RREVIEW:
 #   ok (default)  three panelists and the coordinator complete; exits $FAKE_EXIT (1)
 #   degraded      as ok, but the security panelist failed
@@ -11,12 +11,15 @@
 #   split         as ok, in a run dir named `café-<pid>`, with the run dir line and stdout each
 #                 written in two parts split inside the é
 #   replaced      as ok, but 1.5 s after the panelists start another run replaces the run dir
-#                 with its own progress (role `foreign`)
+#                 with its own meta.json and progress (role `foreign`); the dir keeps its inode, as
+#                 Linux gives a dir made right after one removed
 printf 'rreview %s | %s\n' "$PWD" "$*" >> "${FAKE_LOG:-/dev/null}"
 [ -n "$GH_TOKEN" ] && echo "rreview token $GH_TOKEN" >> "${FAKE_LOG:-/dev/null}"
 dir="$FAKE_STATE/run-$$"
 [ "$FAKE_RREVIEW" = split ] && dir="$FAKE_STATE/café-$$"
 mkdir -p "$dir"
+echo "{\"run_id\":\"fake-$$\"}" > "$dir/meta.json"
+echo "run id: fake-$$" >&2
 case "$FAKE_RREVIEW" in
 slow) printf 'run dir: %s' "${dir%/*}" >&2; sleep 1; printf '/%s\n' "${dir##*/}" >&2 ;;
 split) printf 'run dir: %s/caf\303' "$FAKE_STATE" >&2; sleep 0.5; printf '\251-%s\n' "$$" >&2 ;;
@@ -27,7 +30,7 @@ ev() { printf '{"ts":%s000,"role":"%s","status":"%s","agent":"%s","model":"defau
 for r in intent_contracts reliability security; do ev $r started claude 0; done
 [ "$FAKE_RREVIEW" = slow ] && sleep 2
 if [ "$FAKE_RREVIEW" = replaced ]; then
-  sleep 1.5; rm -rf "$dir"; mkdir -p "$dir"
+  sleep 1.5; rm -rf "$dir"/*; echo '{"run_id":"foreign"}' > "$dir/meta.json"
   for r in foreign foreign foreign foreign foreign foreign foreign foreign; do ev $r started codex 0; done
   sleep 1.5
 fi
