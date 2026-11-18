@@ -516,7 +516,8 @@ impl<R: Runner> Ctx<'_, R> {
         if timeout.is_zero() {
             return Err(e);
         }
-        self.progress.event(pass, "retry", started, None)?;
+        self.progress
+            .event(pass, "retry", started, Some(&format!("{e:#}")))?;
         let raw = self
             .runner
             .wrap_up(pass, &format!("{RETRY}\n\nThe reason: {e:#}"), timeout)

@@ -1090,6 +1090,18 @@ fn an_invalid_reply_gets_one_retry_turn() {
         fx.statuses_of("intent_contracts"),
         ["started", "retry", "completed"]
     );
+    let retry = fx
+        .progress()
+        .into_iter()
+        .find(|e| e["status"] == "retry" && e["role"] == "coordinator")
+        .unwrap();
+    assert!(
+        retry["error"]
+            .as_str()
+            .unwrap()
+            .contains("no JSON object in the reply"),
+        "{retry}"
+    );
     // The retry resumes the session and says why.
     let coordinator = fx.prompt_of("coordinator");
     assert!(
