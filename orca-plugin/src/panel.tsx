@@ -30,20 +30,24 @@ import {
   type Tone,
   type TreeItem
 } from 'orca'
-import { findingKey, type Finding, type Run, type Runner, type Target } from './protocol'
+import { findingKey, type Finding, type Result, type Run, type Runner, type Target } from './protocol'
 
 const ROLES = ['intent_contracts', 'reliability', 'security', 'coordinator', 'judge']
 
 const target = atom<Target | null>(null)
 const loading = atom(true)
 const run = atom<Run | null>(null)
+/** The finished run's result, as `review.result` gives it. */
+const result = atom<Result | null>(null)
 const prArg = atom('prArg', '', { persist: 'workspace' })
 const runner = atom<Runner>('runner', 'headless', { persist: 'plugin' })
 const showAll = atom('showAll', false, { persist: 'plugin' })
 const selected = atom<string | null>(null)
 /** Keys of the findings "Send to author" types. */
 const picked = atom<string[]>([])
-const agents = atom<{ value: string; label: string }[]>([])
+/** Agents in the reviewed run's workspace; `session` is what `findings.send` checks. */
+const agents = atom<{ value: string; label: string; session: string | null }[]>([])
+/** The terminal the person chose; never picked for them. */
 const author = atom<string | null>(null)
 const notice = atom<{ tone: Tone; text: string } | null>(null)
 
@@ -61,24 +65,36 @@ async function loadTarget(): Promise<void> {
 }
 
 async function loadAgents(): Promise<void> {
+  const workspaceId = read(run)?.workspaceId
   try {
-    const list = await host.call('agents.list')
-    const options = list.agents.flatMap((a) =>
-      a.terminalId ? [{ value: a.terminalId, label: `${a.title ?? a.agent ?? 'agent'} (${a.state})` }] : []
+    const list = workspaceId ? (await host.call('agents.list', { workspaceId })).agents : []
+    const options = list.flatMap((a) =>
+      a.terminalId && a.agent
+        ? [{ value: a.terminalId, label: `${a.title ?? a.agent} (${a.state})`, session: a.sessionId ?? null }]
+        : []
     )
     set(agents, options)
-    if (!options.some((o) => o.value === read(author))) set(author, options[0]?.value ?? null)
   } catch {
     set(agents, [])
   }
+  if (!read(agents).some((o) => o.value === read(author))) set(author, null)
 }
 
-function showRun(r: Run | null): void {
+async function showRun(r: Run | null): Promise<void> {
   const was = read(run)
   set(run, r)
-  // A newly finished review starts with its gated findings picked.
-  if (r?.status === 'done' && r.result && (was?.status !== 'done' || was.startedAt !== r.startedAt)) {
-    set(picked, r.result.findings.map(findingKey))
+  const fresh = !was || !r || was.startedAt !== r.startedAt
+  if (fresh) {
+    set(result, null)
+    set(author, null)
+    void loadAgents()
+  }
+  // A newly finished review: fetch its result, with its gated findings picked.
+  if (r?.status === 'done' && (fresh || was?.status !== 'done')) {
+    const res = await plugin.request('review.result')
+    if (read(run)?.startedAt !== r.startedAt) return
+    set(result, res)
+    set(picked, res ? res.findings.map(findingKey) : [])
     set(selected, null)
   }
 }
@@ -97,20 +113,20 @@ async function startReview(): Promise<void> {
 async function sendToAuthor(): Promise<void> {
   const terminalId = read(author)
   if (!terminalId) return
+  const sessionId = read(agents).find((a) => a.value === terminalId)?.session ?? null
   try {
-    const { sent } = await plugin.request('findings.send', { terminalId, keys: read(picked) })
-    set(notice, { tone: 'success', text: `Sent ${sent} finding${sent === 1 ? '' : 's'} to the author.` })
+    const { sent, file } = await plugin.request('findings.send', { terminalId, sessionId, keys: read(picked) })
+    set(notice, { tone: 'success', text: `Sent ${sent} finding${sent === 1 ? '' : 's'} to the author (${file}).` })
   } catch (e) {
     set(notice, { tone: 'danger', text: errorText(e) })
   }
 }
 
 export function setup(ctx: PanelContext): void {
-  ctx.subscriptions.push(plugin.on('review.changed', showRun))
+  ctx.subscriptions.push(plugin.on('review.changed', (r) => void showRun(r)))
   let workspaceId: string | undefined
   ctx.subscriptions.push(
     on('workspace.changed', ({ context }) => {
-      void loadAgents()
       if (context?.workspaceId !== workspaceId) {
         workspaceId = context?.workspaceId
         void loadTarget()
@@ -120,7 +136,6 @@ export function setup(ctx: PanelContext): void {
   ctx.subscriptions.push(on('agent.status.changed', () => void loadAgents()))
   void plugin.request('review.get').then(showRun)
   void loadTarget()
-  void loadAgents()
 }
 
 // The directory tree with single-child folders folded together follows buildTree() in
@@ -250,7 +265,8 @@ function Controls() {
 }
 
 function Status({ r }: { r: Run }) {
-  const res = r.result
+  const res = read(result)
+  const sum = r.summary
   return (
     <Stack gap="sm">
       <Row gap="xs" align="center">
@@ -263,10 +279,10 @@ function Status({ r }: { r: Run }) {
           <Badge tone="danger">failed</Badge>
         ) : (
           <Badge tone={r.exitCode === 0 ? 'success' : 'warning'}>
-            {res && res.findings.length ? `${res.findings.length} gated` : 'no gated findings'}
+            {sum?.gated ? `${sum.gated} gated` : 'no gated findings'}
           </Badge>
         )}
-        {res?.degraded ? <Badge tone="warning">degraded</Badge> : null}
+        {sum?.degraded ? <Badge tone="warning">degraded</Badge> : null}
       </Row>
       <Table
         label="Passes"
@@ -302,8 +318,9 @@ function Status({ r }: { r: Run }) {
 }
 
 function Findings({ r }: { r: Run }) {
-  const res = r.result
-  if (!res) return null
+  const res = read(result)
+  if (r.status !== 'done') return null
+  if (!res) return <Text muted>The result is not available: its run dir is gone or was replaced by a later run.</Text>
   const list = read(showAll) ? res.ungated_findings : res.findings
   const items = fileTree(list)
   const sel = list.find((f) => findingKey(f) === read(selected))
@@ -314,6 +331,11 @@ function Findings({ r }: { r: Run }) {
         <Heading level={3}>Findings</Heading>
         <Switch label={`All ${res.ungated_findings.length}, below the gate too`} checked={read(showAll)} onChange={(v) => set(showAll, v)} />
       </Row>
+      {res.omitted ? (
+        <Text size="xs" muted>
+          {`${res.omitted} more findings are not shown here (Orca's message limits); see result.json in the run dir.`}
+        </Text>
+      ) : null}
       {list.length ? (
         <Tree
           label="Findings by file"
@@ -341,10 +363,10 @@ function Findings({ r }: { r: Run }) {
       ) : null}
       <Row gap="sm" align="center" wrap>
         <Select
-          label="Author agent"
-          placeholder="No agent in this workspace"
+          label="Author agent (in the reviewed workspace)"
+          placeholder={read(agents).length ? 'Choose the author agent' : 'No agent in the reviewed workspace'}
           value={read(author) ?? undefined}
-          options={read(agents)}
+          options={read(agents).map(({ value, label }) => ({ value, label }))}
           onChange={(v) => set(author, v)}
         />
         <Button icon="next" disabled={!keys.length || !read(author)} onPress={sendToAuthor}>

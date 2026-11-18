@@ -49,7 +49,12 @@ export type Result = {
   passes: Pass[]
   head: string
   degraded: boolean
+  /** Findings left out of what the panel got, to keep it within Orca's message limits. */
+  omitted?: number
 }
+
+/** A finished run's counts, small enough for every post and the plugin's storage. */
+export type Summary = { gated: number; all: number; degraded: boolean }
 
 export type Run = {
   status: 'running' | 'done' | 'failed'
@@ -58,8 +63,12 @@ export type Run = {
   runner: Runner
   startedAt: number
   runDir: string | null
+  /** `dev:ino` of the run dir when the run named it: a later run for the same PR head replaces
+   * the dir, and the worker then stops reading it. */
+  runDirId?: string
   events: PassEvent[]
-  result: Result | null
+  /** Set when the run is done; the result itself comes from `review.result`. */
+  summary: Summary | null
   /** rreview's exit code: 0 no gated findings, 1 gated findings, 2 failed. */
   exitCode: number | null
   error: string | null
@@ -73,8 +82,16 @@ declare module 'orca' {
     'review.start': { input: { workspaceId: string; pr?: string; runner: Runner }; output: Run }
     /** The current or last run. */
     'review.get': { output: Run | null }
-    /** Types the findings `keys` name (see findingKey) into an agent's terminal. */
-    'findings.send': { input: { terminalId: string; keys: string[] }; output: { sent: number } }
+    /** The finished run's result, bodies and length cut to Orca's limits (the full text stays in
+     * result.json); null when no finished run or its run dir is gone or replaced. */
+    'review.result': { output: Result | null }
+    /** Writes the findings `keys` name (see findingKey) to a file in the run dir and asks the
+     * agent in `terminalId` to read it. Refused unless that terminal still runs the agent session
+     * `sessionId` in the reviewed run's workspace. */
+    'findings.send': {
+      input: { terminalId: string; sessionId: string | null; keys: string[] }
+      output: { sent: number; file: string }
+    }
   }
   interface PluginPanelEvents {
     /** Posted to every open panel when the run changes. */

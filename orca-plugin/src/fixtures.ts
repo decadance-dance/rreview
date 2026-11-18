@@ -1,5 +1,5 @@
 // Runs and targets the panel's tests and `orca plugin check` scenarios share.
-import type { Finding, Run, Target } from './protocol'
+import type { Finding, Result, Run, Target } from './protocol'
 
 export const target: Target = {
   workspaceId: 'ws1',
@@ -21,7 +21,7 @@ const ev = (role: string, status: string, agent: string, duration_ms: number) =>
 const base = { pr: target.pr!, workspaceId: 'ws1', runner: 'orca' as const, startedAt: 1_700_000_000_000, runDir: '/state/rreview/acme/repo/11-abc' }
 
 export const running: Run = {
-  ...base, status: 'running', result: null, exitCode: null, error: null,
+  ...base, status: 'running', summary: null, exitCode: null, error: null,
   events: [
     ev('intent_contracts', 'started', 'codex', 0),
     ev('reliability', 'started', 'claude', 0),
@@ -33,6 +33,19 @@ export const running: Run = {
 const gated = [f('src/orca.rs', 120, 'Terminal leaks when close fails', 1, 0.9), f('src/review.rs', 40, 'Budget skips setup', 2, 0.85)]
 const below = [f('src/orca.rs', 300, 'Unclear error text', 3, 0.6)]
 
+export const doneResult: Result = {
+  findings: gated,
+  ungated_findings: [...gated, ...below],
+  overall_correctness: 'patch is incorrect',
+  overall_explanation: 'A failed close leaves a terminal open.',
+  passes: [
+    { role: 'security', agent: 'codex', status: 'failed', duration_ms: 40_000, error: 'no reply' },
+    { role: 'coordinator', agent: 'claude', status: 'completed', duration_ms: 120_000 }
+  ],
+  head: 'a'.repeat(40),
+  degraded: true
+}
+
 export const done: Run = {
   ...base, status: 'done', exitCode: 1, error: null,
   events: [
@@ -42,22 +55,11 @@ export const done: Run = {
     ev('coordinator', 'started', 'claude', 0),
     ev('coordinator', 'completed', 'claude', 120_000)
   ],
-  result: {
-    findings: gated,
-    ungated_findings: [...gated, ...below],
-    overall_correctness: 'patch is incorrect',
-    overall_explanation: 'A failed close leaves a terminal open.',
-    passes: [
-      { role: 'security', agent: 'codex', status: 'failed', duration_ms: 40_000, error: 'no reply' },
-      { role: 'coordinator', agent: 'claude', status: 'completed', duration_ms: 120_000 }
-    ],
-    head: 'a'.repeat(40),
-    degraded: true
-  }
+  summary: { gated: 2, all: 3, degraded: true }
 }
 
 export const failed: Run = {
-  ...base, status: 'failed', exitCode: 2, result: null,
+  ...base, status: 'failed', exitCode: 2, summary: null,
   error: 'error: coordinator: the reply is not JSON',
   events: [...done.events.slice(0, 7), ev('coordinator', 'failed', 'claude', 30_000)]
 }

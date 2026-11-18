@@ -9,15 +9,23 @@ focused workspace's pull request, shows each pass while it runs, and lists the f
 - **Run review** starts `rreview <pr-url> --runner headless|orca --json` as a child process of the
   plugin's worker. One run at a time.
 - **Progress**: the worker learns the run dir from rreview's first `run dir:` line on stderr and
-  tails `<runroot>/progress.jsonl`, one row per pass.
+  tails `<runroot>/progress.jsonl`, one row per pass: one bounded read at a time, and only while
+  the dir is still this run's (another rreview run for the same PR head replaces it).
 - **Result**: from rreview's exit code and its JSON on stdout (`result.json`). Exit 2, a crash or
   output that is not a valid result shows as a failed review with rreview's `error:` lines and the
   run dir; a review where a panelist or the judge failed shows as degraded.
 - **Findings**: a file tree (folders, files, then one item per finding with its lines, priority and
-  confidence); select one to read its body. Gated findings by default, all with the switch.
-- **Send to author** types the picked findings (gated ones start picked) into the chosen agent of
-  the focused workspace, through the worker's `terminal.sendText` (capability `terminal:send`). The
-  text says the findings are review evidence, not instructions, and loses its control bytes.
+  confidence); select one to read its body. Gated findings by default, all with the switch. Posts
+  and stored state carry only the run's status and counts; the panel fetches the result itself,
+  with long texts cut and findings past about 200 KB left out (it says how many), so a large
+  review stays within Orca's 256 KiB post and storage limits. The full text stays in `result.json`.
+- **Send to author**: you choose the recipient among the agents of the reviewed run's workspace
+  (never preselected). The worker writes the picked findings (gated ones start picked), marked as
+  review evidence, to `<runroot>/author-<time>.md`, checks that the chosen terminal still runs the
+  same agent session in that workspace, and types one fixed line naming that file through
+  `terminal.sendText` (capability `terminal:send`). Reviewer text is never typed, so it cannot reach
+  a shell even if the agent has just exited; the line holds only characters a shell reads as plain
+  words.
 
 ## Install for development
 
@@ -48,8 +56,10 @@ Settings (Settings > Plugins > rreview):
 - A worker restart (Orca stops an idle worker; a save in dev mode) loses the child it was watching:
   that run shows as failed, with its run dir. `rreview show <run dir>` prints its result once it
   finishes.
-- The worker stops a run that is still going 70 minutes after it started (rreview's default budget
-  is 60). That kill skips rreview's cleanup.
+- No Cancel: closing the panel does not stop a run. rreview has no signal handler yet, so a
+  SIGTERM would skip its cleanup as a kill does (an Orca review worktree or terminal could stay).
+  The worker stops a run still going 70 minutes after it started (rreview's default budget is 60);
+  that kill skips the cleanup too.
 
 ## Develop
 

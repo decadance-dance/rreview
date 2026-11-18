@@ -1,25 +1,36 @@
 #!/bin/sh
-# Fake `rreview` for the plugin's tests. Logs its cwd, argv and a GH_TOKEN to $FAKE_LOG, makes a run dir under
-# $FAKE_STATE, names it on stderr as rreview does, writes progress.jsonl and plays FAKE_RREVIEW:
-#   ok (default)  three panelists and the coordinator complete; prints $FAKE_RESULT, exits $FAKE_EXIT (1)
+# Fake `rreview` for the plugin's tests. Logs its cwd, argv and a GH_TOKEN to $FAKE_LOG, makes a run
+# dir under $FAKE_STATE, names it on stderr as rreview does, writes progress.jsonl, writes the result
+# ($FAKE_RESULT_FILE, else $FAKE_RESULT) to result.json and stdout, and plays FAKE_RREVIEW:
+#   ok (default)  three panelists and the coordinator complete; exits $FAKE_EXIT (1)
 #   degraded      as ok, but the security panelist failed
 #   fail          the coordinator fails: an `error:` line on stderr, exit 2
 #   garbage       exits 0 with no JSON on stdout
 #   slow          as ok, but names the run dir in two writes a second apart and pauses 2 s
 #                 once the panelists have started
+#   split         as ok, in a run dir named `café-<pid>`, with the run dir line and stdout each
+#                 written in two parts split inside the é
+#   replaced      as ok, but 1.5 s after the panelists start another run replaces the run dir
+#                 with its own progress (role `foreign`)
 printf 'rreview %s | %s\n' "$PWD" "$*" >> "${FAKE_LOG:-/dev/null}"
 [ -n "$GH_TOKEN" ] && echo "rreview token $GH_TOKEN" >> "${FAKE_LOG:-/dev/null}"
 dir="$FAKE_STATE/run-$$"
+[ "$FAKE_RREVIEW" = split ] && dir="$FAKE_STATE/café-$$"
 mkdir -p "$dir"
-if [ "$FAKE_RREVIEW" = slow ]; then # the run dir line in two writes, as an unbuffered stderr may
-  printf 'run dir: %s' "${dir%/*}" >&2; sleep 1; printf '/%s\n' "${dir##*/}" >&2
-else
-  echo "run dir: $dir" >&2
-fi
+case "$FAKE_RREVIEW" in
+slow) printf 'run dir: %s' "${dir%/*}" >&2; sleep 1; printf '/%s\n' "${dir##*/}" >&2 ;;
+split) printf 'run dir: %s/caf\303' "$FAKE_STATE" >&2; sleep 0.5; printf '\251-%s\n' "$$" >&2 ;;
+*) echo "run dir: $dir" >&2 ;;
+esac
 p="$dir/progress.jsonl"
 ev() { printf '{"ts":%s000,"role":"%s","status":"%s","agent":"%s","model":"default","duration_ms":%s%s}\n' "$(date +%s)" "$1" "$2" "$3" "$4" "$5" >> "$p"; }
 for r in intent_contracts reliability security; do ev $r started claude 0; done
 [ "$FAKE_RREVIEW" = slow ] && sleep 2
+if [ "$FAKE_RREVIEW" = replaced ]; then
+  sleep 1.5; rm -rf "$dir"; mkdir -p "$dir"
+  for r in foreign foreign foreign foreign foreign foreign foreign foreign; do ev $r started codex 0; done
+  sleep 1.5
+fi
 ev intent_contracts completed codex 1200
 ev reliability completed claude 1500
 if [ "$FAKE_RREVIEW" = degraded ]; then ev security failed codex 900 ',"error":"no reply"'; else ev security completed codex 900; fi
@@ -33,6 +44,12 @@ fail)
 garbage) echo "summary, not JSON"; exit 0 ;;
 esac
 ev coordinator completed claude 2000
-printf '%s\n' "$FAKE_RESULT"
+if [ -n "$FAKE_RESULT_FILE" ]; then cp "$FAKE_RESULT_FILE" "$dir/result.json"; else printf '%s\n' "$FAKE_RESULT" > "$dir/result.json"; fi
+if [ "$FAKE_RREVIEW" = split ]; then
+  n=$(grep -bo 'é' "$dir/result.json" | head -n 1 | cut -d: -f1)
+  head -c "$((n + 1))" "$dir/result.json"; sleep 0.5; tail -c "+$((n + 2))" "$dir/result.json"
+else
+  cat "$dir/result.json"
+fi
 echo "run dir: $dir" >&2
 exit "${FAKE_EXIT:-1}"
