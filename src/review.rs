@@ -87,6 +87,7 @@ pub fn run(args: &Args) -> Result<bool> {
             wt_path.display()
         );
     }
+    // limit: two runs for the same PR head at once share this dir; the later one wipes it.
     if runroot.exists() {
         fs::remove_dir_all(&runroot).with_context(|| format!("{}", runroot.display()))?;
     }
@@ -174,7 +175,7 @@ pub fn run(args: &Args) -> Result<bool> {
 
 /// One pass; a pass that times out gets one wrap-up turn (spec §4).
 fn run_pass(
-    runner: &Headless,
+    runner: &impl Runner,
     pass: &Pass,
     progress: &Progress,
     started: Instant,
