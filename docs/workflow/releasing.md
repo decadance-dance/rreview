@@ -64,7 +64,8 @@ git push -u origin release-1.2.0 && gh pr create --draft --base main --title "Re
 # maintainer:
 gh pr merge <pr> -R decadance-dance/rreview --merge
 git checkout main && git pull && git tag -a 1.2.0 --cleanup=verbatim -F "$NOTES" && git push origin 1.2.0   # the push publishes the Release
-gh pr create --base develop --head release-1.2.0 --title "Release 1.2.0 into develop" --body "Closes #<r>"   # then merge it
+gh pr create --base develop --head release-1.2.0 --title "Release 1.2.0 into develop" --body "Closes #<r>"
+gh pr merge <develop pr> -R decadance-dance/rreview --merge
 git push origin --delete release-1.2.0 && git branch -d release-1.2.0
 
 # urgently fix a release

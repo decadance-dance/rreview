@@ -21,7 +21,7 @@ Source: Vincent Driessen, "A successful Git branching model", https://nvie.com/p
 
 ### Don't
 - Don't commit to `main` by hand. Code reaches it only through a PR from `release-*` or `hotfix-*`.
-- Don't commit work directly on `develop`. It arrives through a PR from a `feature/*` branch.
+- Don't commit work directly on `develop`. It arrives through PRs: from `feature/*`, and back from `release-*` and `hotfix-*` after they reach `main`.
 - Don't push, rebase, reset, force-push or delete `main` or `develop`. GitHub offers no ruleset or branch protection for a private repo on the free plan, so nothing on GitHub stops it: these rules are the only guard.
 - Don't wait for an approving review: a sole maintainer cannot approve their own PR. The green `ci-ok` check and the cross-model review are the gate.
 
