@@ -756,7 +756,12 @@ fn output(cmd: &mut Command, deadline: Option<Instant>) -> Result<Output> {
     }
     let (stdout, stderr) = (read(child.stdout.take()), read(child.stderr.take()));
     loop {
-        if let Some(status) = child.try_wait()? {
+        // A descendant can hold the pipes after the leader exits, so the drain is under the
+        // deadline too: done only when the leader has exited and both pipes reached EOF.
+        if let Some(status) = child.try_wait()?
+            && stdout.is_finished()
+            && stderr.is_finished()
+        {
             return Ok(Output {
                 status,
                 stdout: stdout.join().unwrap_or_default(),

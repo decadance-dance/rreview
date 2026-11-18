@@ -1282,6 +1282,28 @@ fn the_budget_covers_preparation() {
     assert_dead(&fx, 1);
 }
 
+/// The budget also covers draining a preparation step's output: a gh that exits while its child
+/// still holds the pipes is stopped at the deadline, and the child is killed with it.
+#[test]
+fn the_budget_covers_draining_preparation_output() {
+    let fx = fixture();
+    let started = Instant::now();
+    let run = fx.full(
+        &["--budget", "1"],
+        &with(pipeline(), &[("FAKE_GH_LINGER", "5".into())]),
+    );
+    let took = started.elapsed();
+    assert_eq!(run.code, Some(2), "{run:?}");
+    assert!(took < Duration::from_millis(2500), "took {took:?}: {run:?}");
+    assert!(
+        run.stderr
+            .contains("the review's budget ran out while preparing (gh)"),
+        "{run:?}"
+    );
+    assert!(!fx.runroot().exists(), "{run:?}");
+    assert_dead(&fx, 1);
+}
+
 /// Each pass writes only into its own scratch dir; validated replies live in the host's out/
 /// (review finding 8). A later pass's writable dir holds no earlier pass's artifact.
 #[test]
