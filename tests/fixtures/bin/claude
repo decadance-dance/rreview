@@ -1,6 +1,7 @@
 #!/bin/sh
 # Fake `claude` for doctor tests. FAKE_CLAUDE: ok (default); no-safe-mode; leak (runs the
-# probe unsandboxed, as if the sandbox let everything through). Argv is appended to $FAKE_LOG.
+# probe unsandboxed, as if the sandbox let everything through); ignore (does not run the probe).
+# Argv is appended to $FAKE_LOG.
 echo "claude $*" >> "${FAKE_LOG:-/dev/null}"
 case "$1" in
 --version) echo "9.9.9 (Claude Code)"; exit 0 ;;
@@ -12,6 +13,7 @@ auth) echo '{"loggedIn": true, "authMethod": "fake"}'; exit 0 ;;
 esac
 # A reviewer pass: the prompt on stdin names the probe script, whose dir holds out/.
 probe=$(grep -o "/[^']*/probe\.sh")
+[ "$FAKE_CLAUDE" = ignore ] && { echo '{"type": "result", "result": "no"}'; exit 0; }
 out=$(dirname "$probe")/out
 if [ "$FAKE_CLAUDE" = leak ]; then
   sh "$probe" > /dev/null 2>&1

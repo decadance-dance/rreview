@@ -153,3 +153,20 @@ fn fails_when_codex_loads_the_user_agents_md() {
         run.stdout
     );
 }
+
+#[test]
+fn fails_when_the_agents_skip_the_probe_instead_of_passing_vacuously() {
+    let run = doctor(ALL, &[("FAKE_CLAUDE", "ignore"), ("FAKE_CODEX", "ignore")]);
+    assert!(!run.passed);
+    for line in [
+        "FAIL  claude self-test: the probe did not run in Claude's sandbox",
+        "FAIL  codex sandbox: write into the worktree: Codex did not run the probe",
+        "FAIL  codex: user AGENTS.md: control failed",
+    ] {
+        assert!(
+            run.stdout.contains(line),
+            "missing {line:?} in\n{}",
+            run.stdout
+        );
+    }
+}

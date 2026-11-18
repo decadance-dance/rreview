@@ -80,7 +80,13 @@ impl Report {
 
     /// Prints `<bin> --version`; a missing optional tool is a warning.
     fn tool(&mut self, bin: &str, required: bool) -> bool {
-        let version = output(bin, &["--version"]).map(|o| first_line(&o.stdout));
+        let version = output(bin, &["--version"]).and_then(|o| match o.status.success() {
+            true => Ok(first_line(&o.stdout)),
+            false => Err(format!(
+                "`{bin} --version` failed: {}",
+                first_line(&o.stderr)
+            )),
+        });
         match version {
             Err(reason) if !required => {
                 println!("warn  {bin}: {reason} (optional)");
@@ -344,6 +350,7 @@ fn codex_self_test(fx: &Fixture) -> Vec<Check> {
 /// if any. Its `HOME` is a stand-in whose `.codex/AGENTS.md` names a canary, so the user's
 /// real `~/.codex` is never touched; a control run with a canary in its own `CODEX_HOME`
 /// must report it, or the AGENTS.md check proves nothing.
+// limit: assumes Codex finds `~` through `$HOME`; one reading the passwd home would slip past.
 fn codex_probe(fx: &Fixture) -> Result<Vec<Check>> {
     let auth = launch::user_codex_auth()?;
     let leak = fx.wt.join("rreview-probe-codex.txt");
