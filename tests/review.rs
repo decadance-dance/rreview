@@ -737,9 +737,10 @@ fn the_largest_timeout_does_not_overflow() {
     assert_eq!(fx.statuses(), ["started", "completed"]);
 }
 
-/// The reviewer may write into out/; a symlink it plants there must be replaced, not followed.
+/// A symlink the reviewer plants in the one dir it may write (its scratch out/) is never
+/// followed: the host publishes into its own out/.
 #[test]
-fn a_planted_out_symlink_is_replaced_not_followed() {
+fn a_planted_out_symlink_is_not_followed() {
     let fx = fixture();
     let victim = fx.root.join("log.victim");
     fs::write(&victim, "victim\n").unwrap();
@@ -753,6 +754,8 @@ fn a_planted_out_symlink_is_replaced_not_followed() {
     );
     assert_eq!(run.code, Some(0), "{run:?}");
     assert_eq!(fs::read_to_string(&victim).unwrap(), "victim\n");
+    let planted = fx.runroot().join("scratch/reliability/out/reliability.json");
+    assert!(fs::symlink_metadata(&planted).unwrap().file_type().is_symlink());
     let out = fx.runroot().join("out/reliability.json");
     assert!(fs::symlink_metadata(&out).unwrap().file_type().is_file());
     assert_eq!(fx.out(), Some(env));
