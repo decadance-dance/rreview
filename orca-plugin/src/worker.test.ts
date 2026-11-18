@@ -1,7 +1,7 @@
 // The worker against fake `gh` and `rreview` executables (test/fixtures/bin) first on PATH, over
 // a mock Orca host. Each fake logs its cwd and argv to $FAKE_LOG.
 import { assert, beforeEach, mockHost, mountWorker, test } from 'orca/testing'
-import { mkdtempSync, readFileSync, realpathSync } from 'node:fs'
+import { existsSync, mkdtempSync, readFileSync, realpathSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -178,15 +178,25 @@ test('the GitHub account setting gives gh and rreview its token, and only them',
 test('one run at a time', async () => {
   process.env.FAKE_RREVIEW = 'slow'
   const worker = await mountWorker(main, { host: host() })
-  await worker.request('review.start', { workspaceId: 'ws1', runner: 'headless' })
-  await assert.rejects(worker.request('review.start', { workspaceId: 'ws1', runner: 'headless' }), /still running/)
+  // Two presses before the first answer: one run.
+  const [a, b] = await Promise.allSettled([
+    worker.request('review.start', { workspaceId: 'ws1', runner: 'headless' }),
+    worker.request('review.start', { workspaceId: 'ws1', runner: 'headless' })
+  ])
+  assert.equal(a.status, 'fulfilled')
+  assert.equal(b.status, 'rejected')
+  assert.match(String((b as PromiseRejectedResult).reason), /still starting or running/)
+  await assert.rejects(worker.request('review.start', { workspaceId: 'ws1', runner: 'headless' }), /still starting or running/)
   // The panelists' start shows before the run ends.
   for (let i = 0; i < 100 && !(worker.posts.at(-1)?.payload as Run).events.length; i++) {
     await new Promise((r) => setTimeout(r, 20))
   }
   assert.equal((worker.posts.at(-1)?.payload as Run).status, 'running')
   assert.equal((worker.posts.at(-1)?.payload as Run).events.length, 3)
-  assert.equal((await ended(worker)).status, 'done')
+  const run = await ended(worker)
+  assert.equal(run.status, 'done')
+  assert.ok(run.runDir && existsSync(join(run.runDir, 'progress.jsonl')), `the whole run dir: ${run.runDir}`)
+  assert.equal(log().match(/^rreview \//gm)?.length, 1)
 })
 
 test('a run the worker lost on restart is reported failed, not running', async () => {

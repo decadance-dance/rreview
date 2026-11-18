@@ -164,10 +164,22 @@ export default function activate(orca: OrcaWorkerApi): void {
     return run
   })
 
+  // Set before the first await, so a second start during the lookups is refused too.
+  let starting = false
+
   orca.panels.handle('review.start', async ({ workspaceId, pr, runner }) => {
     await loaded
-    if (run?.status === 'running') throw fail('busy', `a review of PR #${run.pr.number} is still running`)
+    if (starting || run?.status === 'running') throw fail('busy', 'a review is still starting or running')
     if (runner !== 'headless' && runner !== 'orca') throw fail('invalid_runner', `unknown runner ${runner}`)
+    starting = true
+    try {
+      return await begin(workspaceId, runner, pr)
+    } finally {
+      starting = false
+    }
+  })
+
+  async function begin(workspaceId: string, runner: Runner, pr?: string): Promise<Run> {
     // The worker resolves the workspace's path and PR itself rather than trusting the panel's.
     const t = await target(workspaceId, pr)
     if (!t?.pr) throw fail('no_pr', t?.error ?? 'no focused workspace')
@@ -181,7 +193,7 @@ export default function activate(orca: OrcaWorkerApi): void {
     start(current, bin, t.path, env)
     publish(true)
     return current
-  })
+  }
 
   function start(r: Run, bin: string, cwd: string, env: NodeJS.ProcessEnv): void {
     const child = spawn(bin, [r.pr.url, '--runner', r.runner, '--json'], { cwd, env, stdio: ['ignore', 'pipe', 'pipe'] })
@@ -194,7 +206,8 @@ export default function activate(orca: OrcaWorkerApi): void {
     child.stderr.on('data', (d: Buffer) => {
       stderr = (stderr + d.toString()).slice(-STDERR_KEEP)
       if (!r.runDir) {
-        const dir = /^run dir: (.+)$/m.exec(stderr)?.[1]
+        // Only a whole line: stderr is unbuffered, so the path may arrive in several chunks.
+        const dir = /^run dir: (.+)\n/m.exec(stderr)?.[1]
         if (dir && isAbsolute(dir)) {
           r.runDir = dir
           publish(true)
