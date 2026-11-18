@@ -3,6 +3,7 @@
 //! 0c13293, Apache-2.0, Copyright Block, Inc.; modified: pass durations in milliseconds and the
 //! pass's agent instead of a Goose provider), and the human summary.
 
+use std::cmp::Reverse;
 use std::fmt::Write;
 
 use serde::{Deserialize, Serialize};
@@ -91,10 +92,11 @@ impl std::str::FromStr for Gate {
     }
 }
 
-/// Merges findings at the same place with the same title (case and spacing ignored), keeping
-/// the most urgent priority and the first one's other fields. Order is kept.
-pub fn dedupe(findings: Vec<Finding>) -> Vec<Finding> {
-    let mut out: Vec<Finding> = vec![];
+/// Merges findings at the same place with the same title (case and spacing ignored). The
+/// whole finding that ranks highest wins: one that clears `gate` over one that does not, then
+/// the most urgent priority, then the highest confidence, then the first. The merged finding
+/// covers every duplicate's candidates. Order is kept.
+pub fn dedupe(findings: Vec<Finding>, gate: Gate) -> Vec<Finding> {
     let key = |f: &Finding| {
         (
             f.file.clone(),
@@ -106,9 +108,22 @@ pub fn dedupe(findings: Vec<Finding>) -> Vec<Finding> {
                 .to_lowercase(),
         )
     };
+    let rank = |f: &Finding| (gate.keep(f), Reverse(f.priority), f.confidence_score);
+    let mut out: Vec<Finding> = vec![];
     for f in findings {
         match out.iter_mut().find(|o| key(o) == key(&f)) {
-            Some(o) => o.priority = o.priority.min(f.priority),
+            Some(o) => {
+                let mut ids = std::mem::take(&mut o.candidate_ids);
+                if rank(&f) > rank(o) {
+                    *o = f.clone();
+                }
+                ids.extend(f.candidate_ids);
+                ids.retain({
+                    let mut seen = std::collections::BTreeSet::new();
+                    move |id| seen.insert(id.clone())
+                });
+                o.candidate_ids = ids;
+            }
             None => out.push(f),
         }
     }
@@ -171,6 +186,7 @@ mod tests {
             priority,
             confidence_score: confidence,
             stage: "coordinator".into(),
+            candidate_ids: vec![format!("c-{line}-{priority}")],
         }
     }
 
@@ -191,17 +207,66 @@ mod tests {
     }
 
     #[test]
-    fn dedupe_merges_same_place_and_title_keeping_the_most_urgent() {
-        let out = dedupe(vec![
-            f("Fix  It", 1, 2, 0.9),
-            f("other", 1, 3, 0.9),
-            f("fix it", 1, 1, 0.5),
-            f("fix it", 2, 3, 0.9),
-        ]);
+    fn dedupe_merges_same_place_and_title() {
+        let out = dedupe(
+            vec![
+                f("Fix  It", 1, 2, 0.9),
+                f("other", 1, 3, 0.9),
+                f("fix it", 1, 1, 0.9),
+                f("fix it", 2, 3, 0.9),
+            ],
+            Gate::DEFAULT,
+        );
         let got: Vec<_> = out
             .iter()
-            .map(|f| (f.title.as_str(), f.start_line, f.priority))
+            .map(|f| {
+                (
+                    f.title.as_str(),
+                    f.start_line,
+                    f.priority,
+                    f.candidate_ids.join(","),
+                )
+            })
             .collect();
-        assert_eq!(got, [("Fix  It", 1, 1), ("other", 1, 3), ("fix it", 2, 3)]);
+        assert_eq!(
+            got,
+            [
+                ("fix it", 1, 1, "c-1-2,c-1-1".to_string()),
+                ("other", 1, 3, "c-1-3".into()),
+                ("fix it", 2, 3, "c-2-3".into())
+            ]
+        );
+    }
+
+    /// Only one duplicate clears the gate: that whole finding wins, so the merge never mixes
+    /// one's priority with the other's confidence.
+    #[test]
+    fn the_duplicate_that_clears_the_gate_wins() {
+        for findings in [
+            vec![f("t", 1, 2, 0.70), f("t", 1, 1, 0.95)],
+            vec![f("t", 1, 1, 0.95), f("t", 1, 2, 0.70)],
+            // The more urgent one misses the gate; the other clears it.
+            vec![f("t", 1, 1, 0.70), f("t", 1, 2, 0.95)],
+        ] {
+            let want = findings
+                .iter()
+                .find(|f| Gate::DEFAULT.keep(f))
+                .unwrap()
+                .clone();
+            let out = dedupe(findings, Gate::DEFAULT);
+            assert_eq!(out.len(), 1);
+            assert!(Gate::DEFAULT.keep(&out[0]), "{out:?}");
+            assert_eq!(
+                (out[0].priority, out[0].confidence_score),
+                (want.priority, want.confidence_score)
+            );
+            assert_eq!(out[0].candidate_ids.len(), 2);
+        }
+        // Neither clears it: the most urgent, then the most confident.
+        let out = dedupe(
+            vec![f("t", 1, 3, 0.9), f("t", 1, 2, 0.5), f("t", 1, 2, 0.6)],
+            Gate::DEFAULT,
+        );
+        assert_eq!((out[0].priority, out[0].confidence_score), (2, 0.6));
     }
 }

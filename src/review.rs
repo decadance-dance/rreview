@@ -4,16 +4,18 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, OpenOptions};
-use std::io::Write;
+use std::io::{Read, Write};
+use std::os::unix::process::CommandExt;
 use std::path::{Component, Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::{Command, Output, Stdio};
+use std::thread::JoinHandle;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, anyhow, bail};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
-use crate::coordinator::{self, PanelResult, Scope};
+use crate::coordinator::{self, PanelCandidate, PanelResult, Scope, Tagged};
 use crate::launch;
 use crate::panelist::{self, PrText, ROLES, Role};
 use crate::result::{self, Gate, PassReport, ReviewResult};
@@ -146,7 +148,8 @@ pub fn run(args: &Args) -> Result<u8> {
     // None: a budget too large for the clock is no limit.
     let deadline = Instant::now().checked_add(args.budget);
 
-    let pr = view_pr(&args.pr, args.repo.as_deref())?;
+    // The budget covers preparation too: gh, a fetch or a checkout hook can stall.
+    let pr = view_pr(&args.pr, args.repo.as_deref(), deadline)?;
     let (owner, name) = owner_and_name(&pr.url)?;
     let head = commit(&pr.head_ref_oid, "headRefOid")?;
     // A merged PR's base branch now contains its head; its diff is against the base before the merge.
@@ -154,14 +157,15 @@ pub fn run(args: &Args) -> Result<u8> {
         ("MERGED", Some(m)) => format!("{}^1", commit(&m.oid, "mergeCommit")?),
         _ => commit(&pr.base_ref_oid, "baseRefOid")?.to_string(),
     };
-    ensure_commits(&pr, &[head, &base_tip])?;
-    let base = git(&["merge-base", &base_tip, head])?;
+    ensure_commits(&pr, &[head, &base_tip], deadline)?;
+    let base = git(&["merge-base", &base_tip, head], deadline)?;
     // Raw bytes: names may start or end with spaces. A non-UTF-8 name cannot be named in JSON.
-    let diff_files: BTreeSet<String> = git_raw(&["diff", "--name-only", "-z", &base, head])?
-        .split(|b| *b == 0)
-        .filter_map(|f| String::from_utf8(f.to_vec()).ok())
-        .filter(|f| !f.is_empty())
-        .collect();
+    let diff_files: BTreeSet<String> =
+        git_raw(&["diff", "--name-only", "-z", &base, head], deadline)?
+            .split(|b| *b == 0)
+            .filter_map(|f| String::from_utf8(f.to_vec()).ok())
+            .filter(|f| !f.is_empty())
+            .collect();
 
     let runroot = state_home()?
         .join("rreview")
@@ -187,14 +191,17 @@ pub fn run(args: &Args) -> Result<u8> {
         path: runroot.join("wt"),
         keep: false,
     };
-    git(&[
-        "worktree",
-        "add",
-        "--quiet",
-        "--detach",
-        launch::utf8(&wt.path)?,
-        head,
-    ])
+    git(
+        &[
+            "worktree",
+            "add",
+            "--quiet",
+            "--detach",
+            launch::utf8(&wt.path)?,
+            head,
+        ],
+        deadline,
+    )
     .context("cannot create the review worktree")?;
     wt.keep = args.keep_worktree;
 
@@ -209,7 +216,7 @@ pub fn run(args: &Args) -> Result<u8> {
         "pr": { "number": pr.number, "title": pr.title, "url": pr.url, "repo": format!("{owner}/{name}"),
                 "head_ref": pr.head_ref_name, "base_ref": pr.base_ref_name },
         "base": base, "head": head, "runner": "headless", "roles": roles,
-        "versions": { "claude": version("claude"), "codex": version("codex") },
+        "versions": { "claude": version("claude", deadline), "codex": version("codex", deadline) },
     });
     fs::write(
         runroot.join("meta.json"),
@@ -217,7 +224,11 @@ pub fn run(args: &Args) -> Result<u8> {
     )?;
 
     let runner = Headless {
-        git_common_dir: git(&["rev-parse", "--path-format=absolute", "--git-common-dir"])?.into(),
+        git_common_dir: git(
+            &["rev-parse", "--path-format=absolute", "--git-common-dir"],
+            deadline,
+        )?
+        .into(),
         worktree: wt.path.clone(),
         runroot: runroot.clone(),
         codex_auth: launch::user_codex_auth()?,
@@ -255,12 +266,29 @@ pub fn run(args: &Args) -> Result<u8> {
             .map(|t| t.join().map_err(|_| anyhow!("a panel thread panicked")))
             .collect::<Result<Vec<_>>>()
     })?;
+    // Every candidate gets a stable id, `<role>-<n>`, which the coordinator accounts for.
+    let ids: Vec<Vec<String>> = panel
+        .iter()
+        .zip(&outcomes)
+        .map(|(role, (_, outcome))| match outcome {
+            Ok(env) => (1..=env.candidates.len())
+                .map(|n| format!("{}-{n}", role.id))
+                .collect(),
+            Err(_) => vec![],
+        })
+        .collect();
     let mut results = vec![];
-    let mut candidates = 0;
-    for (role, (report, outcome)) in panel.iter().zip(&outcomes) {
+    let mut candidates = vec![];
+    for ((role, (report, outcome)), ids) in panel.iter().zip(&outcomes).zip(&ids) {
         match outcome {
             Ok(env) => {
-                candidates += env.candidates.len();
+                for (id, c) in ids.iter().zip(&env.candidates) {
+                    candidates.push(PanelCandidate {
+                        id: id.clone(),
+                        panelist: role.name,
+                        candidate: c,
+                    });
+                }
                 eprintln!(
                     "{} ({}): {} candidates",
                     role.id,
@@ -278,7 +306,13 @@ pub fn run(args: &Args) -> Result<u8> {
             } else {
                 "failed"
             },
-            result: outcome.as_ref().ok(),
+            coverage_summary: outcome.as_ref().ok().map(|e| e.coverage_summary.as_str()),
+            candidates: outcome.as_ref().ok().map(|env| {
+                ids.iter()
+                    .zip(&env.candidates)
+                    .map(|(id, candidate)| Tagged { id, candidate })
+                    .collect()
+            }),
             error: outcome.as_ref().err().map(|e| format!("{e:#}")),
         });
     }
@@ -297,7 +331,7 @@ pub fn run(args: &Args) -> Result<u8> {
     let roster: Vec<_> = panel.iter().map(|r| r.name).collect();
     let prompt = coordinator::coordinator_prompt(&roster, &base, head, &pr_text, &results)?;
     let (report, review) = ctx.review_pass("coordinator", prompt, |raw| {
-        coordinator::parse_review(raw, &scope, candidates)
+        coordinator::parse_review(raw, &scope, &candidates)
     });
     let mut passes: Vec<PassReport> = outcomes
         .into_iter()
@@ -318,8 +352,9 @@ pub fn run(args: &Args) -> Result<u8> {
     if !review.dropped_candidates.is_empty() {
         let prompt =
             coordinator::judge_prompt(&base, head, &review.findings, &review.dropped_candidates)?;
-        let (report, restored) =
-            ctx.review_pass("judge", prompt, |raw| coordinator::parse_judge(raw, &scope));
+        let (report, restored) = ctx.review_pass("judge", prompt, |raw| {
+            coordinator::parse_judge(raw, &scope, &review.dropped_candidates)
+        });
         passes.push(report);
         match restored {
             Ok(restored) => findings.extend(restored),
@@ -331,7 +366,7 @@ pub fn run(args: &Args) -> Result<u8> {
     }
     drop(wt);
 
-    let ungated = result::dedupe(findings);
+    let ungated = result::dedupe(findings, args.gate);
     let result = ReviewResult {
         findings: ungated
             .iter()
@@ -371,7 +406,7 @@ pub fn show(target: &str, repo: Option<&str>, json: bool) -> Result<u8> {
 }
 
 fn latest_result(pr: &str, repo: Option<&str>) -> Result<PathBuf> {
-    let pr = view_pr(pr, repo)?;
+    let pr = view_pr(pr, repo, None)?;
     let (owner, name) = owner_and_name(&pr.url)?;
     let dir = state_home()?.join("rreview").join(owner).join(name);
     let prefix = format!("{}-", pr.number);
@@ -450,19 +485,14 @@ impl<R: Runner> Ctx<'_, R> {
             }
             self.progress.event(&pass, "started", started, None)?;
             let value = self.turns(&pass, &parse, started)?;
-            // The reviewer can write into out/ (a symlink, say); a rename from the run root,
-            // which it cannot write, replaces whatever stands there without following it.
-            let tmp = self.runroot.join(format!(".{role}.json.tmp"));
-            fs::write(&tmp, serde_json::to_string_pretty(&value)?)?;
-            fs::rename(&tmp, &out).with_context(|| format!("{}", out.display()))?;
+            // out/ is the host's: no reviewer can write there (reviewers write only into their
+            // own `scratch/<role>/`).
+            fs::write(&out, serde_json::to_string_pretty(&value)?)
+                .with_context(|| format!("{}", out.display()))?;
             Ok(value)
         })()
         .with_context(|| format!("pass {role} ({agent})"));
         let error = result.as_ref().err().map(|e| format!("{e:#}"));
-        if error.is_some() {
-            // The reviewer may write into out/; only a validated reply may stand there.
-            let _ = fs::remove_file(&out);
-        }
         let status = if error.is_some() {
             "failed"
         } else {
@@ -544,7 +574,7 @@ impl Drop for Worktree {
             return;
         }
         let removed =
-            launch::utf8(&self.path).and_then(|p| git(&["worktree", "remove", "--force", p]));
+            launch::utf8(&self.path).and_then(|p| git(&["worktree", "remove", "--force", p], None));
         // Not registered (a checkout that failed early): only a directory may be left.
         if let Err(e) = removed
             && self.path.exists()
@@ -580,7 +610,7 @@ impl Progress {
     }
 }
 
-fn view_pr(pr: &str, repo: Option<&str>) -> Result<Pr> {
+fn view_pr(pr: &str, repo: Option<&str>, deadline: Option<Instant>) -> Result<Pr> {
     let mut cmd = Command::new("gh");
     cmd.args(["pr", "view", pr, "--json"]).arg(
         "number,title,body,url,headRefName,baseRefName,headRefOid,baseRefOid,state,mergeCommit",
@@ -588,7 +618,7 @@ fn view_pr(pr: &str, repo: Option<&str>) -> Result<Pr> {
     if let Some(repo) = repo {
         cmd.args(["--repo", repo]);
     }
-    let out = cmd.stdin(Stdio::null()).output().context("cannot run gh")?;
+    let out = output(&mut cmd, deadline).context("cannot run gh")?;
     if !out.status.success() {
         bail!(
             "gh pr view {pr}: {}",
@@ -631,19 +661,23 @@ fn commit<'a>(oid: &'a str, field: &str) -> Result<&'a str> {
 }
 
 /// Fetches the PR head and its base branch from the PR's repository when a commit is missing.
-fn ensure_commits(pr: &Pr, revs: &[&str]) -> Result<()> {
-    let missing = |rev: &str| git(&["cat-file", "-e", &format!("{rev}^{{commit}}")]).is_err();
+fn ensure_commits(pr: &Pr, revs: &[&str], deadline: Option<Instant>) -> Result<()> {
+    let missing =
+        |rev: &str| git(&["cat-file", "-e", &format!("{rev}^{{commit}}")], deadline).is_err();
     if !revs.iter().any(|r| missing(r)) {
         return Ok(());
     }
-    git(&[
-        "fetch",
-        "--quiet",
-        "--no-tags",
-        repo_url(&pr.url)?,
-        &format!("refs/pull/{}/head", pr.number),
-        &format!("refs/heads/{}", pr.base_ref_name),
-    ])
+    git(
+        &[
+            "fetch",
+            "--quiet",
+            "--no-tags",
+            repo_url(&pr.url)?,
+            &format!("refs/pull/{}/head", pr.number),
+            &format!("refs/heads/{}", pr.base_ref_name),
+        ],
+        deadline,
+    )
     .context("cannot fetch the PR")?;
     match revs.iter().find(|r| missing(r)) {
         Some(rev) => bail!(
@@ -663,12 +697,8 @@ fn state_home() -> Result<PathBuf> {
     }
 }
 
-fn version(bin: &str) -> Option<String> {
-    let out = Command::new(bin)
-        .arg("--version")
-        .stdin(Stdio::null())
-        .output()
-        .ok()?;
+fn version(bin: &str, deadline: Option<Instant>) -> Option<String> {
+    let out = output(Command::new(bin).arg("--version"), deadline).ok()?;
     let v = String::from_utf8_lossy(&out.stdout)
         .lines()
         .next()?
@@ -677,18 +707,16 @@ fn version(bin: &str) -> Option<String> {
     (out.status.success() && !v.is_empty()).then_some(v)
 }
 
-/// Git in the current repository.
-fn git(args: &[&str]) -> Result<String> {
-    Ok(String::from_utf8_lossy(&git_raw(args)?).trim().into())
+/// Git in the current repository, stopped at `deadline`.
+fn git(args: &[&str], deadline: Option<Instant>) -> Result<String> {
+    Ok(String::from_utf8_lossy(&git_raw(args, deadline)?)
+        .trim()
+        .into())
 }
 
 /// Git's stdout as it is.
-fn git_raw(args: &[&str]) -> Result<Vec<u8>> {
-    let out = Command::new("git")
-        .args(args)
-        .stdin(Stdio::null())
-        .output()
-        .context("cannot run git")?;
+fn git_raw(args: &[&str], deadline: Option<Instant>) -> Result<Vec<u8>> {
+    let out = output(Command::new("git").args(args), deadline).context("cannot run git")?;
     if !out.status.success() {
         bail!(
             "git {}: {}",
@@ -697,6 +725,50 @@ fn git_raw(args: &[&str]) -> Result<Vec<u8>> {
         );
     }
     Ok(out.stdout)
+}
+
+/// Runs `cmd` to its end with no stdin. With a deadline (the review's budget), it runs in its
+/// own process group, which is killed at the deadline; past the deadline it does not start.
+fn output(cmd: &mut Command, deadline: Option<Instant>) -> Result<Output> {
+    cmd.stdin(Stdio::null());
+    let Some(deadline) = deadline else {
+        return Ok(cmd.output()?);
+    };
+    let program = cmd.get_program().to_string_lossy().into_owned();
+    let spent = || anyhow!("the review's budget ran out while preparing ({program})");
+    if Instant::now() >= deadline {
+        return Err(spent());
+    }
+    let mut child = cmd
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .process_group(0)
+        .spawn()?;
+    // Reader threads, so a full pipe cannot stall the child while we wait on it.
+    fn read(pipe: Option<impl Read + Send + 'static>) -> JoinHandle<Vec<u8>> {
+        std::thread::spawn(move || {
+            let mut buf = vec![];
+            if let Some(mut pipe) = pipe {
+                let _ = pipe.read_to_end(&mut buf);
+            }
+            buf
+        })
+    }
+    let (stdout, stderr) = (read(child.stdout.take()), read(child.stderr.take()));
+    loop {
+        if let Some(status) = child.try_wait()? {
+            return Ok(Output {
+                status,
+                stdout: stdout.join().unwrap_or_default(),
+                stderr: stderr.join().unwrap_or_default(),
+            });
+        }
+        if Instant::now() >= deadline {
+            launch::kill_group(&mut child);
+            return Err(spent());
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
 }
 
 #[cfg(test)]

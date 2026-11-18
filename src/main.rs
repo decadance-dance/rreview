@@ -2,6 +2,7 @@ mod coordinator;
 mod doctor;
 mod launch;
 mod panelist;
+mod reply;
 mod result;
 mod review;
 mod runner;

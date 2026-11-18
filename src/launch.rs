@@ -5,7 +5,7 @@ use std::fs::{self, File};
 use std::io::{ErrorKind, Write};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
-use std::process::{Command, ExitStatus, Stdio};
+use std::process::{Child, Command, ExitStatus, Stdio};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
@@ -49,12 +49,7 @@ impl Launch {
                 return Ok(status);
             }
             if started.elapsed() >= timeout {
-                let _ = Command::new("kill")
-                    .args(["-KILL", "--", &format!("-{}", child.id())])
-                    .stderr(Stdio::null())
-                    .status();
-                let _ = child.kill();
-                let _ = child.wait();
+                kill_group(&mut child);
                 return Err(TimedOut(format!(
                     "{} timed out after {}s",
                     self.program,
@@ -65,6 +60,16 @@ impl Launch {
             std::thread::sleep(Duration::from_millis(100));
         }
     }
+}
+
+/// Kills `child`, which leads its own process group, and everything it started.
+pub fn kill_group(child: &mut Child) {
+    let _ = Command::new("kill")
+        .args(["-KILL", "--", &format!("-{}", child.id())])
+        .stderr(Stdio::null())
+        .status();
+    let _ = child.kill();
+    let _ = child.wait();
 }
 
 /// A launch killed at its timeout; callers tell it from other failures to give a wrap-up turn.
@@ -105,14 +110,8 @@ pub fn claude(worktree: &Path, git_common_dir: &Path, runroot: &Path) -> Result<
         },
         "disableBundledSkills": true
     });
-    // Parallel passes of one run rewrite the same file; a rename never shows a half-written one.
-    let tmp = runroot.join(format!(
-        ".claude-settings.{:?}.tmp",
-        std::thread::current().id()
-    ));
-    fs::write(&tmp, serde_json::to_string_pretty(&settings)?)
-        .with_context(|| format!("{}", tmp.display()))?;
-    fs::rename(&tmp, &settings_path).with_context(|| format!("{}", settings_path.display()))?;
+    fs::write(&settings_path, serde_json::to_string_pretty(&settings)?)
+        .with_context(|| format!("{}", settings_path.display()))?;
     Ok(Launch {
         program: "claude".into(),
         args: [
@@ -146,21 +145,18 @@ pub fn codex(worktree: &Path, runroot: &Path, out_name: &str, user_auth: &Path) 
     let home = runroot.join("codex-home");
     fs::create_dir_all(&home).with_context(|| format!("{}", home.display()))?;
     let link = home.join("auth.json");
-    // Several passes of one run share the home, in parallel: the link may already be there.
-    match std::os::unix::fs::symlink(&user_auth, &link) {
-        Err(e) if e.kind() == ErrorKind::AlreadyExists => match fs::read_link(&link) {
-            Ok(target) if target == user_auth => {}
-            Ok(target) => bail!(
-                "{} points at {}, not {}",
-                link.display(),
-                target.display(),
-                user_auth.display()
-            ),
-            Err(e) => {
-                return Err(e).with_context(|| format!("{} is not a symlink", link.display()));
-            }
-        },
-        r => r.with_context(|| format!("{}", link.display()))?,
+    // A wrap-up or retry turn reuses the pass's home; the link may already be there.
+    match fs::read_link(&link) {
+        Ok(target) if target == user_auth => {}
+        Ok(target) => bail!(
+            "{} points at {}, not {}",
+            link.display(),
+            target.display(),
+            user_auth.display()
+        ),
+        Err(e) if e.kind() == ErrorKind::NotFound => std::os::unix::fs::symlink(&user_auth, &link)
+            .with_context(|| format!("{}", link.display()))?,
+        Err(e) => return Err(e).with_context(|| format!("{} is not a symlink", link.display())),
     }
     Ok(Launch {
         program: "codex".into(),

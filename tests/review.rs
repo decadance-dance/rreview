@@ -301,7 +301,7 @@ fn claude_pass_end_to_end() {
     }
 
     // Launched through the builder, in the review worktree, with a session id for a wrap-up.
-    let settings = runroot.join("claude-settings.json");
+    let settings = runroot.join("scratch/reliability/claude-settings.json");
     assert!(
         run.log.contains(&format!(
             "claude -p --safe-mode --settings {} --output-format json --session-id ",
@@ -349,8 +349,10 @@ fn codex_pass_with_repo_and_kept_worktree() {
         run.log.contains(&format!(
             "codex exec --json -s read-only -C {} -o {} - CODEX_HOME={}",
             runroot.join("wt").display(),
-            runroot.join("replies/reliability.reply.txt").display(),
-            runroot.join("codex-home").display()
+            runroot
+                .join("scratch/reliability/replies/reply.txt")
+                .display(),
+            runroot.join("scratch/reliability/codex-home").display()
         )),
         "{run:?}"
     );
@@ -462,11 +464,15 @@ fn bad_replies_fail_the_pass() {
             claude_says(&second_bad.to_string()),
             "candidate 2",
         ),
-        ("no json", claude_says("I found nothing."), "no JSON object"),
+        (
+            "no json",
+            claude_says("I found nothing."),
+            "no JSON in the reply",
+        ),
         (
             "positional candidate",
             claude_says(&positional.to_string()),
-            "candidate 1 is not a JSON object",
+            "/candidates[0] is not a JSON object",
         ),
         (
             "forged out file",
@@ -475,7 +481,7 @@ fn bad_replies_fail_the_pass() {
                 ("FAKE_FORGED", envelope("src/lib.rs").to_string()),
                 ("FAKE_STDOUT", claude_result("not json")),
             ],
-            "no JSON object",
+            "no JSON in the reply",
         ),
         (
             "claude error",
@@ -609,14 +615,20 @@ fn a_timed_out_pass_is_resumed_for_its_wrap_up() {
                 .unwrap();
             format!(
                 "claude -p --safe-mode --settings {} --output-format json --resume {id}\n",
-                fx.runroot().join("claude-settings.json").display()
+                fx.runroot()
+                    .join("scratch/reliability/claude-settings.json")
+                    .display()
             )
         } else {
             format!(
                 "codex exec --json -s read-only -C {} -o {} resume fake-thread - CODEX_HOME={}\n",
                 fx.runroot().join("wt").display(),
-                fx.runroot().join("replies/reliability.reply.txt").display(),
-                fx.runroot().join("codex-home").display()
+                fx.runroot()
+                    .join("scratch/reliability/replies/reply.txt")
+                    .display(),
+                fx.runroot()
+                    .join("scratch/reliability/codex-home")
+                    .display()
             )
         };
         assert!(run.log.contains(&resumed), "want {resumed:?} in {run:?}");
@@ -756,16 +768,24 @@ fn panel_envelope(name: &str, title: &str) -> Value {
     env
 }
 
-fn review_finding(title: &str, priority: u8, confidence: f64) -> Value {
+/// A coordinator finding covering the panel candidates `ids`.
+fn review_finding(title: &str, priority: u8, confidence: f64, ids: &[&str]) -> Value {
     json!({"title": format!("[P{priority}] {title}"), "body": "Because.", "priority": priority,
-        "confidence_score": confidence,
+        "confidence_score": confidence, "candidate_ids": ids,
         "code_location": {"absolute_file_path": "src/lib.rs", "line_range": {"start": 1, "end": 1}}})
 }
 
-fn dropped(title: &str) -> Value {
-    json!({"title": title, "panelist": "Security & Trust Boundaries", "file": "src/lib.rs",
-        "line_range": {"start": 1, "end": 1}, "priority": 2, "confidence_score": 0.6,
-        "claim": "c", "drop_reason": "disproved", "evidence": "src/lib.rs:1 guards it"})
+/// A judge restoration of the dropped candidate `id`.
+fn restored(id: &str, title: &str, priority: u8, confidence: f64) -> Value {
+    let mut f = review_finding(title, priority, confidence, &[]);
+    let f = f.as_object_mut().unwrap();
+    f.remove("candidate_ids");
+    f.insert("candidate_id".into(), id.into());
+    json!(f)
+}
+
+fn dropped(id: &str) -> Value {
+    json!({"candidate_id": id, "drop_reason": "disproved", "evidence": "src/lib.rs:1 guards it"})
 }
 
 fn coordinator_review(findings: Vec<Value>, dropped: Vec<Value>) -> Value {
@@ -774,12 +794,18 @@ fn coordinator_review(findings: Vec<Value>, dropped: Vec<Value>) -> Value {
         "overall_confidence_score": 0.8, "review_process": "Read the diff."})
 }
 
-/// Every pass replies at once: three candidates; the coordinator keeps a P1 and drops two; the
-/// judge restores a P3 one.
+/// Every pass replies at once: three candidates (`intent_contracts-1` "Overflow",
+/// `reliability-1` "Handle the error", `security-1` "Injection"); the coordinator keeps a P1 and
+/// drops two; the judge restores a P3 one.
 fn pipeline() -> Scenario {
     let coordinator = coordinator_review(
-        vec![review_finding("Handle the error", 1, 0.9)],
-        vec![dropped("Injection"), dropped("Overflow")],
+        vec![review_finding(
+            "Handle the error",
+            1,
+            0.9,
+            &["reliability-1"],
+        )],
+        vec![dropped("security-1"), dropped("intent_contracts-1")],
     );
     vec![
         ("FAKE_REVIEW", "ok".into()),
@@ -803,7 +829,7 @@ fn pipeline() -> Scenario {
         ),
         (
             "FAKE_OUT_judge",
-            json!([review_finding("Check the overflow", 3, 0.7)]).to_string(),
+            json!([restored("intent_contracts-1", "Check the overflow", 3, 0.7)]).to_string(),
         ),
     ]
 }
@@ -929,7 +955,10 @@ fn full_pipeline_gates_findings_and_writes_result_json() {
 fn no_gated_findings_exits_0_and_json_prints_result_json() {
     let fx = fixture();
     // Only a P3 finding and nothing dropped: no judge pass.
-    let coordinator = coordinator_review(vec![review_finding("Rename", 3, 0.9)], vec![]);
+    let coordinator = coordinator_review(
+        vec![review_finding("Rename", 3, 0.9, &["reliability-1"])],
+        vec![],
+    );
     let mut scenario = pipeline();
     for (k, v) in [
         ("FAKE_OUT_intent_contracts", json!({"panelist": "Intent & Contracts", "coverage_summary": "", "candidates": []}).to_string()),
@@ -976,9 +1005,26 @@ fn no_gated_findings_exits_0_and_json_prints_result_json() {
 #[test]
 fn a_failed_panelist_degrades_the_review() {
     let fx = fixture();
+    // The coordinator covers the lens with a finding of its own, tied to no candidate.
+    let coordinator = coordinator_review(
+        vec![
+            review_finding("Handle the error", 1, 0.9, &["reliability-1"]),
+            review_finding("Sanitize the input", 2, 0.8, &[]),
+        ],
+        vec![dropped("intent_contracts-1")],
+    );
     let run = fx.full(
         &[],
-        &with(pipeline(), &[("FAKE_MODE_security", "crash".into())]),
+        &with(
+            pipeline(),
+            &[
+                ("FAKE_MODE_security", "crash".into()),
+                (
+                    "FAKE_OUT_coordinator",
+                    claude_result(&coordinator.to_string()),
+                ),
+            ],
+        ),
     );
     assert_eq!(run.code, Some(1), "{run:?}");
     assert!(
@@ -1042,7 +1088,15 @@ fn a_failed_coordinator_fails_the_review() {
 
     // A review that leaves a candidate unaccounted for fails too, after its retry.
     let fx = fixture();
-    let short = coordinator_review(vec![review_finding("Handle the error", 1, 0.9)], vec![]);
+    let short = coordinator_review(
+        vec![review_finding(
+            "Handle the error",
+            1,
+            0.9,
+            &["reliability-1"],
+        )],
+        vec![],
+    );
     let run = fx.full(
         &[],
         &with(
@@ -1053,12 +1107,232 @@ fn a_failed_coordinator_fails_the_review() {
     assert_eq!(run.code, Some(2), "{run:?}");
     assert!(
         run.stderr
-            .contains("the panel sent 3 candidates but the review accounts for 1"),
+            .contains("candidate intent_contracts-1 has no disposition"),
         "{run:?}"
     );
     assert_eq!(
         fx.statuses_of("coordinator"),
         ["started", "retry", "failed"]
+    );
+
+    // The right count with one id repeated: two candidates vanish (review finding 1).
+    let fx = fixture();
+    let repeated = coordinator_review(
+        vec![],
+        vec![
+            dropped("security-1"),
+            dropped("security-1"),
+            dropped("security-1"),
+        ],
+    );
+    let run = fx.full(
+        &[],
+        &with(
+            pipeline(),
+            &[("FAKE_OUT_coordinator", claude_result(&repeated.to_string()))],
+        ),
+    );
+    assert_eq!(run.code, Some(2), "{run:?}");
+    assert!(
+        run.stderr
+            .contains("candidate security-1 has more than one disposition"),
+        "{run:?}"
+    );
+    assert_eq!(fx.result(), None);
+
+    // The review wrapped in an array (review finding 3).
+    let fx = fixture();
+    let wrapped = json!([coordinator_review(
+        vec![review_finding(
+            "Handle the error",
+            1,
+            0.9,
+            &["reliability-1"]
+        )],
+        vec![dropped("security-1"), dropped("intent_contracts-1")],
+    )]);
+    let run = fx.full(
+        &[],
+        &with(
+            pipeline(),
+            &[("FAKE_OUT_coordinator", claude_result(&wrapped.to_string()))],
+        ),
+    );
+    assert_eq!(run.code, Some(2), "{run:?}");
+    assert!(
+        run.stderr.contains("the reply is not a JSON object"),
+        "{run:?}"
+    );
+}
+
+/// A judge finding that restores no dropped candidate, or a judge reply of another shape, is
+/// rejected (review findings 2, 3): the coordinator's findings stand and the run is degraded.
+#[test]
+fn the_judge_restores_only_dropped_candidates() {
+    for (name, reply, want) in [
+        (
+            "new finding",
+            json!([restored("reliability-9", "Invent a P1", 1, 0.95)]).to_string(),
+            "\"reliability-9\" is not a dropped candidate's id",
+        ),
+        (
+            "kept candidate",
+            json!([restored("reliability-1", "Restore a kept one", 1, 0.95)]).to_string(),
+            "\"reliability-1\" is not a dropped candidate's id",
+        ),
+        (
+            "wrapped",
+            json!({"unexpected": [restored("intent_contracts-1", "Check", 1, 0.95)]}).to_string(),
+            "the reply is not a JSON array",
+        ),
+    ] {
+        let fx = fixture();
+        let run = fx.full(&[], &with(pipeline(), &[("FAKE_OUT_judge", reply)]));
+        assert_eq!(run.code, Some(1), "{name}: {run:?}");
+        assert!(
+            run.stderr.contains(want),
+            "{name}: want {want:?} in {run:?}"
+        );
+        let result = fx.result().unwrap();
+        assert_eq!(result["degraded"], true, "{name}");
+        assert_eq!(
+            result["ungated_findings"].as_array().unwrap().len(),
+            1,
+            "{name}"
+        );
+        assert_eq!(
+            fx.statuses_of("judge"),
+            ["started", "retry", "failed"],
+            "{name}"
+        );
+    }
+}
+
+/// A Codex turn that exits 0 without a final message gets the one retry (review finding 4).
+#[test]
+fn a_codex_turn_without_a_final_message_is_retried() {
+    let fx = fixture();
+    let judge = json!([restored("intent_contracts-1", "Check the overflow", 3, 0.7)]).to_string();
+    let run = fx.full(
+        &[],
+        &with(
+            pipeline(),
+            &[
+                ("FAKE_MODE_judge", "no-reply".into()),
+                ("FAKE_RESUME_judge", judge),
+            ],
+        ),
+    );
+    assert_eq!(run.code, Some(1), "{run:?}");
+    assert_eq!(fx.statuses_of("judge"), ["started", "retry", "completed"]);
+    let retry = fx
+        .progress()
+        .into_iter()
+        .find(|e| e["status"] == "retry")
+        .unwrap();
+    assert!(
+        retry["error"]
+            .as_str()
+            .unwrap()
+            .contains("the reply is empty"),
+        "{retry}"
+    );
+    let result = fx.result().unwrap();
+    assert_eq!(result["degraded"], false);
+    assert_eq!(result["ungated_findings"].as_array().unwrap().len(), 2);
+
+    // A nonzero exit still fails at once.
+    let fx = fixture();
+    let run = fx.full(
+        &[],
+        &with(pipeline(), &[("FAKE_MODE_judge", "crash".into())]),
+    );
+    assert_eq!(fx.statuses_of("judge"), ["started", "failed"], "{run:?}");
+}
+
+/// The budget stops a stalled preparation step (review finding 5): no checkout, no pass.
+#[test]
+fn the_budget_covers_preparation() {
+    let fx = fixture();
+    let started = Instant::now();
+    let run = fx.full(
+        &["--budget", "1"],
+        &with(pipeline(), &[("FAKE_GH_DELAY", "5".into())]),
+    );
+    let took = started.elapsed();
+    assert_eq!(run.code, Some(2), "{run:?}");
+    assert!(took < Duration::from_millis(2500), "took {took:?}: {run:?}");
+    assert!(
+        run.stderr
+            .contains("the review's budget ran out while preparing (gh)"),
+        "{run:?}"
+    );
+    assert!(!fx.runroot().exists(), "{run:?}");
+    // The fake gh's `sleep` was killed with it.
+    assert_dead(&fx, 1);
+}
+
+/// Each pass writes only into its own scratch dir; validated replies live in the host's out/
+/// (review finding 8). A later pass's writable dir holds no earlier pass's artifact.
+#[test]
+fn passes_get_their_own_scratch_and_cannot_reach_published_replies() {
+    let fx = fixture();
+    let run = fx.full(
+        &[],
+        &with(
+            pipeline(),
+            &[
+                ("FAKE_MODE_coordinator", "forge".into()),
+                ("FAKE_FORGED", "forged".into()),
+            ],
+        ),
+    );
+    assert_eq!(run.code, Some(1), "{run:?}");
+    let runroot = fx.runroot();
+    for role in ["reliability", "coordinator"] {
+        let dir = runroot.join("scratch").join(role);
+        let s: Value =
+            serde_json::from_str(&fs::read_to_string(dir.join("claude-settings.json")).unwrap())
+                .unwrap();
+        assert_eq!(
+            s["sandbox"]["filesystem"]["allowWrite"],
+            json!([dir.join("out")]),
+            "{role}"
+        );
+        assert!(
+            run.log.contains(&format!(
+                "--settings {} ",
+                dir.join("claude-settings.json").display()
+            )),
+            "{role}: {run:?}"
+        );
+    }
+    for role in ["intent_contracts", "security", "judge"] {
+        let dir = runroot.join("scratch").join(role);
+        assert!(
+            run.log.contains(&format!(
+                "-o {} - CODEX_HOME={}",
+                dir.join("replies/reply.txt").display(),
+                dir.join("codex-home").display()
+            )),
+            "{role}: {run:?}"
+        );
+    }
+    // The coordinator wrote where it may; the panel's published replies are untouched.
+    assert_eq!(
+        fs::read_to_string(runroot.join("scratch/coordinator/out/coordinator.json")).unwrap(),
+        "forged"
+    );
+    let published: Value =
+        serde_json::from_str(&fs::read_to_string(runroot.join("out/reliability.json")).unwrap())
+            .unwrap();
+    assert_eq!(published["panelist"], "Reliability & Operations");
+    let coordinator: Value =
+        serde_json::from_str(&fs::read_to_string(runroot.join("out/coordinator.json")).unwrap())
+            .unwrap();
+    assert_eq!(
+        coordinator["findings"][0]["candidate_ids"],
+        json!(["reliability-1"])
     );
 }
 
@@ -1099,14 +1373,14 @@ fn an_invalid_reply_gets_one_retry_turn() {
         retry["error"]
             .as_str()
             .unwrap()
-            .contains("no JSON object in the reply"),
+            .contains("no JSON in the reply"),
         "{retry}"
     );
     // The retry resumes the session and says why.
     let coordinator = fx.prompt_of("coordinator");
     assert!(
         coordinator.contains("Your reply was rejected.")
-            && coordinator.contains("no JSON object in the reply"),
+            && coordinator.contains("no JSON in the reply"),
         "{coordinator}"
     );
     assert!(run.log.contains(" --resume "), "{run:?}");

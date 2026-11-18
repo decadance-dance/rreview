@@ -12,8 +12,8 @@ use std::collections::BTreeSet;
 
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
 
+use crate::reply;
 use crate::runner::Agent;
 
 pub struct Role {
@@ -151,24 +151,11 @@ pub struct Candidate {
     pub dedupe_key: String,
 }
 
-/// Decodes a panelist's reply. Surrounding prose or a code fence is tolerated; an unknown
-/// field, a missing one, or one candidate breaking the contract rejects the whole envelope.
+/// Decodes a panelist's reply (bare JSON, or in one ```json fence). An unknown field, a missing
+/// one, or one candidate breaking the contract rejects the whole envelope.
 pub fn parse(raw: &str, role: &Role, diff_files: &BTreeSet<String>) -> Result<Envelope> {
-    let (start, end) = (raw.find('{'), raw.rfind('}'));
-    let body = match (start, end) {
-        (Some(s), Some(e)) if s < e => &raw[s..=e],
-        _ => bail!("no JSON object in the reply"),
-    };
-    let value: Value = serde_json::from_str(body).context("malformed panelist envelope")?;
-    // Serde's derived struct decoder also takes a positional array; only objects name fields.
-    // The envelope itself is an object: `body` starts with `{`.
-    if let Some(candidates) = value["candidates"].as_array()
-        && let Some(i) = candidates.iter().position(|c| !c.is_object())
-    {
-        bail!("candidate {} is not a JSON object", i + 1);
-    }
-    // Decoded again from the text: a `Value` keeps only the last of repeated keys.
-    let env: Envelope = serde_json::from_str(body).context("malformed panelist envelope")?;
+    let env: Envelope =
+        reply::decode(raw, false, &["candidates/*"]).context("malformed panelist envelope")?;
     if env.panelist != role.name {
         bail!(
             "envelope names panelist {:?}, want {:?}",
@@ -216,7 +203,7 @@ fn check(c: &Candidate, diff_files: &BTreeSet<String>) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use serde_json::json;
+    use serde_json::{Value, json};
 
     fn rel() -> &'static Role {
         role("reliability").unwrap()
@@ -347,14 +334,14 @@ mod tests {
             0.9,
             "k"
         ]);
-        assert!(err(&reply(vec![candidate(), c])).contains("candidate 2 is not a JSON object"));
+        assert!(err(&reply(vec![candidate(), c])).contains("/candidates[1] is not a JSON object"));
     }
 
     #[test]
     fn rejects_the_wrong_panelist_and_non_json() {
         let raw = reply(vec![]).replace("Reliability & Operations", "Security");
         assert!(err(&raw).contains("want \"Reliability & Operations\""));
-        assert!(err("no json here").contains("no JSON object"));
+        assert!(err("no json here").contains("no JSON in the reply"));
         assert!(err("{not json}").contains("malformed panelist envelope"));
     }
 

@@ -1,7 +1,12 @@
 #!/bin/sh
-# Fake `gh`: a logged-in gh; `gh pr view` prints $FAKE_GH_PR.
+# Fake `gh`: a logged-in gh; `gh pr view` prints $FAKE_GH_PR, after $FAKE_GH_DELAY seconds
+# when set (the sleep's pid is appended to $FAKE_LOG.grandchild).
 echo "gh $*" >> "${FAKE_LOG:-/dev/null}"
 case "$1" in
 --version) echo "gh version 9.9.9" ;;
-pr) printf '%s\n' "$FAKE_GH_PR" ;;
+pr)
+  if [ -n "$FAKE_GH_DELAY" ]; then
+    sleep "$FAKE_GH_DELAY" & echo $! >> "$FAKE_LOG.grandchild"; wait
+  fi
+  printf '%s\n' "$FAKE_GH_PR" ;;
 esac

@@ -57,7 +57,10 @@ pub trait Runner {
     fn wrap_up(&self, pass: &Pass, message: &str, timeout: Duration) -> Result<String>;
 }
 
-/// `claude -p` / `codex exec` in the review worktree. Logs go to `<runroot>/logs/<role>.*`.
+/// `claude -p` / `codex exec` in the review worktree. Each pass gets its own launch dir,
+/// `<runroot>/scratch/<role>`: Claude's settings and the one dir it may write (`out/`), Codex's
+/// home and its `-o` reply. No pass can write into another pass's dir, or into `<runroot>/out`
+/// where the host keeps validated replies. Logs go to `<runroot>/logs/<role>.*`.
 pub struct Headless {
     pub worktree: PathBuf,
     pub git_common_dir: PathBuf,
@@ -66,15 +69,15 @@ pub struct Headless {
 }
 
 impl Headless {
+    fn scratch(&self, pass: &Pass) -> PathBuf {
+        self.runroot.join("scratch").join(pass.role)
+    }
+
     fn launch(&self, pass: &Pass) -> Result<Launch> {
+        let dir = self.scratch(pass);
         let mut launch = match pass.agent {
-            Agent::Claude => launch::claude(&self.worktree, &self.git_common_dir, &self.runroot)?,
-            Agent::Codex => launch::codex(
-                &self.worktree,
-                &self.runroot,
-                &reply_name(pass.role),
-                &self.codex_auth,
-            )?,
+            Agent::Claude => launch::claude(&self.worktree, &self.git_common_dir, &dir)?,
+            Agent::Codex => launch::codex(&self.worktree, &dir, REPLY, &self.codex_auth)?,
         };
         // Codex's options go before its trailing `-` (the prompt on stdin).
         let stdin = (pass.agent == Agent::Codex).then(|| launch.args.pop());
@@ -99,7 +102,7 @@ impl Headless {
         log: &Path,
         timeout: Duration,
     ) -> Result<String> {
-        let reply = self.runroot.join("replies").join(reply_name(pass.role));
+        let reply = self.scratch(pass).join("replies").join(REPLY);
         let _ = fs::remove_file(&reply);
         let status = launch.run(prompt, log, timeout)?;
         let stderr = log.with_extension("stderr");
@@ -119,8 +122,12 @@ impl Headless {
                 if !status.success() {
                     bail!("codex {status}; see {}", stderr.display());
                 }
-                fs::read_to_string(&reply)
-                    .with_context(|| format!("codex wrote no final message to {}", reply.display()))
+                // A turn that ended well without a final message is an empty reply: it fails
+                // validation and so gets the one retry turn, like any other invalid reply.
+                match fs::read_to_string(&reply) {
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(String::new()),
+                    r => r.with_context(|| format!("{}", reply.display())),
+                }
             }
         }
     }
@@ -170,10 +177,8 @@ impl Runner for Headless {
     }
 }
 
-/// Codex's `-o` file for a pass, in `<runroot>/replies/`.
-fn reply_name(role: &str) -> String {
-    format!("{role}.reply.txt")
-}
+/// Codex's `-o` file, in the pass's `replies/`.
+const REPLY: &str = "reply.txt";
 
 /// The model and effort flags of `pass`'s CLI. The values were checked when parsed (`main.rs`):
 /// none starts with `-`, so none reads as another flag.
