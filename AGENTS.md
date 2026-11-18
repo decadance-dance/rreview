@@ -8,6 +8,7 @@ rreview is a Rust CLI that runs an isolated, cross-model panel review of a GitHu
 
 ## Read before
 - The first commit or PR: [git-flow.md](docs/workflow/git-flow.md). Branches, PRs into `develop` with a merge commit, cross-model review, what agents may push.
+- Cutting a release or shipping a hotfix: [releasing.md](docs/workflow/releasing.md); its notes: [release-notes.md](docs/workflow/release-notes.md).
 - Any change to how a reviewer is launched, sandboxed or isolated: spec §3. Those facts were verified by hand; `rreview doctor` turns them into a check, and a change there must keep `doctor` green.
 
 ## Before you change anything
