@@ -754,8 +754,15 @@ fn a_planted_out_symlink_is_not_followed() {
     );
     assert_eq!(run.code, Some(0), "{run:?}");
     assert_eq!(fs::read_to_string(&victim).unwrap(), "victim\n");
-    let planted = fx.runroot().join("scratch/reliability/out/reliability.json");
-    assert!(fs::symlink_metadata(&planted).unwrap().file_type().is_symlink());
+    let planted = fx
+        .runroot()
+        .join("scratch/reliability/out/reliability.json");
+    assert!(
+        fs::symlink_metadata(&planted)
+            .unwrap()
+            .file_type()
+            .is_symlink()
+    );
     let out = fx.runroot().join("out/reliability.json");
     assert!(fs::symlink_metadata(&out).unwrap().file_type().is_file());
     assert_eq!(fx.out(), Some(env));
