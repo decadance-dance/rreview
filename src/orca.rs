@@ -548,31 +548,27 @@ fn printable(text: &str) -> String {
         .collect()
 }
 
-/// Orca types `--command` into the terminal's login shell, so the launch becomes one shell line.
-/// Every word is single-quoted; `exec` leaves no shell behind the agent to receive later input.
+/// Orca types `--command` into the terminal's login shell, so the launch becomes one shell line:
+/// `NAME='value' ... exec 'program' 'arg' ...`, every value and word single-quoted. `exec` leaves
+/// no shell behind the agent to receive later input. Not `exec env ...`: Orca then does not
+/// recognize the agent for `send` and types the prompt raw (*verified*, Orca 1.4.262).
 fn shell_line(launch: &Launch) -> Result<String> {
-    let env = launch.env.iter().map(|(k, v)| format!("{k}={v}"));
-    let words: Vec<String> = ["exec".into(), "env".into()]
-        .into_iter()
-        .chain(env)
-        .chain([launch.program.clone()])
-        .chain(launch.args.iter().cloned())
-        .collect();
-    let mut line = String::new();
-    for (i, w) in words.iter().enumerate() {
+    let quote = |w: &str| -> Result<String> {
         if w.chars().any(char::is_control) {
             bail!("cannot put {w:?} on a shell line");
         }
-        if i > 0 {
-            line.push(' ');
+        Ok(format!("'{}'", w.replace('\'', r"'\''")))
+    };
+    let mut line = String::new();
+    for (k, v) in &launch.env {
+        if k.is_empty() || !k.chars().all(|c| c == '_' || c.is_ascii_alphanumeric()) {
+            bail!("cannot put the variable {k:?} on a shell line");
         }
-        if i < 2 {
-            line.push_str(w);
-        } else {
-            line.push('\'');
-            line.push_str(&w.replace('\'', r"'\''"));
-            line.push('\'');
-        }
+        line += &format!("{k}={} ", quote(v)?);
+    }
+    line += "exec";
+    for w in [&launch.program].into_iter().chain(&launch.args) {
+        line += &format!(" {}", quote(w)?);
     }
     Ok(line)
 }
@@ -669,7 +665,7 @@ mod tests {
         };
         assert_eq!(
             shell_line(&launch).unwrap(),
-            r"exec env 'CODEX_HOME=/h $x' 'codex' '-C' '/a b/it'\''s'"
+            r"CODEX_HOME='/h $x' exec 'codex' '-C' '/a b/it'\''s'"
         );
         let bad = Launch {
             args: vec!["a\nrm -rf x".into()],

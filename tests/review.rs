@@ -1673,7 +1673,7 @@ fn orca_pass_end_to_end() {
         let out = runroot.join("scratch/reliability/out");
         let command = if agent == "claude" {
             format!(
-                "exec env 'claude' '--safe-mode' '--settings' '{}' '--permission-mode' 'acceptEdits' '--add-dir' '{}'",
+                "exec 'claude' '--safe-mode' '--settings' '{}' '--permission-mode' 'acceptEdits' '--add-dir' '{}'",
                 runroot
                     .join("scratch/reliability/claude-settings.json")
                     .display(),
@@ -1681,7 +1681,7 @@ fn orca_pass_end_to_end() {
             )
         } else {
             format!(
-                "exec env 'CODEX_HOME={}' 'codex' '-C' '{}' '-s' 'workspace-write' '-a' 'never' '-c' 'sandbox_workspace_write.exclude_slash_tmp=true' '-c' 'sandbox_workspace_write.exclude_tmpdir_env_var=true' '-c' 'check_for_update_on_startup=false'",
+                "CODEX_HOME='{}' exec 'codex' '-C' '{}' '-s' 'workspace-write' '-a' 'never' '-c' 'sandbox_workspace_write.exclude_slash_tmp=true' '-c' 'sandbox_workspace_write.exclude_tmpdir_env_var=true' '-c' 'check_for_update_on_startup=false'",
                 runroot.join("scratch/reliability/codex-home").display(),
                 out.display()
             )
