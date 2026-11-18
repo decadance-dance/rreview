@@ -1,0 +1,34 @@
+#!/bin/sh
+# Fake `codex` for doctor tests. With --json it prints a command_execution event for the
+# probe, as the real one does when it runs a command. FAKE_CODEX:
+#   ok (default)    runs nothing, reports a blocked write
+#   leak            runs the probe unsandboxed
+#   user-agents     reads $HOME/.codex/AGENTS.md like a Codex that ignores CODEX_HOME
+#   ignore          neither runs the probe nor reports a canary
+#   lie             replies "write=1" without running the probe
+#   read            only reads the probe (cat) and logs that command with its output
+#   rebuild         reads the probe's last line and rebuilds the result line from it
+# Argv and CODEX_HOME are appended to $FAKE_LOG.
+echo "codex $* CODEX_HOME=$CODEX_HOME" >> "${FAKE_LOG:-/dev/null}"
+case "$1" in
+--version) echo "codex-cli 9.9.9"; exit 0 ;;
+login) echo "Logged in using ChatGPT"; exit 0 ;;
+esac
+out=; prev=
+for a; do [ "$prev" = -o ] && out=$a; prev=$a; done
+probe=$(grep -o "/[^']*probe\.sh")
+[ "$FAKE_CODEX" = ignore ] && { echo "I would rather not." > "$out"; exit 0; }
+cmd="sh $probe"
+case "$FAKE_CODEX" in
+lie) result=write=1 ;;
+leak) result=$(sh "$probe" 2>&1 | tr '\n' ' ') ;;
+read) cmd="cat $probe" result=$(tr '\n' ' ' < "$probe") ;;
+rebuild) cmd="tail -n 1 $probe | sed -e s/^echo.// -e s/[$]r/1/" result=$(sh -c "$cmd") ;;
+*) result="rreview-probe-result write=1" ;;
+esac
+[ "$FAKE_CODEX" = lie ] ||
+  printf '{"type":"item.completed","item":{"type":"command_execution","command":"/bin/sh -lc '"'"'%s'"'"'","aggregated_output":"%s\\n","exit_code":0,"status":"completed"}}\n' "$cmd" "$result"
+agents=$CODEX_HOME/AGENTS.md
+[ "$FAKE_CODEX" = user-agents ] && agents=$HOME/.codex/AGENTS.md
+canary=$(grep -o 'RREVIEW-CANARY-[0-9a-f]*' "$agents" 2> /dev/null || echo NO-CANARY)
+printf '%s\n%s\n' "$result" "$canary" > "$out"
