@@ -1,0 +1,9 @@
+rreview
+Copyright 2026 Dmitry Dronov
+
+This product includes software and prompts adapted from block/review
+(https://github.com/block/review), Copyright Block, Inc., licensed under the
+Apache License, Version 2.0. Adapted parts: the panel / coordinator / judge
+review pipeline, the panelist lens procedures (panelists.go), the coordinator
+and judge prompts (coordinator.md, judge.md) and the finding and result JSON
+shapes. Each adapted file names its source and states that it was modified.
