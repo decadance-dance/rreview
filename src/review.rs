@@ -140,9 +140,6 @@ impl Settings {
 
 /// Runs the review; returns the exit code: 0 no gated findings, 1 gated findings, 2 failed.
 pub fn run(args: &Args) -> Result<u8> {
-    if args.orca {
-        orca::check_env()?;
-    }
     let settings = Settings::new(args)?;
     let panel: Vec<&Role> = match &args.only {
         Some(id) => vec![panelist::role(id)?],
@@ -155,6 +152,9 @@ pub fn run(args: &Args) -> Result<u8> {
     };
     // None: a budget too large for the clock is no limit.
     let deadline = Instant::now().checked_add(args.budget);
+    if args.orca {
+        orca::check_env(deadline)?;
+    }
 
     // The budget covers preparation too: gh, a fetch or a checkout hook can stall.
     let pr = view_pr(&args.pr, args.repo.as_deref(), deadline)?;
@@ -196,6 +196,8 @@ pub fn run(args: &Args) -> Result<u8> {
     }
     fs::create_dir_all(runroot.join("out")).with_context(|| format!("{}", runroot.display()))?;
     let runroot = fs::canonicalize(&runroot)?;
+    // Printed now, not only at the end: the Orca plugin tails progress.jsonl here during the run.
+    eprintln!("run dir: {}", runroot.display());
     // The guard exists before the checkout: a failed one (a post-checkout hook) can leave a
     // registered, half-made worktree behind.
     let ran = |r: &str| panel.iter().any(|p| p.id == r) || args.only.is_none();

@@ -1,0 +1,49 @@
+{
+  "manifestVersion": 2,
+  "id": "rreview",
+  "name": "rreview",
+  "version": "0.1.0",
+  "description": "Runs an rreview cross-model panel review of the focused workspace's PR, shows each pass while it runs, and lists the findings by file.",
+  "license": "Apache-2.0",
+  "repository": "https://github.com/decadance-dance/rreview",
+  "engines": {
+    "orca": ">=1.4.248"
+  },
+  "execution": "trusted-worker",
+  "pluginApi": 1,
+  "main": "src/worker.ts",
+  "contributes": {
+    "panels": [
+      {
+        "id": "rreview",
+        "title": "rreview",
+        "icon": "search",
+        "entry": "src/panel.tsx",
+        "ui": "components"
+      }
+    ],
+    "settings": [
+      {
+        "key": "rreviewPath",
+        "title": "rreview executable",
+        "description": "The rreview binary to run: a name on the plugin worker's PATH or an absolute path.",
+        "type": "string",
+        "default": "rreview"
+      },
+      {
+        "key": "githubAccount",
+        "title": "GitHub account",
+        "description": "A gh account (gh auth status lists them) whose token gh and rreview use, for a repository gh's active account cannot see. Empty: gh's active account.",
+        "type": "string",
+        "placeholder": "gh's active account"
+      }
+    ]
+  },
+  "capabilities": [
+    { "kind": "workspace:read" },
+    { "kind": "agent:read" },
+    { "kind": "terminal:send" },
+    { "kind": "storage:own" },
+    { "kind": "settings:own" }
+  ]
+}

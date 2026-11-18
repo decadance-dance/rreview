@@ -1,0 +1,33 @@
+#!/bin/sh
+# Fake `rreview` for the plugin's tests. Logs its cwd, argv and a GH_TOKEN to $FAKE_LOG, makes a run dir under
+# $FAKE_STATE, names it on stderr as rreview does, writes progress.jsonl and plays FAKE_RREVIEW:
+#   ok (default)  three panelists and the coordinator complete; prints $FAKE_RESULT, exits $FAKE_EXIT (1)
+#   degraded      as ok, but the security panelist failed
+#   fail          the coordinator fails: an `error:` line on stderr, exit 2
+#   garbage       exits 0 with no JSON on stdout
+#   slow          as ok, after a 2 s pause once the panelists have started
+printf 'rreview %s | %s\n' "$PWD" "$*" >> "${FAKE_LOG:-/dev/null}"
+[ -n "$GH_TOKEN" ] && echo "rreview token $GH_TOKEN" >> "${FAKE_LOG:-/dev/null}"
+dir="$FAKE_STATE/run-$$"
+mkdir -p "$dir"
+echo "run dir: $dir" >&2
+p="$dir/progress.jsonl"
+ev() { printf '{"ts":%s000,"role":"%s","status":"%s","agent":"%s","model":"default","duration_ms":%s%s}\n' "$(date +%s)" "$1" "$2" "$3" "$4" "$5" >> "$p"; }
+for r in intent_contracts reliability security; do ev $r started claude 0; done
+[ "$FAKE_RREVIEW" = slow ] && sleep 2
+ev intent_contracts completed codex 1200
+ev reliability completed claude 1500
+if [ "$FAKE_RREVIEW" = degraded ]; then ev security failed codex 900 ',"error":"no reply"'; else ev security completed codex 900; fi
+ev coordinator started claude 0
+case "$FAKE_RREVIEW" in
+fail)
+  ev coordinator failed claude 300 ',"error":"bad JSON"'
+  echo "error: coordinator: bad JSON" >&2
+  echo "run dir: $dir" >&2
+  exit 2 ;;
+garbage) echo "summary, not JSON"; exit 0 ;;
+esac
+ev coordinator completed claude 2000
+printf '%s\n' "$FAKE_RESULT"
+echo "run dir: $dir" >&2
+exit "${FAKE_EXIT:-1}"
