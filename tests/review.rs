@@ -1811,6 +1811,7 @@ fn orca_pass_end_to_end() {
             orca_calls(&run),
             [
                 "status --json",
+                "repo show",
                 "worktree create",
                 "terminal create",
                 "terminal show",
@@ -2000,7 +2001,7 @@ fn orca_answers_the_claude_trust_dialog_once() {
     assert_eq!(run.code, Some(0), "{run:?}");
     assert_eq!(fx.out(), Some(env));
     assert_eq!(
-        orca_calls(&run)[2..8],
+        orca_calls(&run)[3..9],
         [
             "terminal create",
             "terminal show",
@@ -2161,6 +2162,29 @@ fn orca_runner_needs_a_running_orca() {
         "nothing may run before the check"
     );
 
+    // A reachable Orca that does not have this repository stops the run before any work.
+    let fx = fixture();
+    let run = fx.run(
+        &["--runner", "orca"],
+        &[("FAKE_ORCA_REPO", "missing".into())],
+    );
+    assert_eq!(run.code, Some(2), "{run:?}");
+    let main = fs::canonicalize(&fx.clone).unwrap();
+    assert!(
+        run.stderr.contains(&format!(
+            "--runner orca needs this repository in Orca, and Orca does not show {}",
+            main.display()
+        )),
+        "{run:?}"
+    );
+    assert!(run.stderr.contains("repo_not_found"), "{run:?}");
+    assert_eq!(
+        orca_calls(&run),
+        ["status --json", "repo show"],
+        "nothing else may run"
+    );
+    assert!(!run.log.contains("gh "), "{run:?}");
+
     // A status call that never answers is killed at the budget.
     let fx = fixture();
     let start = Instant::now();
@@ -2192,7 +2216,10 @@ fn orca_runner_needs_no_terminal_handle() {
         ],
     );
     assert_eq!(run.code, Some(0), "{run:?}");
-    assert_eq!(orca_calls(&run)[..2], ["status --json", "worktree create"]);
+    assert_eq!(
+        orca_calls(&run)[..3],
+        ["status --json", "repo show", "worktree create"]
+    );
 }
 
 impl Fixture {

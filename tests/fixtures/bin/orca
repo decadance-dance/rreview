@@ -32,6 +32,7 @@
 # `worktree create` starts; FAKE_ORCA_WAIT_DELAY: seconds every `terminal wait` after a prompt
 # takes before it answers. FAKE_ORCA_CLOSE=fail-once: the first `terminal close` fails with
 # runtime_unavailable. FAKE_ORCA_STATUS: `down` reports the app not running, `hang` never answers.
+# FAKE_ORCA_REPO=missing: `repo show` answers repo_not_found, as a runtime without this checkout.
 line=orca; for a; do line="$line $a"; done
 printf '%s\n' "$line" >> "${FAKE_LOG:-/dev/null}"
 scenario=${FAKE_ORCA:-ok}
@@ -55,6 +56,9 @@ case "$1 $2" in
   hang) sleep 60 ;;
   esac
   ok '{"app":{"running":true},"runtime":{"reachable":true}}' ;;
+"repo show")
+  [ "$FAKE_ORCA_REPO" = missing ] && { echo '{"ok":false,"error":{"code":"repo_not_found","message":"repo_not_found"}}'; exit 1; }
+  ok "{\"repo\":{\"path\":\"$(arg --repo "$@" | sed 's/^path://')\"}}" ;;
 "worktree create")
   [ -n "$FAKE_ORCA_CREATE_DELAY" ] && sleep "$FAKE_ORCA_CREATE_DELAY"
   name=$(arg --name "$@"); branch=$(arg --branch "$@"); base=$(arg --base-branch "$@")

@@ -152,8 +152,13 @@ pub fn run(args: &Args) -> Result<u8> {
     };
     // None: a budget too large for the clock is no limit.
     let deadline = Instant::now().checked_add(args.budget);
+    let git_common_dir: PathBuf = git(
+        &["rev-parse", "--path-format=absolute", "--git-common-dir"],
+        deadline,
+    )?
+    .into();
     if args.orca {
-        orca::check_env(deadline)?;
+        orca::check_env(&git_common_dir, deadline)?;
     }
 
     // The budget covers preparation too: gh, a fetch or a checkout hook can stall.
@@ -214,11 +219,6 @@ pub fn run(args: &Args) -> Result<u8> {
         keep: false,
         orca_name: None,
     };
-    let git_common_dir: PathBuf = git(
-        &["rev-parse", "--path-format=absolute", "--git-common-dir"],
-        deadline,
-    )?
-    .into();
     if args.orca {
         // The pid and start time make the name the run's own: a concurrent run for the same
         // PR head gets another one, so neither run's cleanup can reach the other's worktree.

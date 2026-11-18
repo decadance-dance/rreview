@@ -30,8 +30,9 @@ const SETUP: Duration = Duration::from_secs(300);
 const CLOSE: Duration = Duration::from_secs(30);
 
 /// The runner drives Orca through its CLI, which needs the app running with its runtime
-/// reachable (spec §4); `orca status` proves that before any work, from an Orca terminal or not.
-pub fn check_env(deadline: Option<Instant>) -> Result<()> {
+/// reachable and this repository registered (spec §4); `orca status` and `orca repo show` prove
+/// that before any work, from an Orca terminal or not.
+pub fn check_env(git_common_dir: &Path, deadline: Option<Instant>) -> Result<()> {
     let bound = Instant::now()
         .checked_add(CLOSE)
         .into_iter()
@@ -45,7 +46,23 @@ pub fn check_env(deadline: Option<Instant>) -> Result<()> {
             "--runner orca needs a running Orca app, and `orca status` reports it is not reachable; use the default headless runner elsewhere"
         );
     }
+    let repo = main_checkout(git_common_dir);
+    let selector = format!("path:{}", launch::utf8(repo)?);
+    orca(&["repo", "show", "--repo", &selector], bound).with_context(|| {
+        format!(
+            "--runner orca needs this repository in Orca, and Orca does not show {}; add it in Orca first",
+            repo.display()
+        )
+    })?;
     Ok(())
+}
+
+/// Orca registers a repository by its main checkout, the parent of a non-bare common dir.
+fn main_checkout(git_common_dir: &Path) -> &Path {
+    match git_common_dir.file_name() {
+        Some(n) if n == ".git" => git_common_dir.parent().unwrap_or(git_common_dir),
+        _ => git_common_dir,
+    }
 }
 
 /// The Codex TUI starts in `<runroot>/out`; inside a git checkout it stops at its trust prompt,
@@ -103,11 +120,7 @@ pub fn create_worktree(
     deadline: Option<Instant>,
 ) -> Result<PathBuf> {
     let branch = branch_for(name);
-    // Orca registers a repository by its main checkout, the parent of a non-bare common dir.
-    let repo = match git_common_dir.file_name() {
-        Some(n) if n == ".git" => git_common_dir.parent().unwrap_or(git_common_dir),
-        _ => git_common_dir,
-    };
+    let repo = main_checkout(git_common_dir);
     let v = orca(
         &[
             "worktree",
