@@ -56,7 +56,7 @@ Settings (Settings > Plugins > rreview):
 - A worker restart (Orca stops an idle worker; a save in dev mode) loses the child it was watching:
   that run shows as failed, with its run dir. `rreview show <run dir>` prints its result once it
   finishes.
-- No Cancel: closing the panel does not stop a run. rreview has no signal handler yet, so a
+- No Cancel ([#27](https://github.com/decadance-dance/rreview/issues/27)): closing the panel does not stop a run. rreview has no signal handler yet, so a
   SIGTERM would skip its cleanup as a kill does (an Orca review worktree or terminal could stay).
   The worker stops a run still going 70 minutes after it started (rreview's default budget is 60);
   that kill skips the cleanup too.
