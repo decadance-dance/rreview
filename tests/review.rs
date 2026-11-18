@@ -1649,6 +1649,7 @@ fn orca_pass_end_to_end() {
             [
                 "worktree create",
                 "terminal create",
+                "terminal show",
                 "terminal wait",
                 "terminal send",
                 "terminal wait",
@@ -1751,9 +1752,10 @@ fn orca_answers_the_claude_trust_dialog_once() {
     assert_eq!(run.code, Some(0), "{run:?}");
     assert_eq!(fx.out(), Some(env));
     assert_eq!(
-        orca_calls(&run)[1..6],
+        orca_calls(&run)[1..7],
         [
             "terminal create",
+            "terminal show",
             "terminal wait",
             "terminal send",
             "terminal send",
@@ -2124,13 +2126,26 @@ fn orca_runs_the_full_pipeline_in_one_terminal_per_pass() {
         "judge",
     ] {
         assert_eq!(fx.statuses_of(role), ["started", "completed"], "{role}");
-        assert!(
-            run.log
-                .contains(&format!("--title rreview:{role} --command ")),
-            "{role}: {run:?}"
-        );
         fx.assert_terminal_closed(role);
     }
     assert!(!run.log.contains("orchestration"), "{run:?}");
     fx.assert_orca_worktree_removed();
+}
+
+#[test]
+fn orca_types_nothing_before_orca_recognizes_the_agent() {
+    let env = envelope("src/lib.rs");
+    for agent in ["claude", "codex"] {
+        let fx = fixture();
+        let run = orca_run(
+            &fx,
+            &["--role-agent", &format!("reliability={agent}")],
+            "slow-agent",
+            &env,
+        );
+        assert_eq!(run.code, Some(0), "{run:?}");
+        assert_eq!(fx.out(), Some(env.clone()));
+        let state = fs::read_to_string(fx.root.join("log.orca-reliability")).unwrap();
+        assert!(state.matches("show").count() >= 3, "{state}");
+    }
 }

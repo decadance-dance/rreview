@@ -263,7 +263,11 @@ impl Orca {
     /// The first turn, all within `deadline`: wait for the agent, answer Claude's trust dialog,
     /// send the prompt, and one reminder if the agent stops without a reply file.
     fn first_turn(&self, pass: &Pass, handle: &str, deadline: Option<Instant>) -> Result<String> {
-        // Text typed before the agent is up reaches the shell; tui-idle holds only for an agent.
+        // Until Orca recognizes the agent, text is typed raw: into the shell before the agent
+        // starts, and with every newline an Enter afterwards. Nothing is sent before that.
+        if !agent_up(handle, pass.agent, deadline)? {
+            return Err(TimedOut("Orca did not recognize the agent".into()).into());
+        }
         let mut state = wait(handle, deadline)?;
         if state == Wait::Blocked("agent-trust-workspace".into()) && pass.agent == Agent::Claude {
             // "Yes, I trust this folder" (second entry): `claude -p` skips this dialog, and
@@ -287,7 +291,7 @@ impl Orca {
         );
         let reply = self.reply(pass);
         for text in [&*pass.prompt, NUDGE] {
-            send(handle, &self.message(pass, text), deadline)?;
+            send(handle, pass.agent, &self.message(pass, text), deadline)?;
             match wait(handle, deadline)? {
                 Wait::Idle => {}
                 Wait::TimedOut => return Err(TimedOut("no idle agent".into()).into()),
@@ -374,7 +378,12 @@ impl Runner for Orca {
             if !term.ready {
                 bail!("the agent never became ready for the prompt");
             }
-            send(&term.handle, &self.message(pass, message), deadline)?;
+            send(
+                &term.handle,
+                pass.agent,
+                &self.message(pass, message),
+                deadline,
+            )?;
             match wait(&term.handle, deadline)? {
                 Wait::Idle => {}
                 Wait::TimedOut => bail!(TimedOut("no idle agent".into())),
@@ -463,7 +472,7 @@ fn wait(handle: &str, deadline: Option<Instant>) -> Result<Wait> {
 
 /// A prompt to the agent; Orca bracket-pastes it and submits it with Enter. Watching for the
 /// turn to start takes at most 10 s and never past `deadline`.
-fn send(handle: &str, text: &str, deadline: Option<Instant>) -> Result<()> {
+fn send(handle: &str, agent: Agent, text: &str, deadline: Option<Instant>) -> Result<()> {
     let watch = left(deadline).as_secs().min(10).to_string();
     let text = printable(text);
     let mut args = vec![
@@ -482,7 +491,28 @@ fn send(handle: &str, text: &str, deadline: Option<Instant>) -> Result<()> {
     if v["send"]["accepted"] != true {
         bail!("orca terminal send: the prompt was not accepted");
     }
+    // Orca names the agent it pasted to; another provider means the text went in raw.
+    if let Some(p) = v["send"]["prompt"]["provider"].as_str()
+        && p != agent.to_string()
+    {
+        bail!("orca terminal send: typed as raw input (provider {p:?}), not pasted to {agent}");
+    }
     Ok(())
+}
+
+/// Polls `orca terminal show` until Orca identifies the terminal's agent as `agent`; false when
+/// `deadline` passes first.
+fn agent_up(handle: &str, agent: Agent, deadline: Option<Instant>) -> Result<bool> {
+    loop {
+        let v = orca(&["terminal", "show", "--terminal", handle], deadline)?;
+        if v["terminal"]["agentIdentity"].as_str() == Some(&agent.to_string()) {
+            return Ok(true);
+        }
+        if left(deadline) < Duration::from_millis(250) {
+            return Ok(false);
+        }
+        std::thread::sleep(Duration::from_millis(250));
+    }
 }
 
 /// Raw key bytes, as typed.

@@ -14,7 +14,10 @@
 #   silent          never writes a reply
 #   hang            every wait after the prompt times out
 #   hang-once       waits time out until the wrap-up message ("Time is up"), which it answers
-#   no-agent        no agent ever comes up: every wait times out
+#   no-agent        Orca never recognizes an agent and every wait times out
+#   slow-agent      Orca recognizes the agent only at the third `terminal show`; tui-idle holds
+#                   before that (as it does for a starting Codex), and a prompt sent earlier is
+#                   typed raw (provider "unsupported")
 #   wrong-head      the worktree is checked out at the parent of the requested commit
 #   lost-reply      `worktree create` makes the worktree and branch, then fails without JSON
 #   foreign-branch  `worktree create` reports the branch `victim` instead of its own
@@ -23,7 +26,8 @@
 #   blocked         after the prompt the agent waits on a permission dialog
 # FAKE_ORCA_SEND_DELAY: seconds every prompt send takes. FAKE_ORCA_CLOSE=fail-once: the first
 # `terminal close` fails with runtime_unavailable.
-{ printf 'orca'; for a; do printf ' %s' "$a"; done; echo; } >> "${FAKE_LOG:-/dev/null}"
+line=orca; for a; do line="$line $a"; done
+printf '%s\n' "$line" >> "${FAKE_LOG:-/dev/null}"
 scenario=${FAKE_ORCA:-ok}
 arg() { # the value of option $1 in the remaining args
   want=$1; shift; prev=
@@ -54,7 +58,18 @@ case "$1 $2" in
   [ "$scenario" = no-ok ] && { echo '{"ok":false,"error":{"code":"boom","message":"no terminal"}}'; exit 0; }
   role=$(arg --title "$@"); role=${role#rreview:}
   echo open >> "$FAKE_LOG.orca-$role"
+  case "$(arg --command "$@")" in *"'claude'"*) agent=claude ;; *) agent=codex ;; esac
+  echo "agent $agent" >> "$FAKE_LOG.orca-$role"
   ok "{\"terminal\":{\"handle\":\"term_$role\"}}" ;;
+"terminal show")
+  echo show >> "$state"
+  agent=$(sed -n 's/^agent //p' "$state")
+  case "$scenario" in
+  no-agent) agent= ;;
+  slow-agent) [ "$(grep -c '^show' "$state")" -lt 3 ] && agent= ;;
+  esac
+  if [ -n "$agent" ]; then echo agent-up >> "$state"; id="\"$agent\""; else id=null; fi
+  ok "{\"terminal\":{\"agentIdentity\":$id}}" ;;
 "terminal close")
   if [ "$FAKE_ORCA_CLOSE" = fail-once ] && ! grep -q close-failed "$state" 2> /dev/null; then
     echo close-failed >> "$state"
@@ -76,7 +91,7 @@ case "$1 $2" in
   n=$(sent)
   write=no
   case "$scenario" in
-  ok | trust | foreign-branch) write=yes ;;
+  ok | trust | foreign-branch | slow-agent) write=yes ;;
   nudge) [ "$n" -ge 2 ] && write=yes ;;
   hang-once) case "$text" in *"Time is up"*) write=yes; echo wrapped >> "$state" ;; esac ;;
   esac
@@ -86,7 +101,8 @@ case "$1 $2" in
     if [ "$n" = 1 ]; then printf '%s' "$first" > "$state.pending"; else printf '%s' "$later" > "$state.pending"; fi
     printf '%s' "$text" | grep -o '/[^`'"'"' ]*/reply\.txt' | head -n 1 > "$state.path"
   fi
-  ok '{"send":{"accepted":true}}' ;;
+  if grep -q agent-up "$state"; then provider=$(sed -n 's/^agent //p' "$state"); else provider=unsupported; fi
+  ok "{\"send\":{\"accepted\":true,\"prompt\":{\"provider\":\"$provider\"}}}" ;;
 "terminal wait")
   case "$scenario" in
   no-agent) timeout "$@" ;;
