@@ -375,7 +375,28 @@ fn bad_replies_fail_the_pass() {
         0.8,
         "k"
     ]);
+    // A JSON value collapses repeated keys; the typed decoder must still see them.
+    let duplicate = envelope("src/lib.rs")
+        .to_string()
+        .replace(r#""priority":2"#, r#""priority":4,"priority":2"#);
+    assert!(duplicate.contains(r#""priority":4,"#), "{duplicate}");
+    let candidates_twice = envelope("src/lib.rs").to_string().replacen(
+        r#""candidates":"#,
+        r#""candidates":null,"candidates":"#,
+        1,
+    );
+    assert!(candidates_twice.contains("null"), "{candidates_twice}");
     let cases: Vec<(&str, Scenario, &str)> = vec![
+        (
+            "duplicate field",
+            claude_says(&duplicate),
+            "duplicate field `priority`",
+        ),
+        (
+            "candidates twice",
+            claude_says(&candidates_twice),
+            "invalid type: null",
+        ),
         (
             "malformed",
             claude_says("{\"panelist\": }"),

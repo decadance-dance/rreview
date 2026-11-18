@@ -119,7 +119,8 @@ pub fn parse(raw: &str, role: &Role, diff_files: &BTreeSet<String>) -> Result<En
     {
         bail!("candidate {} is not a JSON object", i + 1);
     }
-    let env: Envelope = serde_json::from_value(value).context("malformed panelist envelope")?;
+    // Decoded again from the text: a `Value` keeps only the last of repeated keys.
+    let env: Envelope = serde_json::from_str(body).context("malformed panelist envelope")?;
     if env.panelist != role.name {
         bail!(
             "envelope names panelist {:?}, want {:?}",
@@ -256,6 +257,27 @@ mod tests {
                 "{field} = {value}"
             );
         }
+    }
+
+    #[test]
+    fn rejects_duplicate_fields() {
+        let c = r#"{"path": "src/a.rs", "line_start": 3, "line_end": 4, "priority": 4, "priority": 1,
+            "title": "t", "root_cause": "r", "trigger": "g", "impact": "i",
+            "evidence": ["src/a.rs:3"], "confidence_score": 0.9, "dedupe_key": "k"}"#;
+        let raw = format!(
+            r#"{{"panelist": "Reliability & Operations", "coverage_summary": "", "candidates": [{c}]}}"#
+        );
+        assert!(
+            err(&raw).contains("duplicate field `priority`"),
+            "{}",
+            err(&raw)
+        );
+        let raw = format!(
+            r#"{{"panelist": "Reliability & Operations", "coverage_summary": "", "candidates": null, "candidates": [{}]}}"#,
+            candidate()
+        );
+        // Rejected at the null, before serde reaches the repeated key.
+        assert!(err(&raw).contains("invalid type: null"), "{}", err(&raw));
     }
 
     #[test]

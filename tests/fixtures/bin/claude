@@ -36,8 +36,8 @@ if [ -n "$FAKE_REVIEW" ]; then
   settings=; prev=
   for a; do [ "$prev" = --settings ] && settings=$a; prev=$a; done
   out=$(dirname "$settings")/out/reliability.json
-  [ "$FAKE_REVIEW" = forge ] && printf '%s' "$FAKE_FORGED" > "$out"
-  [ "$FAKE_REVIEW" = symlink ] && ln -s "$FAKE_LOG.victim" "$out"
+  if [ "$FAKE_REVIEW" = forge ]; then printf '%s' "$FAKE_FORGED" > "$out" || exit 97; fi
+  if [ "$FAKE_REVIEW" = symlink ]; then ln -s "$FAKE_LOG.victim" "$out" || exit 97; fi
   printf '%s\n' "$FAKE_STDOUT"; exit 0
 fi
 fire_hooks() {
