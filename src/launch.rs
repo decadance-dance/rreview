@@ -12,8 +12,7 @@ use anyhow::{Context, Result, bail};
 use serde_json::json;
 
 /// What every reviewer inherits from the environment it starts in (spec §3); every other
-/// variable, such as a `GH_TOKEN` meant for rreview's own `gh`, is dropped. A trailing `*` makes
-/// a name a prefix.
+/// variable, such as a `GH_TOKEN` meant for rreview's own `gh`, is dropped.
 const INHERIT: &[&str] = &[
     // Run at all, find the user's login (the macOS keychain), give the sandboxed Bash a shell.
     "PATH",
@@ -24,11 +23,18 @@ const INHERIT: &[&str] = &[
     "TMPDIR",
     // Locale and the terminal the TUI draws in (the Orca runner).
     "LANG",
-    "LC_*",
+    "LC_ALL",
+    "LC_CTYPE",
+    "LC_COLLATE",
+    "LC_MESSAGES",
+    "LC_MONETARY",
+    "LC_NUMERIC",
+    "LC_TIME",
     "TZ",
     "TERM",
     "COLORTERM",
-    // Reach the API from a network behind a proxy or a private CA.
+    // Reach the API from a network behind a proxy or a private CA. A proxy URL may carry the
+    // proxy's user and password; when set, they reach the CLI and so the reviewer.
     "HTTPS_PROXY",
     "https_proxy",
     "NO_PROXY",
@@ -37,17 +43,15 @@ const INHERIT: &[&str] = &[
     "SSL_CERT_FILE",
 ];
 
-/// Claude's own login and config: its config dir (an Orca account home, say), or a key or
-/// token given by env. Codex needs none: its login is the `auth.json` in its run-scoped home.
-const CLAUDE_INHERIT: &[&str] = &[
-    "CLAUDE_CONFIG_DIR",
-    "ANTHROPIC_API_KEY",
-    "CLAUDE_CODE_OAUTH_TOKEN",
-];
+/// Claude's own subscription login: its config dir (an Orca account home, say) or a
+/// `claude setup-token` OAuth token, which then reaches the reviewer. Not `ANTHROPIC_API_KEY`:
+/// it would move the review to API billing (spec §1: subscriptions, not API keys). Codex needs
+/// none: its login is the `auth.json` in its run-scoped home.
+const CLAUDE_INHERIT: &[&str] = &["CLAUDE_CONFIG_DIR", "CLAUDE_CODE_OAUTH_TOKEN"];
 
 /// One reviewer process: program, argument vector, the variables it inherits (see [`INHERIT`]),
 /// extra env and working directory.
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct Launch {
     pub program: String,
     pub args: Vec<String>,
@@ -59,10 +63,7 @@ pub struct Launch {
 impl Launch {
     /// Whether the reviewer inherits `name` from the environment it starts in.
     pub fn inherits(&self, name: &str) -> bool {
-        self.inherit.iter().any(|p| match p.strip_suffix('*') {
-            Some(prefix) => name.starts_with(prefix),
-            None => name == *p,
-        })
+        self.inherit.contains(&name)
     }
 
     /// Runs with `prompt` on stdin. Stdout and stderr go to `<log>.stdout` and `<log>.stderr`.
@@ -154,10 +155,11 @@ pub fn claude(worktree: &Path, git_common_dir: &Path, runroot: &Path) -> Result<
 }
 
 /// The same isolation as [`claude`] as an interactive session (the orca runner). The reply file
-/// is written by a sandboxed Bash redirect into `<runroot>/out`; Claude asks before such a write
-/// outside its working dirs (`dontAsk` refuses it), so `out` is added as a working dir and
-/// `acceptEdits` takes it without a dialog nobody would answer. The deny rules still remove
-/// Edit and Write, and the sandbox still refuses every other write.
+/// is written by a sandboxed Bash redirect into `<runroot>/out`, added as a working dir so that
+/// write needs no approval. `dontAsk` refuses every call that would ask instead of showing a
+/// dialog nobody answers: under `acceptEdits` a WebSearch stopped the pass at its dialog until
+/// the timeout, and the wrap-up was typed into it (*verified*, Claude Code 2.1.316). The deny
+/// rules still remove Edit and Write, and the sandbox still refuses every other write.
 pub fn claude_tui(worktree: &Path, git_common_dir: &Path, runroot: &Path) -> Result<Launch> {
     let (settings, cwd) = claude_settings(worktree, git_common_dir, runroot)?;
     let out = absolute(&runroot.join("out"))?;
@@ -168,7 +170,7 @@ pub fn claude_tui(worktree: &Path, git_common_dir: &Path, runroot: &Path) -> Res
             "--settings",
             &settings,
             "--permission-mode",
-            "acceptEdits",
+            "dontAsk",
             "--add-dir",
             utf8(&out)?,
         ]

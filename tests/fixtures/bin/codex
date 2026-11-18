@@ -26,6 +26,7 @@ case "$1" in
 login) echo "Logged in using ChatGPT"; exit 0 ;;
 esac
 [ -n "$FAKE_LOG" ] && { echo "== codex"; env; } >> "$FAKE_LOG.env"
+[ "$1" = -C ] && exit 0  # the TUI under the fake orca
 out=; prev=
 for a; do [ "$prev" = -o ] && out=$a; prev=$a; done
 if [ -n "$FAKE_REVIEW" ]; then

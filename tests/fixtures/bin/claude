@@ -36,6 +36,7 @@ case "$1" in
 auth) echo '{"loggedIn": true, "authMethod": "fake"}'; exit 0 ;;
 esac
 [ -n "$FAKE_LOG" ] && { echo "== claude"; env; } >> "$FAKE_LOG.env"
+case " $* " in *" --permission-mode "*) exit 0 ;; esac  # the TUI under the fake orca
 if [ -n "$FAKE_REVIEW" ]; then
   prompt=$(cat)
   printf '%s\n' "$prompt" >> "$FAKE_LOG.prompt"

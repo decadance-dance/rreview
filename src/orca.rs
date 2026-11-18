@@ -7,7 +7,8 @@
 
 use std::collections::HashMap;
 use std::fs::{self, File};
-use std::io::{ErrorKind, Read};
+use std::io::{ErrorKind, Read, Write};
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::{Mutex, mpsc};
@@ -330,7 +331,7 @@ impl Runner for Orca {
             }
             _ => {}
         }
-        let command = shell_line(&self.launch(pass)?)?;
+        let command = shell_line(&self.launch(pass)?, &self.scratch(pass).join("bin"))?;
         let v = orca(
             &[
                 "terminal",
@@ -563,41 +564,66 @@ fn printable(text: &str) -> String {
         .collect()
 }
 
-/// Orca types `--command` into the terminal's login shell, so the launch becomes one shell line:
-/// `<unset> NAME='value' ... exec 'program' 'arg' ...`, every value and word single-quoted.
-/// `exec` leaves no shell behind the agent to receive later input. Not `exec env ...`: Orca then
-/// does not recognize the agent for `send` and types the prompt raw (*verified*, Orca 1.4.262).
-/// The terminal's environment is Orca's and the login shell's, not rreview's, so `<unset>`
-/// drops there every exported variable the launch does not inherit (spec §3); the values never
-/// go on the line, which the shell may keep in its history.
-// limit: a POSIX-family login shell (sh, bash, zsh); a variable the shell cannot unset (a bash
-// exported function, a readonly one) still reaches the agent.
-fn shell_line(launch: &Launch) -> Result<String> {
+/// Orca types `--command` into the terminal's login shell, whose environment is Orca's and the
+/// shell's own, not rreview's. So the agent starts through a shim, `<bin>/<program>`, that builds
+/// its environment from nothing at the last exec (spec §3): `/usr/bin/env -i` with each inherited
+/// variable that is set and the launch's own env. Nothing the shell holds can slip past it: a
+/// read-only export, a name that is no identifier, an exported function. The line is
+/// `PATH='<bin>':"$PATH" exec 'program' 'arg' ...`, every word single-quoted, no value on it
+/// (the shell may keep it in its history), and the shim takes `<bin>` off `PATH` again. `exec`
+/// leaves no shell behind the agent to receive later input. The program must be `exec`'s first
+/// word: with `exec env ...` or `exec '<path>/program'` Orca still names the agent, but its
+/// `send` reports provider "unsupported" and types the prompt raw (*verified*, Orca 1.4.262).
+// limit: a POSIX-family login shell (sh, bash, zsh) types the line.
+fn shell_line(launch: &Launch, bin: &Path) -> Result<String> {
     let quote = |w: &str| -> Result<String> {
         if w.chars().any(char::is_control) {
             bail!("cannot put {w:?} on a shell line");
         }
         Ok(format!("'{}'", w.replace('\'', r"'\''")))
     };
-    for p in &launch.inherit {
-        let name = p.strip_suffix('*').unwrap_or(p);
-        if name.is_empty() || !name.chars().all(|c| c == '_' || c.is_ascii_alphanumeric()) {
-            bail!("cannot put the pattern {p:?} on a shell line");
-        }
+    let name = |k: &str| !k.is_empty() && k.chars().all(|c| c == '_' || c.is_ascii_alphanumeric());
+    if launch.program.contains('/') || launch.program.starts_with('.') || launch.program.is_empty()
+    {
+        bail!("cannot shim the program {:?}", launch.program);
     }
-    // `command` skips an alias the user's shell may define for `env` or `sed`.
-    let mut line = format!(
-        "for v in $(command env | command sed -n 's/^\\([A-Za-z_][A-Za-z0-9_]*\\)=.*/\\1/p'); \
-         do case $v in {}) ;; *) unset $v ;; esac; done; ",
-        launch.inherit.join("|")
+    fs::create_dir_all(bin).with_context(|| format!("{}", bin.display()))?;
+    let bin = fs::canonicalize(bin).with_context(|| format!("{}", bin.display()))?;
+    let bin_q = quote(launch::utf8(&bin)?)?;
+    let mut shim = format!(
+        "#!/bin/sh\n# rreview: {} with only the variables it inherits (spec §3).\n\
+         PATH=${{PATH#{bin_q}:}}\nexec /usr/bin/env -i",
+        launch.program
     );
+    for k in &launch.inherit {
+        if !name(k) {
+            bail!("cannot inherit the variable {k:?}");
+        }
+        shim += &format!(" ${{{k}+\"{k}=${k}\"}}");
+    }
     for (k, v) in &launch.env {
-        if k.is_empty() || !k.chars().all(|c| c == '_' || c.is_ascii_alphanumeric()) {
+        if !name(k) {
             bail!("cannot put the variable {k:?} on a shell line");
         }
-        line += &format!("{k}={} ", quote(v)?);
+        shim += &format!(" {}", quote(&format!("{k}={v}"))?);
     }
-    line += "exec";
+    shim += &format!(" {} \"$@\"\n", quote(&launch.program)?);
+    let path = bin.join(&launch.program);
+    // A fresh file: whatever stands at that path is replaced, never written through.
+    match fs::remove_file(&path) {
+        Err(e) if e.kind() != ErrorKind::NotFound => {
+            return Err(e).with_context(|| format!("{}", path.display()));
+        }
+        _ => {}
+    }
+    fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o700)
+        .open(&path)
+        .and_then(|mut f| f.write_all(shim.as_bytes()))
+        .with_context(|| format!("{}", path.display()))?;
+    let mut line = format!("PATH={bin_q}:\"$PATH\" exec");
     for w in [&launch.program].into_iter().chain(&launch.args) {
         line += &format!(" {}", quote(w)?);
     }
@@ -688,89 +714,105 @@ mod tests {
 
     #[test]
     fn shell_line_quotes_every_word() {
+        let root = crate::doctor::fresh_temp_dir("rreview-test").unwrap();
+        let bin = root.join("it's bin");
         let launch = Launch {
             program: "codex".into(),
             args: vec!["-C".into(), "/a b/it's".into()],
-            inherit: vec!["PATH", "LC_*"],
+            inherit: vec!["PATH", "LC_ALL"],
             env: vec![("CODEX_HOME".into(), "/h $x".into())],
             cwd: PathBuf::from("/"),
         };
-        assert!(
-            shell_line(&launch)
-                .unwrap()
-                .ends_with(r"CODEX_HOME='/h $x' exec 'codex' '-C' '/a b/it'\''s'")
+        let q = r"'\''";
+        assert_eq!(
+            shell_line(&launch, &bin).unwrap(),
+            format!(
+                "PATH='{}/it{q}s bin':\"$PATH\" exec 'codex' '-C' '/a b/it{q}s'",
+                root.display()
+            )
         );
-        let bad = Launch {
-            args: vec!["a\nrm -rf x".into()],
-            ..launch
-        };
-        assert!(shell_line(&bad).is_err());
-        let bad = Launch {
-            inherit: vec!["X) ;; *) rm -rf x"],
-            args: vec![],
-            ..bad
-        };
-        assert!(shell_line(&bad).is_err());
+        let shim = fs::read_to_string(bin.join("codex")).unwrap();
+        assert!(
+            shim.ends_with(
+                " ${PATH+\"PATH=$PATH\"} ${LC_ALL+\"LC_ALL=$LC_ALL\"} 'CODEX_HOME=/h $x' 'codex' \"$@\"\n"
+            ),
+            "{shim}"
+        );
+        for bad in [
+            Launch {
+                args: vec!["a\nrm -rf x".into()],
+                ..launch.clone()
+            },
+            Launch {
+                inherit: vec!["X) ;; *) rm -rf x"],
+                ..launch.clone()
+            },
+            Launch {
+                program: "../codex".into(),
+                ..launch.clone()
+            },
+        ] {
+            assert!(shell_line(&bad, &bin).is_err(), "{bad:?}");
+        }
+        fs::remove_dir_all(root).unwrap();
     }
 
-    /// The terminal's shell has Orca's environment; the agent gets only what it inherits and
-    /// the launch's own env, in every shell family Orca may start.
+    /// The terminal's shell has Orca's environment and whatever the user's startup files add;
+    /// the agent gets exactly what it inherits and the launch's own env, in every shell family
+    /// Orca may start, whatever that shell cannot unset (review of PR #24).
     #[test]
     fn shell_line_drops_what_the_agent_does_not_inherit() {
+        let root = crate::doctor::fresh_temp_dir("rreview-test").unwrap();
         let launch = Launch {
             program: "env".into(),
             args: vec![],
-            inherit: vec!["PATH", "HOME", "LC_*"],
+            inherit: vec!["PATH", "HOME", "LC_CTYPE", "LC_ALL"],
             env: vec![("CODEX_HOME".into(), "/run/codex-home".into())],
             cwd: PathBuf::from("/"),
         };
-        let line = shell_line(&launch).unwrap();
+        let line = shell_line(&launch, &root.join("bin")).unwrap();
         let mut ran = 0;
-        for shell in ["/bin/sh", "/bin/bash", "/bin/zsh"] {
+        for (shell, startup) in [
+            ("/bin/sh", ""),
+            (
+                "/bin/bash",
+                "export RO_SECRET=canary; readonly RO_SECRET; \
+                 f() { echo canary; }; export -f f; ",
+            ),
+            ("/bin/zsh", "typeset -rx RO_SECRET=canary; "),
+        ] {
             if !Path::new(shell).exists() {
                 continue;
             }
-            let out = Command::new(shell)
-                .args(["-c", &line])
-                .env_clear()
-                .env("PATH", "/usr/bin:/bin")
-                .env("HOME", "/home/u")
-                .env("LC_CTYPE", "C")
-                .env("GH_TOKEN", "canary")
-                .env("MULTI", "a\nGH_TOKEN=b\nHOME=c")
-                .env("CODEX_HOME", "/orca/account")
+            let out = Command::new("/usr/bin/env")
+                .args(["-i", "PATH=/usr/bin:/bin", "HOME=/home/u", "LC_CTYPE=C"])
+                .args([
+                    "GH_TOKEN=canary",
+                    "DOTTED.SECRET=canary",
+                    "CODEX_HOME=/orca",
+                ])
+                .args(["MULTI=a\nGH_TOKEN=canary\nHOME=canary"])
+                .args([shell, "-c", &format!("{startup}{line}")])
                 .output()
                 .unwrap();
             let env = String::from_utf8(out.stdout).unwrap();
-            let names: Vec<_> = env.lines().filter_map(|l| l.split_once('=')).collect();
-            for want in [
-                ("PATH", "/usr/bin:/bin"),
-                ("HOME", "/home/u"),
-                ("LC_CTYPE", "C"),
-                ("CODEX_HOME", "/run/codex-home"),
-            ] {
-                assert!(names.contains(&want), "{shell}: no {want:?} in {env}");
-            }
-            for (k, _) in &names {
-                // The shell itself may add these on exec.
-                assert!(
-                    [
-                        "PATH",
-                        "HOME",
-                        "LC_CTYPE",
-                        "CODEX_HOME",
-                        "SHLVL",
-                        "_",
-                        "PWD",
-                        "OLDPWD"
-                    ]
-                    .contains(k),
-                    "{shell} passed {k}: {env}"
-                );
-            }
+            let mut got: Vec<_> = env.lines().collect();
+            got.sort();
+            assert_eq!(
+                got,
+                [
+                    "CODEX_HOME=/run/codex-home",
+                    "HOME=/home/u",
+                    "LC_CTYPE=C",
+                    "PATH=/usr/bin:/bin"
+                ],
+                "{shell}: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
             ran += 1;
         }
         assert!(ran > 0);
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
