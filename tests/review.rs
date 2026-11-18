@@ -1111,6 +1111,14 @@ fn an_invalid_reply_gets_one_retry_turn() {
     );
     assert!(run.log.contains(" --resume "), "{run:?}");
     assert!(run.log.contains("resume fake-thread -"), "{run:?}");
+    let logs = fx.runroot().join("logs");
+    for log in [
+        "coordinator.stdout",
+        "coordinator-turn2.stdout",
+        "intent_contracts-turn2.stdout",
+    ] {
+        assert!(logs.join(log).is_file(), "{log}");
+    }
     assert_eq!(fx.result().unwrap()["degraded"], false);
 }
 

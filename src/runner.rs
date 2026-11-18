@@ -157,7 +157,16 @@ impl Runner for Headless {
                 launch.args.extend(stdin);
             }
         }
-        self.finish(pass, &launch, message, &self.log(pass, "-wrapup")?, timeout)
+        // A pass may get a wrap-up and then a retry; each turn keeps its own logs.
+        let turn = (2..)
+            .map(|n| format!("-turn{n}"))
+            .find(|t| {
+                !first
+                    .with_file_name(format!("{}{t}.stdout", pass.role))
+                    .exists()
+            })
+            .unwrap_or_default();
+        self.finish(pass, &launch, message, &self.log(pass, &turn)?, timeout)
     }
 }
 
