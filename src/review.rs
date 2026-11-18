@@ -726,7 +726,7 @@ fn pr_commit<'a>(
             String::from_utf8_lossy(&out.stderr).trim()
         );
     }
-    // ponytail: GitHub lists at most 250 commits of a PR; a later commit of a longer PR is refused.
+    // limit: GitHub lists at most 250 commits of a PR; a later commit of a longer PR is refused.
     if !String::from_utf8_lossy(&out.stdout)
         .lines()
         .any(|l| l.trim() == sha)
