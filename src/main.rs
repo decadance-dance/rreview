@@ -58,8 +58,8 @@ struct Cli {
     /// The task's acceptance criteria, for the intent lens and the coordinator.
     #[arg(long, value_name = "PATH")]
     context_file: Option<PathBuf>,
-    /// The reporting bar, e.g. `p<=2,conf>=0.8` (the default).
-    #[arg(long, default_value = "p<=2,conf>=0.8", conflicts_with = "all")]
+    /// The reporting bar, e.g. `p<=2,conf>=0.5` (the default).
+    #[arg(long, default_value = "p<=2,conf>=0.5", conflicts_with = "all")]
     gate: Gate,
     /// Report every finding (no gate).
     #[arg(long)]

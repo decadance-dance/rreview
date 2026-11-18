@@ -54,7 +54,9 @@ pub struct Gate {
 impl Gate {
     pub const DEFAULT: Gate = Gate {
         max_priority: 2,
-        min_confidence: 0.8,
+        // Calibration (docs/calibration.md): the coordinator scores even defects it confirmed
+        // 0.5-0.72, so a 0.8 bar let through only judge restorations.
+        min_confidence: 0.5,
     };
     pub const NONE: Gate = Gate {
         max_priority: 3,
@@ -68,7 +70,7 @@ impl Gate {
 
 impl std::str::FromStr for Gate {
     type Err = String;
-    /// `p<=2,conf>=0.8`; a part left out keeps its default.
+    /// `p<=2,conf>=0.5`; a part left out keeps its default.
     fn from_str(s: &str) -> Result<Gate, String> {
         let mut g = Gate::DEFAULT;
         for part in s.split(',').map(str::trim) {
@@ -192,17 +194,17 @@ mod tests {
 
     #[test]
     fn gate_parses_and_filters() {
-        assert_eq!("p<=2,conf>=0.8".parse::<Gate>().unwrap(), Gate::DEFAULT);
+        assert_eq!("p<=2,conf>=0.5".parse::<Gate>().unwrap(), Gate::DEFAULT);
         let g: Gate = "p<=1".parse().unwrap();
-        assert_eq!((g.max_priority, g.min_confidence), (1, 0.8));
-        let g: Gate = " conf>=0.5 ".parse().unwrap();
-        assert_eq!((g.max_priority, g.min_confidence), (2, 0.5));
+        assert_eq!((g.max_priority, g.min_confidence), (1, 0.5));
+        let g: Gate = " conf>=0.8 ".parse().unwrap();
+        assert_eq!((g.max_priority, g.min_confidence), (2, 0.8));
         for bad in ["p<=4", "conf>=1.1", "p<2", "", "p<=-1", "conf>=x"] {
             assert!(bad.parse::<Gate>().is_err(), "{bad}");
         }
-        assert!(Gate::DEFAULT.keep(&f("t", 1, 2, 0.8)));
+        assert!(Gate::DEFAULT.keep(&f("t", 1, 2, 0.5)));
         assert!(!Gate::DEFAULT.keep(&f("t", 1, 3, 0.9)));
-        assert!(!Gate::DEFAULT.keep(&f("t", 1, 0, 0.79)));
+        assert!(!Gate::DEFAULT.keep(&f("t", 1, 0, 0.49)));
         assert!(Gate::NONE.keep(&f("t", 1, 3, 0.0)));
     }
 
@@ -242,20 +244,17 @@ mod tests {
     /// one's priority with the other's confidence.
     #[test]
     fn the_duplicate_that_clears_the_gate_wins() {
+        let gate: Gate = "p<=2,conf>=0.8".parse().unwrap();
         for findings in [
             vec![f("t", 1, 2, 0.70), f("t", 1, 1, 0.95)],
             vec![f("t", 1, 1, 0.95), f("t", 1, 2, 0.70)],
             // The more urgent one misses the gate; the other clears it.
             vec![f("t", 1, 1, 0.70), f("t", 1, 2, 0.95)],
         ] {
-            let want = findings
-                .iter()
-                .find(|f| Gate::DEFAULT.keep(f))
-                .unwrap()
-                .clone();
-            let out = dedupe(findings, Gate::DEFAULT);
+            let want = findings.iter().find(|f| gate.keep(f)).unwrap().clone();
+            let out = dedupe(findings, gate);
             assert_eq!(out.len(), 1);
-            assert!(Gate::DEFAULT.keep(&out[0]), "{out:?}");
+            assert!(gate.keep(&out[0]), "{out:?}");
             assert_eq!(
                 (out[0].priority, out[0].confidence_score),
                 (want.priority, want.confidence_score)
@@ -265,7 +264,7 @@ mod tests {
         // Neither clears it: the most urgent, then the most confident.
         let out = dedupe(
             vec![f("t", 1, 3, 0.9), f("t", 1, 2, 0.5), f("t", 1, 2, 0.6)],
-            Gate::DEFAULT,
+            gate,
         );
         assert_eq!((out[0].priority, out[0].confidence_score), (2, 0.6));
     }
