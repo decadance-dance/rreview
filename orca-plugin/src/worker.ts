@@ -5,7 +5,7 @@ import type { OrcaWorkerApi } from 'orca/worker'
 import { execFile, spawn } from 'node:child_process'
 import { open, writeFile } from 'node:fs/promises'
 import { isAbsolute, join } from 'node:path'
-import { findingKey, type Finding, type PassEvent, type Pr, type Result, type Run, type Runner, type Target } from './protocol'
+import { findingKey, TEXT_CAP, type Finding, type PassEvent, type Pr, type Result, type Run, type Runner, type Target } from './protocol'
 
 const GH_TIMEOUT_MS = 30_000
 // rreview bounds itself by its --budget (default 3600 s) and its bounded cleanup; this only stops a
@@ -23,7 +23,6 @@ const META_CAP = 64 << 10
 const RESULT_FILE_CAP = STDOUT_CAP
 /** What `review.result` answers, well under Orca's 1 MiB answer and 512 KiB panel render limits. */
 const RESULT_CAP = 200_000
-const TEXT_CAP = 4_000
 const RUN_KEY = 'run'
 
 function fail(code: string, message: string): Error {

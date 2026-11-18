@@ -99,7 +99,11 @@ declare module 'orca' {
   }
 }
 
-/** A finding's key: rreview dedupes on file, start line and title, so this is unique in a result. */
+/** Text past this many characters is cut for the panel (the worker's `review.result`). */
+export const TEXT_CAP = 4_000
+
+/** A finding's key: rreview dedupes on file, start line and title, so this is unique in a result.
+ * Only the title's first `TEXT_CAP` characters count, so a title cut for the panel keeps its key. */
 export function findingKey(f: Finding): string {
-  return `${f.file}#${f.start_line}#${f.title}`
+  return `${f.file}#${f.start_line}#${f.title.slice(0, TEXT_CAP)}`
 }

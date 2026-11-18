@@ -48,7 +48,7 @@ const picked = atom<string[]>([])
 /** Agents in the reviewed run's workspace; `session` is what `findings.send` checks. */
 const agents = atom<{ value: string; label: string; session: string | null }[]>([])
 /** The terminal the person chose; never picked for them. */
-const author = atom<string | null>(null)
+const author = atom<{ terminalId: string; sessionId: string | null } | null>(null)
 const notice = atom<{ tone: Tone; text: string } | null>(null)
 
 const errorText = (e: unknown) => (e instanceof Error ? e.message : String(e))
@@ -77,7 +77,9 @@ async function loadAgents(): Promise<void> {
   } catch {
     set(agents, [])
   }
-  if (!read(agents).some((o) => o.value === read(author))) set(author, null)
+  // The choice is a terminal and the agent session it ran when chosen: a change of either drops it.
+  const a = read(author)
+  if (!read(agents).some((o) => o.value === a?.terminalId && o.session === a.sessionId)) set(author, null)
 }
 
 async function showRun(r: Run | null): Promise<void> {
@@ -111,9 +113,9 @@ async function startReview(): Promise<void> {
 }
 
 async function sendToAuthor(): Promise<void> {
-  const terminalId = read(author)
-  if (!terminalId) return
-  const sessionId = read(agents).find((a) => a.value === terminalId)?.session ?? null
+  const a = read(author)
+  if (!a) return
+  const { terminalId, sessionId } = a
   try {
     const { sent, file } = await plugin.request('findings.send', { terminalId, sessionId, keys: read(picked) })
     set(notice, { tone: 'success', text: `Sent ${sent} finding${sent === 1 ? '' : 's'} to the author (${file}).` })
@@ -365,9 +367,9 @@ function Findings({ r }: { r: Run }) {
         <Select
           label="Author agent (in the reviewed workspace)"
           placeholder={read(agents).length ? 'Choose the author agent' : 'No agent in the reviewed workspace'}
-          value={read(author) ?? undefined}
+          value={read(author)?.terminalId ?? undefined}
           options={read(agents).map(({ value, label }) => ({ value, label }))}
-          onChange={(v) => set(author, v)}
+          onChange={(v) => set(author, { terminalId: v, sessionId: read(agents).find((o) => o.value === v)?.session ?? null })}
         />
         <Button icon="next" disabled={!keys.length || !read(author)} onPress={sendToAuthor}>
           {`Send ${keys.length} to author`}

@@ -5,7 +5,7 @@ import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpath
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
-import type { Run } from './protocol'
+import { findingKey, type Run } from './protocol'
 import * as main from './worker'
 import { authorLine, clean, formatFindings, parseProgress } from './worker'
 
@@ -292,6 +292,19 @@ test('a large result keeps every post and stored value under Orca limits and the
   } finally {
     delete process.env.FAKE_RESULT_FILE
   }
+})
+
+test('a finding whose title is cut for the panel can still be sent by the key the panel shows', async () => {
+  const long = finding('src/a.rs', 10, 'T'.repeat(4_001))
+  process.env.FAKE_RESULT = JSON.stringify({ ...RESULT, findings: [long], ungated_findings: [long] })
+  const worker = await mountWorker(main, { host: host() })
+  await worker.request('review.start', { workspaceId: 'ws1', runner: 'headless' })
+  await ended(worker)
+  const shown = (await worker.request('review.result'))!.findings[0]
+  assert.ok(shown.title.length < 4_100 && shown.title !== long.title, 'the title is cut for the panel')
+  const sent = await worker.request('findings.send', { terminalId: 't1', sessionId: 's1', keys: [findingKey(shown)] })
+  assert.equal(sent.sent, 1)
+  assert.ok(readFileSync(sent.file, 'utf8').includes(long.title))
 })
 
 test('a storage failure is logged and the panel still hears the end', async () => {

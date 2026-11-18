@@ -2294,6 +2294,62 @@ fn orca_cleans_up_a_worktree_whose_create_reply_was_lost() {
     fx.assert_orca_worktree_removed();
 }
 
+/// A second run of a head that is still under review, with the same state home (PR #23 round 2,
+/// finding 1). The Orca runner's worktree lives outside the run dir, so nothing else stops it:
+/// it stops before it touches the run dir, the first run's progress, meta.json and result stay
+/// its own, and once the first ends a new run goes ahead.
+#[test]
+fn a_second_run_of_a_head_under_review_stops() {
+    let fx = fixture();
+    fx.install_fakes();
+    let reply = ("FAKE_REPLY", envelope("src/lib.rs").to_string());
+    // Each run plays its own fake terminals.
+    let log = |id: &str| ("FAKE_LOG", fx.root.join(id).display().to_string());
+    std::thread::scope(|s| {
+        let first = s.spawn(|| {
+            orca_run_with(
+                &fx,
+                &[],
+                "ok",
+                &[
+                    reply.clone(),
+                    log("a"),
+                    ("FAKE_ORCA_WAIT_DELAY", "3".into()),
+                ],
+            )
+        });
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while !fx.runroot().join("progress.jsonl").exists() {
+            assert!(
+                Instant::now() < deadline,
+                "the first run never started its pass"
+            );
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        let second = orca_run_with(&fx, &[], "ok", &[reply.clone(), log("b")]);
+        assert_eq!(second.code, Some(2), "{second:?}");
+        assert!(
+            second
+                .stderr
+                .contains("another review of this PR head is running"),
+            "{second:?}"
+        );
+        let first = first.join().unwrap();
+        assert_eq!(first.code, Some(0), "{first:?}");
+        let id = first
+            .stderr
+            .lines()
+            .find_map(|l| l.strip_prefix("run id: "));
+        let meta: Value =
+            serde_json::from_str(&fs::read_to_string(fx.runroot().join("meta.json")).unwrap())
+                .unwrap();
+        assert_eq!(meta["run_id"].as_str(), id);
+        assert_eq!(fx.statuses(), ["started", "completed"]);
+    });
+    let third = orca_run_with(&fx, &[], "ok", &[reply.clone(), log("c")]);
+    assert_eq!(third.code, Some(0), "{third:?}");
+}
+
 /// Two runs for one PR head in one repo at once (round 2, finding 1): each creates and removes
 /// only its own worktree and branch. Both pass the branch check before either creates.
 #[test]

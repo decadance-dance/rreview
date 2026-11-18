@@ -84,6 +84,27 @@ test('a finished review lists findings by file and sends the picked ones', async
   await view.unmount()
 })
 
+test('the author choice is dropped when its terminal runs another agent session', async () => {
+  const { host, calls } = setup(done)
+  const view = await mount(panel, { host })
+  const picker = { label: 'Author agent (in the reviewed workspace)' }
+  await view.select(picker, 't1')
+  const t1 = AGENTS.ws1[0] as { sessionId: string }
+  t1.sessionId = 's2'
+  try {
+    await view.emit('agent.status.changed', { workspaceId: 'ws1', paneKey: 'p1', terminalId: 't1', state: 'waiting', receivedAt: 1, sessionId: 's2' })
+    // The person chose session s1: the replacement is not chosen for them.
+    assert.equal(view.find(picker)?.props?.value, undefined)
+    assert.equal(view.find({ text: 'Send 2 to author' })?.props?.disabled, true)
+    await view.select(picker, 't1')
+    await view.press({ text: 'Send 2 to author' })
+    assert.equal((calls.at(-1)?.input as { sessionId: string }).sessionId, 's2')
+  } finally {
+    t1.sessionId = 's1'
+  }
+  await view.unmount()
+})
+
 test('a failed review is shown as failed with its error', async () => {
   const { host } = setup(failed)
   const view = await mount(panel, { host })

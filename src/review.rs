@@ -188,6 +188,8 @@ pub fn run(args: &Args) -> Result<u8> {
         .join(owner)
         .join(name)
         .join(format!("{}-{head}", pr.number));
+    // Held until this function returns, past the last write into the run dir.
+    let _lock = lock_head(&runroot)?;
     let wt_path = runroot.join("wt");
     if wt_path.exists() {
         bail!(
@@ -195,7 +197,6 @@ pub fn run(args: &Args) -> Result<u8> {
             wt_path.display()
         );
     }
-    // limit: two runs for the same PR head at once share this dir; the later one wipes it.
     if runroot.exists() {
         fs::remove_dir_all(&runroot).with_context(|| format!("{}", runroot.display()))?;
     }
@@ -471,6 +472,34 @@ pub fn run(args: &Args) -> Result<u8> {
     )?;
     eprintln!("run dir: {}", runroot.display());
     print_result(&result, args.json)
+}
+
+/// Locks `<runroot>.lock`, beside the run dir, which a rerun removes and recreates: two runs of
+/// one PR head would share the dir and mix their progress and results. The OS drops the lock
+/// when the process ends, a crash too.
+fn lock_head(runroot: &Path) -> Result<fs::File> {
+    let mut path = runroot.as_os_str().to_owned();
+    path.push(".lock");
+    let path = PathBuf::from(path);
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).with_context(|| format!("{}", parent.display()))?;
+    }
+    let file = OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(&path)
+        .with_context(|| format!("{}", path.display()))?;
+    match file.try_lock() {
+        Ok(()) => Ok(file),
+        Err(fs::TryLockError::WouldBlock) => bail!(
+            "another review of this PR head is running (it holds {}); wait for it to end",
+            path.display()
+        ),
+        Err(fs::TryLockError::Error(e)) => {
+            Err(e).with_context(|| format!("cannot lock {}", path.display()))
+        }
+    }
 }
 
 /// `rreview show`: the result in a run dir, or of the latest finished review of a PR.
