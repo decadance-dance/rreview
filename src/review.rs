@@ -31,6 +31,8 @@ const PIPELINE: [&str; 2] = ["coordinator", "judge"];
 pub struct Args {
     pub pr: String,
     pub repo: Option<String>,
+    /// Review this commit instead of the PR's current head (a full commit id).
+    pub head: Option<String>,
     /// Run this panelist alone, without coordinator and judge (a development flag).
     pub only: Option<String>,
     /// The family that wrote the change; the defaults give most discovery and the judge to
@@ -157,7 +159,10 @@ pub fn run(args: &Args) -> Result<u8> {
     // The budget covers preparation too: gh, a fetch or a checkout hook can stall.
     let pr = view_pr(&args.pr, args.repo.as_deref(), deadline)?;
     let (owner, name) = owner_and_name(&pr.url)?;
-    let head = commit(&pr.head_ref_oid, "headRefOid")?;
+    let head = match &args.head {
+        Some(h) => h.as_str(),
+        None => commit(&pr.head_ref_oid, "headRefOid")?,
+    };
     // A merged PR's base branch now contains its head; its diff is against the base before the merge.
     let base_tip = match (&*pr.state, &pr.merge_commit) {
         ("MERGED", Some(m)) => format!("{}^1", commit(&m.oid, "mergeCommit")?),

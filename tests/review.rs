@@ -397,6 +397,49 @@ fn merged_pr_is_reviewed_against_the_base_before_its_merge() {
     assert_eq!(meta["base"], fx.base.as_str());
 }
 
+/// `--head` reviews an earlier commit of the PR: the one an earlier review looked at.
+#[test]
+fn head_reviews_an_earlier_commit_of_the_pr() {
+    let fx = fixture();
+    git(&fx.upstream, &["checkout", "-q", "--detach", &fx.head]);
+    fs::write(fx.upstream.join("later.txt"), "later\n").unwrap();
+    git(&fx.upstream, &["add", "."]);
+    git(&fx.upstream, &["commit", "-q", "-m", "later push"]);
+    let later = git(&fx.upstream, &["rev-parse", "HEAD"]);
+    git(&fx.upstream, &["update-ref", "refs/pull/7/head", &later]);
+    git(&fx.upstream, &["checkout", "-q", "main"]);
+    let mut pr = fx.pr();
+    pr["headRefOid"] = later.into();
+
+    // later.txt is not in the earlier head's diff, so a candidate there fails validation.
+    let run = fx.run_pr(
+        &pr,
+        &["--head", &fx.head],
+        &claude_says(&envelope("later.txt").to_string()),
+    );
+    assert_eq!(run.code, Some(2), "{run:?}");
+    let run = fx.run_pr(
+        &pr,
+        &["--head", &fx.head],
+        &claude_says(&envelope("src/lib.rs").to_string()),
+    );
+    assert_eq!(run.code, Some(0), "{run:?}");
+    let meta: Value =
+        serde_json::from_str(&fs::read_to_string(fx.runroot().join("meta.json")).unwrap()).unwrap();
+    assert_eq!(meta["head"], fx.head.as_str());
+    assert_eq!(meta["base"], fx.base.as_str());
+    assert!(
+        run.prompt
+            .contains(&format!("git diff {}..{}", fx.base, fx.head))
+    );
+
+    for bad in ["HEAD", "--upload-pack=x", &fx.head[..12]] {
+        let run = fx.run_pr(&pr, &[&format!("--head={bad}")], &[]);
+        assert_eq!(run.code, Some(2), "{bad}: {run:?}");
+        assert!(run.stderr.contains("full commit id"), "{bad}: {run:?}");
+    }
+}
+
 /// Every way a reply can be wrong fails the pass, leaves no `out/reliability.json` (not even
 /// one the reviewer wrote there itself), and removes the worktree. A reply that does not
 /// validate gets one retry turn first (the fake repeats itself); a failed CLI does not.
