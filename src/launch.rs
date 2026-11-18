@@ -155,11 +155,11 @@ pub fn claude(worktree: &Path, git_common_dir: &Path, runroot: &Path) -> Result<
 }
 
 /// The same isolation as [`claude`] as an interactive session (the orca runner). The reply file
-/// is written by a sandboxed Bash redirect into `<runroot>/out`, added as a working dir so that
-/// write needs no approval. `dontAsk` refuses every call that would ask instead of showing a
-/// dialog nobody answers: under `acceptEdits` a WebSearch stopped the pass at its dialog until
-/// the timeout, and the wrap-up was typed into it (*verified*, Claude Code 2.1.316). The deny
-/// rules still remove Edit and Write, and the sandbox still refuses every other write.
+/// is written by a sandboxed Bash redirect into `<runroot>/out`; Claude asks before such a write
+/// outside its working dirs, so `out` is added as a working dir and `acceptEdits` takes it
+/// without a dialog nobody would answer. Not `dontAsk`: on a live pass it refused the
+/// reviewer's heredoc reply twice (*verified*, Claude Code 2.1.316). The deny rules still remove
+/// Edit and Write, and the sandbox still refuses every other write.
 pub fn claude_tui(worktree: &Path, git_common_dir: &Path, runroot: &Path) -> Result<Launch> {
     let (settings, cwd) = claude_settings(worktree, git_common_dir, runroot)?;
     let out = absolute(&runroot.join("out"))?;
@@ -170,7 +170,7 @@ pub fn claude_tui(worktree: &Path, git_common_dir: &Path, runroot: &Path) -> Res
             "--settings",
             &settings,
             "--permission-mode",
-            "dontAsk",
+            "acceptEdits",
             "--add-dir",
             utf8(&out)?,
         ]
@@ -197,7 +197,10 @@ fn claude_settings(
     let settings = json!({
         "permissions": { "deny": [
             "Edit", "Write", "NotebookEdit", "mcp__*",
-            "Bash(gh *)", "Bash(git push*)", "Bash(curl *)", "Bash(wget *)"
+            "Bash(gh *)", "Bash(git push*)", "Bash(curl *)", "Bash(wget *)",
+            // Network tools; under the orca runner a WebSearch also stopped the pass at a
+            // permission dialog until its timeout (*verified*).
+            "WebSearch", "WebFetch"
         ] },
         "sandbox": {
             "enabled": true,
@@ -367,7 +370,9 @@ mod tests {
                 "Bash(gh *)",
                 "Bash(git push*)",
                 "Bash(curl *)",
-                "Bash(wget *)"
+                "Bash(wget *)",
+                "WebSearch",
+                "WebFetch"
             ])
         );
         let sandbox = &s["sandbox"];

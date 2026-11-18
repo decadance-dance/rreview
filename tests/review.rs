@@ -1780,7 +1780,7 @@ fn orca_pass_end_to_end() {
         let bin = runroot.join("scratch/reliability/bin");
         let args = if agent == "claude" {
             format!(
-                "'--safe-mode' '--settings' '{}' '--permission-mode' 'dontAsk' '--add-dir' '{}'",
+                "'--safe-mode' '--settings' '{}' '--permission-mode' 'acceptEdits' '--add-dir' '{}'",
                 runroot
                     .join("scratch/reliability/claude-settings.json")
                     .display(),
