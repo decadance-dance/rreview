@@ -150,12 +150,8 @@ pub fn summary(r: &ReviewResult) -> String {
             .collect();
         let _ = writeln!(
             s,
-            "DEGRADED: not every independent pass completed (failed or skipped: {}).",
-            if failed.is_empty() {
-                "judge".to_string()
-            } else {
-                failed.join(", ")
-            }
+            "DEGRADED: not every independent pass completed (failed: {}).",
+            failed.join(", ")
         );
     }
     s

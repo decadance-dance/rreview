@@ -1018,7 +1018,7 @@ fn a_failed_judge_keeps_the_coordinator_findings_and_degrades() {
     assert_eq!(fx.statuses_of("judge"), ["started", "retry", "failed"]);
     assert!(
         run.stdout
-            .contains("DEGRADED: not every independent pass completed (failed or skipped: judge)")
+            .contains("DEGRADED: not every independent pass completed (failed: judge)")
     );
 }
 
