@@ -280,3 +280,15 @@ fn hook_control_keeps_claude_out_of_the_user_home() {
         );
     }
 }
+
+#[test]
+fn fails_when_codex_rebuilds_the_result_line_from_the_probe_source() {
+    let run = doctor(ALL, &[("FAKE_CODEX", "rebuild")]);
+    assert!(!run.passed, "{}", run.stdout);
+    assert!(
+        run.stdout
+            .contains("FAIL  codex sandbox: write into the worktree: no evidence"),
+        "{}",
+        run.stdout
+    );
+}

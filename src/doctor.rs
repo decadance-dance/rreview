@@ -485,7 +485,9 @@ fn codex_probe(fx: &Fixture) -> Result<Vec<Check>> {
 }
 
 /// Evidence from Codex's own event log (`--json`), not from the model's reply: a completed
-/// command naming the probe whose output has the line only running it prints.
+/// command that is an invocation of the probe and nothing else, whose output has the line
+/// only running it prints. A fake agent forging its own event log is out of scope: doctor
+/// tests the real CLIs.
 fn probe_saw_blocked_write(events: &str, probe: &Path) -> bool {
     let probe = probe.to_string_lossy();
     events
@@ -497,12 +499,73 @@ fn probe_saw_blocked_write(events: &str, probe: &Path) -> bool {
                 && item["type"] == "command_execution"
                 && item["command"]
                     .as_str()
-                    .is_some_and(|c| c.contains(&*probe))
+                    .is_some_and(|c| runs_only(c, &probe))
                 && item["aggregated_output"].as_str().is_some_and(|o| {
                     o.lines()
                         .any(|l| l.trim() == "rreview-probe-result write=1")
                 })
         })
+}
+
+/// `command` (as Codex logs it, usually `/bin/zsh -lc '<script>'`) runs `script_path` and
+/// nothing else: `<script_path>` or `sh|bash <script_path>`, optionally inside one shell wrapper.
+fn runs_only(command: &str, script_path: &str) -> bool {
+    let is_shell = |w: &str| matches!(w.rsplit('/').next(), Some("sh" | "bash" | "zsh"));
+    let invokes = |words: &[String]| match words {
+        [path] => path == script_path,
+        [shell, path] => is_shell(shell) && path == script_path,
+        _ => false,
+    };
+    match sh_words(command) {
+        Some(words) => match words.as_slice() {
+            [shell, flag, script] if is_shell(shell) && (flag == "-c" || flag == "-lc") => {
+                sh_words(script).is_some_and(|inner| invokes(&inner))
+            }
+            words => invokes(words),
+        },
+        None => false,
+    }
+}
+
+/// Splits a POSIX shell command into words (quotes and backslashes). Operators such as `;`,
+/// `|` or `>` stay inside words, so a command using them never matches a plain invocation.
+fn sh_words(command: &str) -> Option<Vec<String>> {
+    let (mut words, mut word): (Vec<String>, Option<String>) = (vec![], None);
+    let mut chars = command.chars();
+    while let Some(c) = chars.next() {
+        match c {
+            ' ' | '\t' | '\n' => words.extend(word.take()),
+            '\'' => {
+                let w = word.get_or_insert_with(String::new);
+                loop {
+                    match chars.next()? {
+                        '\'' => break,
+                        c => w.push(c),
+                    }
+                }
+            }
+            '"' => {
+                let w = word.get_or_insert_with(String::new);
+                loop {
+                    match chars.next()? {
+                        '"' => break,
+                        '\\' => {
+                            let c = chars.next()?;
+                            if !matches!(c, '"' | '\\' | '$' | '`') {
+                                w.push('\\');
+                            }
+                            w.push(c);
+                        }
+                        c => w.push(c),
+                    }
+                }
+            }
+            '\\' => word.get_or_insert_with(String::new).push(chars.next()?),
+            c => word.get_or_insert_with(String::new).push(c),
+        }
+    }
+    words.extend(word);
+    Some(words)
 }
 
 fn run_codex(launch: &launch::Launch, prompt: &str, run: &Path) -> Result<String> {
@@ -586,6 +649,31 @@ mod tests {
             "write=x commit=128 branch=128 diff=0",
         ] {
             assert_eq!(parse_report(bad), None, "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn runs_only_accepts_just_an_invocation_of_the_script() {
+        let p = "/tmp/x/codex-probe.sh";
+        for ok in [
+            "/bin/zsh -lc 'sh /tmp/x/codex-probe.sh'",
+            "/bin/zsh -lc \"sh '/tmp/x/codex-probe.sh'\"",
+            "/bin/bash -c 'sh '\"'\"'/tmp/x/codex-probe.sh'\"'\"''",
+            "/bin/zsh -lc /tmp/x/codex-probe.sh",
+            "bash /tmp/x/codex-probe.sh",
+        ] {
+            assert!(runs_only(ok, p), "{ok}");
+        }
+        for bad in [
+            "/bin/zsh -lc 'cat /tmp/x/codex-probe.sh'",
+            "/bin/zsh -lc 'tail -n 1 /tmp/x/codex-probe.sh | sed s/x/y/'",
+            "/bin/zsh -lc 'sh /tmp/x/codex-probe.sh; echo rreview-probe-result write=1'",
+            "/bin/zsh -lc 'sh /tmp/x/codex-probe.sh > /dev/null'",
+            "/bin/zsh -lc 'python3 /tmp/x/codex-probe.sh'",
+            "/bin/zsh -lc 'sh /tmp/x/codex-probe.sh.bak'",
+            "/bin/zsh -lc 'sh /tmp/x/codex-probe.sh",
+        ] {
+            assert!(!runs_only(bad, p), "{bad}");
         }
     }
 
