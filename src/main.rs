@@ -35,6 +35,10 @@ struct Cli {
     /// The PR's repository (owner/name); default: the current repository.
     #[arg(long)]
     repo: Option<String>,
+    /// Review this commit of the PR instead of its current head, e.g. the head an earlier
+    /// review looked at. A full commit id.
+    #[arg(long, value_name = "SHA", value_parser = full_sha)]
+    head: Option<String>,
     /// How reviewers run.
     #[arg(long, value_enum, default_value_t = RunnerKind::Headless)]
     runner: RunnerKind,
@@ -54,8 +58,8 @@ struct Cli {
     /// The task's acceptance criteria, for the intent lens and the coordinator.
     #[arg(long, value_name = "PATH")]
     context_file: Option<PathBuf>,
-    /// The reporting bar, e.g. `p<=2,conf>=0.8` (the default).
-    #[arg(long, default_value = "p<=2,conf>=0.8", conflicts_with = "all")]
+    /// The reporting bar, e.g. `p<=2,conf>=0.5` (the default).
+    #[arg(long, default_value = "p<=2,conf>=0.5", conflicts_with = "all")]
     gate: Gate,
     /// Report every finding (no gate).
     #[arg(long)]
@@ -101,6 +105,15 @@ enum Command {
     },
 }
 
+/// A full hex id only: it becomes a git argument, so nothing that reads as a flag or a rev range.
+fn full_sha(s: &str) -> Result<String, String> {
+    if matches!(s.len(), 40 | 64) && s.bytes().all(|b| b.is_ascii_hexdigit()) {
+        Ok(s.to_ascii_lowercase())
+    } else {
+        Err("expected a full commit id (40 or 64 hex digits)".into())
+    }
+}
+
 fn parse_agent(s: &str) -> Result<Agent, String> {
     s.parse()
 }
@@ -144,6 +157,7 @@ fn main() -> ExitCode {
         None => review::run(&review::Args {
             pr: cli.pr.unwrap_or_default(),
             repo: cli.repo,
+            head: cli.head,
             only: cli.only,
             author: cli.author,
             role_agents: cli.role_agents,

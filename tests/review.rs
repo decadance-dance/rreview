@@ -397,6 +397,66 @@ fn merged_pr_is_reviewed_against_the_base_before_its_merge() {
     assert_eq!(meta["base"], fx.base.as_str());
 }
 
+/// `--head` reviews an earlier commit of the PR: the one an earlier review looked at.
+#[test]
+fn head_reviews_an_earlier_commit_of_the_pr() {
+    let fx = fixture();
+    git(&fx.upstream, &["checkout", "-q", "--detach", &fx.head]);
+    fs::write(fx.upstream.join("later.txt"), "later\n").unwrap();
+    git(&fx.upstream, &["add", "."]);
+    git(&fx.upstream, &["commit", "-q", "-m", "later push"]);
+    let later = git(&fx.upstream, &["rev-parse", "HEAD"]);
+    git(&fx.upstream, &["update-ref", "refs/pull/7/head", &later]);
+    git(&fx.upstream, &["checkout", "-q", "main"]);
+    let mut pr = fx.pr();
+    pr["headRefOid"] = later.clone().into();
+    let commits = ("FAKE_GH_COMMITS", format!("{}\n{later}", fx.head));
+
+    // later.txt is not in the earlier head's diff, so a candidate there fails validation.
+    let run = fx.run_pr(
+        &pr,
+        &["--head", &fx.head],
+        &with(
+            claude_says(&envelope("later.txt").to_string()),
+            std::slice::from_ref(&commits),
+        ),
+    );
+    assert_eq!(run.code, Some(2), "{run:?}");
+    assert!(
+        run.stderr
+            .contains("\"later.txt\" is not a file this change touches"),
+        "{run:?}"
+    );
+    let run = fx.run_pr(
+        &pr,
+        &["--head", &fx.head],
+        &with(
+            claude_says(&envelope("src/lib.rs").to_string()),
+            std::slice::from_ref(&commits),
+        ),
+    );
+    assert_eq!(run.code, Some(0), "{run:?}");
+    assert!(
+        run.log
+            .contains("gh api --paginate --jq .[].sha repos/acme/widget/pulls/7/commits"),
+        "{run:?}"
+    );
+    let meta: Value =
+        serde_json::from_str(&fs::read_to_string(fx.runroot().join("meta.json")).unwrap()).unwrap();
+    assert_eq!(meta["head"], fx.head.as_str());
+    assert_eq!(meta["base"], fx.base.as_str());
+    assert!(
+        run.prompt
+            .contains(&format!("git diff {}..{}", fx.base, fx.head))
+    );
+
+    for bad in ["HEAD", "--upload-pack=x", &fx.head[..12]] {
+        let run = fx.run_pr(&pr, &[&format!("--head={bad}")], &[]);
+        assert_eq!(run.code, Some(2), "{bad}: {run:?}");
+        assert!(run.stderr.contains("full commit id"), "{bad}: {run:?}");
+    }
+}
+
 /// Every way a reply can be wrong fails the pass, leaves no `out/reliability.json` (not even
 /// one the reviewer wrote there itself), and removes the worktree. A reply that does not
 /// validate gets one retry turn first (the fake repeats itself); a failed CLI does not.
@@ -2260,4 +2320,98 @@ fn orca_types_nothing_before_orca_recognizes_the_agent() {
         let state = fs::read_to_string(fx.root.join("log.orca-reliability")).unwrap();
         assert!(state.matches("show").count() >= 3, "{state}");
     }
+}
+
+/// `--head` must be a commit of the named PR: a commit of another branch that the clone has
+/// is refused before any checkout or fetch.
+#[test]
+fn head_outside_the_pr_is_refused() {
+    let fx = fixture();
+    let run = fx.run(
+        &["--head", &fx.main],
+        &with(
+            claude_says(&envelope("b.txt").to_string()),
+            &[("FAKE_GH_COMMITS", fx.head.clone())],
+        ),
+    );
+    assert_eq!(run.code, Some(2), "{run:?}");
+    assert!(
+        run.stderr
+            .contains(&format!("--head {} is not a commit of PR #7", fx.main)),
+        "{run:?}"
+    );
+    assert!(!run.log.contains("claude -p"), "{run:?}");
+    assert!(!fx.runroot().exists());
+    assert!(
+        !fx.root
+            .join(format!("state/rreview/acme/widget/7-{}", fx.main))
+            .exists()
+    );
+}
+
+/// The default gate keeps a P2 at confidence 0.6 (calibration, docs/calibration.md); the old
+/// bar `conf>=0.8` does not.
+#[test]
+fn the_default_gate_keeps_a_p2_at_confidence_0_6() {
+    let coordinator = coordinator_review(
+        vec![review_finding(
+            "Handle the error",
+            2,
+            0.6,
+            &["reliability-1"],
+        )],
+        vec![],
+    );
+    let scenario = with(
+        pipeline(),
+        &[
+            ("FAKE_OUT_intent_contracts", json!({"panelist": "Intent & Contracts", "coverage_summary": "", "candidates": []}).to_string()),
+            ("FAKE_OUT_security", json!({"panelist": "Security & Trust Boundaries", "coverage_summary": "", "candidates": []}).to_string()),
+            ("FAKE_OUT_coordinator", claude_result(&coordinator.to_string())),
+        ],
+    );
+    let fx = fixture();
+    let run = fx.full(&[], &scenario);
+    assert_eq!(run.code, Some(1), "{run:?}");
+    assert!(run.stdout.starts_with("[P2] Handle the error"), "{run:?}");
+    let fx = fixture();
+    let run = fx.full(&["--gate", "conf>=0.8"], &scenario);
+    assert_eq!(run.code, Some(0), "{run:?}");
+}
+
+/// `--head` reaches the Orca runner too: its worktree is made at the earlier head.
+#[test]
+fn orca_runner_reviews_the_head_given() {
+    let fx = fixture();
+    git(&fx.upstream, &["checkout", "-q", "--detach", &fx.head]);
+    fs::write(fx.upstream.join("later.txt"), "later\n").unwrap();
+    git(&fx.upstream, &["add", "."]);
+    git(&fx.upstream, &["commit", "-q", "-m", "later push"]);
+    let later = git(&fx.upstream, &["rev-parse", "HEAD"]);
+    git(&fx.upstream, &["update-ref", "refs/pull/7/head", &later]);
+    git(&fx.upstream, &["checkout", "-q", "main"]);
+    let mut pr = fx.pr();
+    pr["headRefOid"] = later.clone().into();
+    let run = fx.run_pr(
+        &pr,
+        &["--runner", "orca", "--head", &fx.head],
+        &[
+            ("ORCA_TERMINAL_HANDLE", "term_caller".to_string()),
+            ("FAKE_ORCA", "ok".into()),
+            ("FAKE_REPLY", envelope("src/lib.rs").to_string()),
+            ("FAKE_GH_COMMITS", format!("{}\n{later}", fx.head)),
+        ],
+    );
+    assert_eq!(run.code, Some(0), "{run:?}");
+    assert!(
+        run.log.contains(&format!("--base-branch {} ", fx.head)),
+        "{run:?}"
+    );
+    let meta: Value =
+        serde_json::from_str(&fs::read_to_string(fx.runroot().join("meta.json")).unwrap()).unwrap();
+    assert_eq!(
+        (meta["head"].as_str(), meta["runner"].as_str()),
+        (Some(fx.head.as_str()), Some("orca"))
+    );
+    fx.assert_orca_worktree_removed();
 }

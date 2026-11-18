@@ -1,7 +1,8 @@
 #!/bin/sh
 # Fake `gh`: a logged-in gh; `gh pr view` prints $FAKE_GH_PR, after $FAKE_GH_DELAY seconds
 # when set, or exits at once leaving a $FAKE_GH_LINGER-second sleep that holds its stdout and
-# stderr (either sleep's pid is appended to $FAKE_LOG.grandchild).
+# stderr (either sleep's pid is appended to $FAKE_LOG.grandchild). `gh api` (the PR's commits)
+# prints $FAKE_GH_COMMITS.
 echo "gh $*" >> "${FAKE_LOG:-/dev/null}"
 case "$1" in
 --version) echo "gh version 9.9.9" ;;
@@ -13,4 +14,5 @@ pr)
   if [ -n "$FAKE_GH_LINGER" ]; then
     sleep "$FAKE_GH_LINGER" & echo $! >> "$FAKE_LOG.grandchild"
   fi ;;
+api) printf '%s\n' "$FAKE_GH_COMMITS" ;;
 esac
