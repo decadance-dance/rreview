@@ -6,6 +6,7 @@
 #   user-agents     reads $HOME/.codex/AGENTS.md like a Codex that ignores CODEX_HOME
 #   ignore          neither runs the probe nor reports a canary
 #   lie             replies "write=1" without running the probe
+#   read            only reads the probe (cat) and logs that command with its output
 # Argv and CODEX_HOME are appended to $FAKE_LOG.
 echo "codex $* CODEX_HOME=$CODEX_HOME" >> "${FAKE_LOG:-/dev/null}"
 case "$1" in
@@ -16,13 +17,15 @@ out=; prev=
 for a; do [ "$prev" = -o ] && out=$a; prev=$a; done
 probe=$(grep -o "/[^']*probe\.sh")
 [ "$FAKE_CODEX" = ignore ] && { echo "I would rather not." > "$out"; exit 0; }
+run=sh
 case "$FAKE_CODEX" in
 lie) result=write=1 ;;
-leak) result=$(sh "$probe") ;;
-*) result=write=1 ;;
+leak) result=$(sh "$probe" 2>&1 | tr '\n' ' ') ;;
+read) run=cat result=$(tr '\n' ' ' < "$probe") ;;
+*) result="rreview-probe-result write=1" ;;
 esac
 [ "$FAKE_CODEX" = lie ] ||
-  printf '{"type":"item.completed","item":{"type":"command_execution","command":"/bin/sh -lc '"'"'sh %s'"'"'","aggregated_output":"%s\\n","exit_code":0,"status":"completed"}}\n' "$probe" "$result"
+  printf '{"type":"item.completed","item":{"type":"command_execution","command":"/bin/sh -lc '"'"'%s %s'"'"'","aggregated_output":"%s\\n","exit_code":0,"status":"completed"}}\n' "$run" "$probe" "$result"
 agents=$CODEX_HOME/AGENTS.md
 [ "$FAKE_CODEX" = user-agents ] && agents=$HOME/.codex/AGENTS.md
 canary=$(grep -o 'RREVIEW-CANARY-[0-9a-f]*' "$agents" 2> /dev/null || echo NO-CANARY)

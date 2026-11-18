@@ -6,6 +6,7 @@ use std::process::Command;
 use std::sync::atomic::{AtomicU32, Ordering};
 
 struct Run {
+    root: String,
     passed: bool,
     stdout: String,
     log: String,
@@ -40,6 +41,7 @@ fn doctor(fakes: &[&str], scenario: &[(&str, &str)]) -> Run {
         .output()
         .unwrap();
     let run = Run {
+        root: fs::canonicalize(&root).unwrap().display().to_string(),
         passed: out.status.success(),
         stdout: String::from_utf8_lossy(&out.stdout).into(),
         log: fs::read_to_string(root.join("log")).unwrap_or_default(),
@@ -236,4 +238,45 @@ fn fails_when_the_planted_hook_cannot_fire_at_all() {
         "{}",
         run.stdout
     );
+}
+
+#[test]
+fn fails_when_codex_only_reads_the_probe() {
+    let run = doctor(ALL, &[("FAKE_CODEX", "read")]);
+    assert!(!run.passed, "{}", run.stdout);
+    assert!(
+        run.stdout
+            .contains("FAIL  codex sandbox: write into the worktree: no evidence"),
+        "{}",
+        run.stdout
+    );
+}
+
+#[test]
+fn hook_control_keeps_claude_out_of_the_user_home() {
+    let run = doctor(ALL, &[]);
+    assert!(run.passed, "{}", run.stdout);
+    let env = run
+        .log
+        .lines()
+        .find_map(|l| l.strip_prefix("control-env "))
+        .expect("the hook control ran");
+    let control = format!("{}/", run.root);
+    for var in [
+        "HOME",
+        "XDG_CONFIG_HOME",
+        "XDG_CACHE_HOME",
+        "XDG_DATA_HOME",
+        "XDG_STATE_HOME",
+        "CLAUDE_CONFIG_DIR",
+    ] {
+        let value = env
+            .split(' ')
+            .find_map(|kv| kv.strip_prefix(&format!("{var}=")))
+            .unwrap();
+        assert!(
+            value.starts_with(&control) && value.contains("/claude-hook-control/"),
+            "{var}={value:?} is not inside the control's run dir"
+        );
+    }
 }

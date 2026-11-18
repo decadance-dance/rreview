@@ -363,13 +363,27 @@ fn claude_probe(fx: &Fixture) -> Result<Vec<Check>> {
 
 /// Positive control for the planted hook, without a model call: the same launch minus
 /// `--safe-mode`, with an empty `CLAUDE_CONFIG_DIR` (no user config, no login), fires the
-/// session-start hook and then fails for want of a login. Returns whether the hook fired.
+/// session-start hook and then fails for want of a login. Its HOME and XDG dirs are in the
+/// run dir too: without `--safe-mode` Claude writes under them (`.claude/ssh`,
+/// `.config/anthropic`). Returns whether the hook fired.
 fn hook_control(fx: &Fixture) -> Result<bool> {
     let run = fx.root.join("claude-hook-control");
     let mut control = launch::claude(&fx.wt, &fx.git_common_dir, &run)?;
-    let config = run.join("config");
+    let home = run.join("home");
+    let config = home.join(".claude");
     fs::create_dir_all(&config)?;
     control.args.retain(|a| a != "--safe-mode");
+    for (var, dir) in [
+        ("HOME", ""),
+        ("XDG_CONFIG_HOME", ".config"),
+        ("XDG_CACHE_HOME", ".cache"),
+        ("XDG_DATA_HOME", ".local/share"),
+        ("XDG_STATE_HOME", ".local/state"),
+    ] {
+        control
+            .env
+            .push((var.into(), launch::utf8(&home.join(dir))?.into()));
+    }
     control.env.extend([
         ("CLAUDE_CONFIG_DIR".into(), launch::utf8(&config)?.into()),
         // limit: other credential sources (cloud provider env, apiKeyHelper) are not cleared.
@@ -414,7 +428,8 @@ fn codex_probe(fx: &Fixture) -> Result<Vec<Check>> {
     fs::write(
         &probe,
         format!(
-            "echo x > {} && echo write=0 || echo write=1\n",
+            // The result line is not in the source, so reading the script cannot fake it.
+            "if echo x > {}; then r=0; else r=1; fi\necho rreview-probe-result write=$r\n",
             sh_quote(&leak)
         ),
     )?;
@@ -470,7 +485,7 @@ fn codex_probe(fx: &Fixture) -> Result<Vec<Check>> {
 }
 
 /// Evidence from Codex's own event log (`--json`), not from the model's reply: a completed
-/// command that ran the probe and printed `write=1`.
+/// command naming the probe whose output has the line only running it prints.
 fn probe_saw_blocked_write(events: &str, probe: &Path) -> bool {
     let probe = probe.to_string_lossy();
     events
@@ -483,9 +498,10 @@ fn probe_saw_blocked_write(events: &str, probe: &Path) -> bool {
                 && item["command"]
                     .as_str()
                     .is_some_and(|c| c.contains(&*probe))
-                && item["aggregated_output"]
-                    .as_str()
-                    .is_some_and(|o| o.contains("write=1"))
+                && item["aggregated_output"].as_str().is_some_and(|o| {
+                    o.lines()
+                        .any(|l| l.trim() == "rreview-probe-result write=1")
+                })
         })
 }
 

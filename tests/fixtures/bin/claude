@@ -26,7 +26,9 @@ fire_hooks() {
 }
 case " $* " in
 *" --safe-mode "*) [ "$FAKE_CLAUDE" = hook ] && fire_hooks ;;
-*) fire_hooks; echo '{"type": "result", "is_error": true, "result": "Not logged in"}'; exit 1 ;;
+*)
+  echo "control-env HOME=$HOME XDG_CONFIG_HOME=$XDG_CONFIG_HOME XDG_CACHE_HOME=$XDG_CACHE_HOME XDG_DATA_HOME=$XDG_DATA_HOME XDG_STATE_HOME=$XDG_STATE_HOME CLAUDE_CONFIG_DIR=$CLAUDE_CONFIG_DIR" >> "${FAKE_LOG:-/dev/null}"
+  fire_hooks; echo '{"type": "result", "is_error": true, "result": "Not logged in"}'; exit 1 ;;
 esac
 # A reviewer pass: the prompt on stdin names the probe script, whose dir holds out/.
 probe=$(grep -o "/[^']*/probe\.sh")
