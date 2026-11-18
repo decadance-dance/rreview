@@ -418,6 +418,11 @@ fn head_reviews_an_earlier_commit_of_the_pr() {
         &claude_says(&envelope("later.txt").to_string()),
     );
     assert_eq!(run.code, Some(2), "{run:?}");
+    assert!(
+        run.stderr
+            .contains("\"later.txt\" is not a file this change touches"),
+        "{run:?}"
+    );
     let run = fx.run_pr(
         &pr,
         &["--head", &fx.head],
