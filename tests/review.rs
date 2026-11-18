@@ -133,7 +133,8 @@ impl Fixture {
         self.rreview(&self.pr(), &args, scenario)
     }
 
-    fn rreview(&self, pr: &Value, args: &[&str], scenario: &[(&str, String)]) -> Run {
+    /// The fake executables' dir and the Codex home; made once, before runs that start together.
+    fn install_fakes(&self) -> (PathBuf, PathBuf) {
         let (bin, codex_home) = (self.root.join("bin"), self.root.join("codex"));
         if !bin.exists() {
             fs::create_dir_all(&bin).unwrap();
@@ -144,6 +145,11 @@ impl Fixture {
                 std::os::unix::fs::symlink(fixtures.join(fake), bin.join(fake)).unwrap();
             }
         }
+        (bin, codex_home)
+    }
+
+    fn rreview(&self, pr: &Value, args: &[&str], scenario: &[(&str, String)]) -> Run {
+        let (bin, codex_home) = self.install_fakes();
         let out = Command::new(env!("CARGO_BIN_EXE_rreview"))
             .args(args)
             .current_dir(&self.clone)
@@ -1613,13 +1619,29 @@ fn orca_calls(run: &Run) -> Vec<String> {
 }
 
 impl Fixture {
+    /// The name the last run gave its Orca worktree: `rreview-7-<sha12>-<pid>-<time>`.
     fn orca_name(&self) -> String {
-        format!("rreview-7-{}", &self.head[..12])
+        let log = fs::read_to_string(self.root.join("log")).unwrap();
+        let name = log
+            .rsplit("orca worktree create ")
+            .next()
+            .and_then(|l| l.split(" --name ").nth(1))
+            .and_then(|l| l.split(' ').next())
+            .unwrap()
+            .to_string();
+        assert!(
+            name.starts_with(&format!("rreview-7-{}-", &self.head[..12])),
+            "{name}"
+        );
+        name
     }
 
-    /// The Orca-made worktree and its branch are gone.
+    /// The Orca-made worktrees and their branches are gone.
     fn assert_orca_worktree_removed(&self) {
-        assert!(!self.root.join("orca-wt").join(self.orca_name()).exists());
+        let left: Vec<_> = fs::read_dir(self.root.join("orca-wt"))
+            .map(|d| d.map(|e| e.unwrap().file_name()).collect())
+            .unwrap_or_default();
+        assert!(left.is_empty(), "{left:?}");
         let list = git(&self.clone, &["worktree", "list", "--porcelain"]);
         assert_eq!(list.matches("worktree ").count(), 1, "{list}");
         assert_eq!(git(&self.clone, &["branch", "--list", "rreview/*"]), "");
@@ -1983,22 +2005,112 @@ fn orca_cleans_up_a_worktree_whose_create_reply_was_lost() {
     );
     git(&fx.clone, &["rev-parse", "--verify", "refs/heads/victim"]);
     fx.assert_orca_worktree_removed();
+}
 
-    // A branch of that name that exists before the run is not ours: refused, never deleted.
+/// Two runs for one PR head in one repo at once (round 2, finding 1): each creates and removes
+/// only its own worktree and branch. Both pass the branch check before either creates.
+#[test]
+fn orca_concurrent_runs_for_one_head_keep_their_own_worktrees() {
+    let env = envelope("src/lib.rs");
     let fx = fixture();
-    let branch = format!("rreview/{}", fx.orca_name());
-    git(&fx.clone, &["branch", &branch]);
-    let run = orca_run(&fx, &[], "ok", &env);
+    fx.install_fakes();
+    let runs: Vec<Run> = std::thread::scope(|s| {
+        let threads: Vec<_> = ["a", "b"]
+            .map(|id| {
+                let (fx, env) = (&fx, &env);
+                s.spawn(move || {
+                    orca_run_with(
+                        fx,
+                        &[],
+                        "ok",
+                        &[
+                            ("FAKE_REPLY", env.to_string()),
+                            ("FAKE_ORCA_CREATE_DELAY", "2".into()),
+                            ("FAKE_LOG", fx.root.join(id).display().to_string()),
+                            (
+                                "XDG_STATE_HOME",
+                                fx.root.join(format!("state-{id}")).display().to_string(),
+                            ),
+                        ],
+                    )
+                })
+            })
+            .into();
+        threads.into_iter().map(|t| t.join().unwrap()).collect()
+    });
+    for run in &runs {
+        assert_eq!(run.code, Some(0), "{run:?}");
+    }
+    let names: Vec<String> = ["a", "b"]
+        .iter()
+        .map(|id| {
+            let log = fs::read_to_string(fx.root.join(id)).unwrap();
+            log.split(" --name ")
+                .nth(1)
+                .unwrap()
+                .split(' ')
+                .next()
+                .unwrap()
+                .into()
+        })
+        .collect();
+    assert_ne!(names[0], names[1]);
+    fx.assert_orca_worktree_removed();
+}
+
+/// `orca worktree create` runs within the review's budget (round 2, finding 2).
+#[test]
+fn orca_worktree_create_stays_within_the_budget() {
+    let env = envelope("src/lib.rs");
+    let fx = fixture();
+    let started = Instant::now();
+    let run = orca_run_with(
+        &fx,
+        &["--budget", "1"],
+        "ok",
+        &[
+            ("FAKE_REPLY", env.to_string()),
+            ("FAKE_ORCA_CREATE_DELAY", "3".into()),
+        ],
+    );
+    let took = started.elapsed();
     assert_eq!(run.code, Some(2), "{run:?}");
+    assert!(took < Duration::from_millis(2500), "took {took:?}: {run:?}");
     assert!(
-        run.stderr.contains("is left from an earlier run"),
+        run.stderr.contains(
+            "cannot create the review worktree: orca worktree create did not answer in time"
+        ),
         "{run:?}"
     );
-    assert!(!run.log.contains("orca worktree create"), "{run:?}");
-    git(
-        &fx.clone,
-        &["rev-parse", "--verify", &format!("refs/heads/{branch}")],
+    assert!(!run.log.contains("orca terminal create"), "{run:?}");
+    fx.assert_orca_worktree_removed();
+}
+
+/// An idle answer that comes after the pass's deadline, inside the kill backstop, is a timeout,
+/// not a finished turn (round 2, finding 2).
+#[test]
+fn orca_does_not_accept_a_wait_answered_past_the_deadline() {
+    let env = envelope("src/lib.rs");
+    let fx = fixture();
+    let run = orca_run_with(
+        &fx,
+        &["--timeout", "1"],
+        "ok",
+        &[
+            ("FAKE_REPLY", env.to_string()),
+            ("FAKE_ORCA_WAIT_DELAY", "2".into()),
+        ],
     );
+    assert_eq!(run.code, Some(2), "{run:?}");
+    assert_eq!(fx.statuses(), ["started", "wrapup", "failed"], "{run:?}");
+    assert!(
+        run.stderr.contains(
+            "pass reliability timed out after 1s; wrap-up: the wrap-up timed out after 1s"
+        ),
+        "{run:?}"
+    );
+    fx.assert_terminal_closed("reliability");
+    fx.assert_orca_worktree_removed();
 }
 
 #[test]

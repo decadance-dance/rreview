@@ -23,7 +23,8 @@ use crate::runner::{Agent, Pass, REPLY, Runner, model_args};
 const NUDGE: &str = "You stopped without writing the reply file. Write the JSON object described in the first message to the reply file now.";
 /// A reply larger than this is not a panelist envelope; reading stops there.
 const MAX_REPLY: u64 = 4 << 20;
-/// Bounds for Orca calls outside a pass's budget (worktree setup, cleanup).
+/// Bounds for Orca calls outside a pass's budget: worktree setup (also within the review's
+/// budget) and cleanup.
 const SETUP: Duration = Duration::from_secs(300);
 const CLOSE: Duration = Duration::from_secs(30);
 
@@ -84,7 +85,13 @@ pub fn check_branch_free(name: &str) -> Result<()> {
 /// `check_branch_free`), in the repository of `git_common_dir`, so Orca tracks the reviewers'
 /// terminals in it (spec §4). Repo setup hooks are skipped: they would run the reviewed PR's
 /// code. Returns the worktree path.
-pub fn create_worktree(git_common_dir: &Path, name: &str, head: &str) -> Result<PathBuf> {
+/// `deadline` is the review's budget; it is capped at `SETUP`.
+pub fn create_worktree(
+    git_common_dir: &Path,
+    name: &str,
+    head: &str,
+    deadline: Option<Instant>,
+) -> Result<PathBuf> {
     let branch = branch_for(name);
     // Orca registers a repository by its main checkout, the parent of a non-bare common dir.
     let repo = match git_common_dir.file_name() {
@@ -106,7 +113,11 @@ pub fn create_worktree(git_common_dir: &Path, name: &str, head: &str) -> Result<
             "--setup",
             "skip",
         ],
-        Instant::now().checked_add(SETUP),
+        Instant::now()
+            .checked_add(SETUP)
+            .into_iter()
+            .chain(deadline)
+            .min(),
     )?;
     let wt = &v["worktree"];
     let made = wt["branch"].as_str().unwrap_or_default();
@@ -454,6 +465,10 @@ fn wait(handle: &str, deadline: Option<Instant>) -> Result<Wait> {
         ],
         backstop,
     )?;
+    // An answer that arrives past the deadline (inside the backstop) is not accepted.
+    if left(deadline).is_zero() {
+        return Ok(Wait::TimedOut);
+    }
     if out["ok"] != true {
         return match out["error"]["code"].as_str() {
             Some("timeout") => Ok(Wait::TimedOut),

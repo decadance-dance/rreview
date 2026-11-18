@@ -213,11 +213,22 @@ pub fn run(args: &Args) -> Result<u8> {
     )?
     .into();
     if args.orca {
-        let name = format!("rreview-{}-{}", pr.number, &head[..12]);
+        // The pid and start time make the name the run's own: a concurrent run for the same
+        // PR head gets another one, so neither run's cleanup can reach the other's worktree.
+        let started = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let name = format!(
+            "rreview-{}-{}-{}-{started}",
+            pr.number,
+            &head[..12],
+            std::process::id()
+        );
         orca::check_branch_free(&name)?;
         // Set before the create: a create whose reply is lost is still found by its name.
         wt.orca_name = Some(name.clone());
-        wt.path = orca::create_worktree(&git_common_dir, &name, head)
+        wt.path = orca::create_worktree(&git_common_dir, &name, head, deadline)
             .context("cannot create the review worktree")?;
         let at = git(
             &["-C", launch::utf8(&wt.path)?, "rev-parse", "HEAD"],

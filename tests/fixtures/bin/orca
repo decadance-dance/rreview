@@ -24,8 +24,10 @@
 #   no-ok           `terminal create` exits 0 with "ok": false
 #   refused         `terminal send` of a prompt answers "accepted": false
 #   blocked         after the prompt the agent waits on a permission dialog
-# FAKE_ORCA_SEND_DELAY: seconds every prompt send takes. FAKE_ORCA_CLOSE=fail-once: the first
-# `terminal close` fails with runtime_unavailable.
+# FAKE_ORCA_SEND_DELAY: seconds every prompt send takes; FAKE_ORCA_CREATE_DELAY: seconds before
+# `worktree create` starts; FAKE_ORCA_WAIT_DELAY: seconds every `terminal wait` after a prompt
+# takes before it answers. FAKE_ORCA_CLOSE=fail-once: the first `terminal close` fails with
+# runtime_unavailable.
 line=orca; for a; do line="$line $a"; done
 printf '%s\n' "$line" >> "${FAKE_LOG:-/dev/null}"
 scenario=${FAKE_ORCA:-ok}
@@ -44,6 +46,7 @@ state="$FAKE_LOG.orca-$role"
 sent() { grep -c '^sent' "$state" 2> /dev/null || echo 0; }
 case "$1 $2" in
 "worktree create")
+  [ -n "$FAKE_ORCA_CREATE_DELAY" ] && sleep "$FAKE_ORCA_CREATE_DELAY"
   name=$(arg --name "$@"); branch=$(arg --branch "$@"); base=$(arg --base-branch "$@")
   [ "$scenario" = wrong-head ] && base="$base^"
   path="$TMPDIR/orca-wt/$name"
@@ -104,6 +107,7 @@ case "$1 $2" in
   if grep -q agent-up "$state"; then provider=$(sed -n 's/^agent //p' "$state"); else provider=unsupported; fi
   ok "{\"send\":{\"accepted\":true,\"prompt\":{\"provider\":\"$provider\"}}}" ;;
 "terminal wait")
+  [ -n "$FAKE_ORCA_WAIT_DELAY" ] && [ "$(sent)" -gt 0 ] && sleep "$FAKE_ORCA_WAIT_DELAY"
   case "$scenario" in
   no-agent) timeout "$@" ;;
   trust) grep -q trusted "$state" 2> /dev/null || blocked agent-trust-workspace ;;
