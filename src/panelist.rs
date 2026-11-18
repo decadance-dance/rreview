@@ -10,6 +10,7 @@ use std::collections::BTreeSet;
 
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 
 use crate::runner::Agent;
 
@@ -110,7 +111,15 @@ pub fn parse(raw: &str, role: &Role, diff_files: &BTreeSet<String>) -> Result<En
         (Some(s), Some(e)) if s < e => &raw[s..=e],
         _ => bail!("no JSON object in the reply"),
     };
-    let env: Envelope = serde_json::from_str(body).context("malformed panelist envelope")?;
+    let value: Value = serde_json::from_str(body).context("malformed panelist envelope")?;
+    // Serde's derived struct decoder also takes a positional array; only objects name fields.
+    // The envelope itself is an object: `body` starts with `{`.
+    if let Some(candidates) = value["candidates"].as_array()
+        && let Some(i) = candidates.iter().position(|c| !c.is_object())
+    {
+        bail!("candidate {} is not a JSON object", i + 1);
+    }
+    let env: Envelope = serde_json::from_value(value).context("malformed panelist envelope")?;
     if env.panelist != role.name {
         bail!(
             "envelope names panelist {:?}, want {:?}",
@@ -158,7 +167,7 @@ fn check(c: &Candidate, diff_files: &BTreeSet<String>) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use serde_json::{Value, json};
+    use serde_json::json;
 
     fn files() -> BTreeSet<String> {
         ["src/a.rs".to_string(), "docs/b.md".to_string()].into()
@@ -247,6 +256,24 @@ mod tests {
                 "{field} = {value}"
             );
         }
+    }
+
+    #[test]
+    fn rejects_positional_arrays() {
+        let c = json!([
+            "src/a.rs",
+            3,
+            4,
+            1,
+            "t",
+            "r",
+            "g",
+            "i",
+            ["src/a.rs:3"],
+            0.9,
+            "k"
+        ]);
+        assert!(err(&reply(vec![candidate(), c])).contains("candidate 2 is not a JSON object"));
     }
 
     #[test]

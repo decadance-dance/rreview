@@ -69,10 +69,11 @@ pub fn run(args: &Args) -> Result<bool> {
     };
     ensure_commits(&pr, &[head, &base_tip])?;
     let base = git(&["merge-base", &base_tip, head])?;
-    let diff_files: BTreeSet<String> = git(&["diff", "--name-only", "-z", &base, head])?
-        .split('\0')
+    // Raw bytes: names may start or end with spaces. A non-UTF-8 name cannot be named in JSON.
+    let diff_files: BTreeSet<String> = git_raw(&["diff", "--name-only", "-z", &base, head])?
+        .split(|b| *b == 0)
+        .filter_map(|f| String::from_utf8(f.to_vec()).ok())
         .filter(|f| !f.is_empty())
-        .map(String::from)
         .collect();
 
     let runroot = state_home()?
@@ -93,19 +94,22 @@ pub fn run(args: &Args) -> Result<bool> {
     }
     fs::create_dir_all(&runroot).with_context(|| format!("{}", runroot.display()))?;
     let runroot = fs::canonicalize(&runroot)?;
+    // The guard exists before the checkout: a failed one (a post-checkout hook) can leave a
+    // registered, half-made worktree behind.
+    let mut wt = Worktree {
+        path: runroot.join("wt"),
+        keep: false,
+    };
     git(&[
         "worktree",
         "add",
         "--quiet",
         "--detach",
-        launch::utf8(&runroot.join("wt"))?,
+        launch::utf8(&wt.path)?,
         head,
     ])
     .context("cannot create the review worktree")?;
-    let wt = Worktree {
-        path: runroot.join("wt"),
-        keep: args.keep_worktree,
-    };
+    wt.keep = args.keep_worktree;
 
     let roles = BTreeMap::from([(role.id, agent.to_string())]);
     let meta = json!({
@@ -145,7 +149,11 @@ pub fn run(args: &Args) -> Result<bool> {
     progress.event(&pass, "started", started, None)?;
     let result = run_pass(&runner, &pass, &progress, started).and_then(|raw| {
         let envelope = panelist::parse(&raw, role, &diff_files)?;
-        fs::write(&out, serde_json::to_string_pretty(&envelope)?)?;
+        // The reviewer can write into out/ (a symlink, say); a rename from the run root, which
+        // it cannot write, replaces whatever stands there without following it.
+        let tmp = runroot.join(format!(".{}.json.tmp", role.id));
+        fs::write(&tmp, serde_json::to_string_pretty(&envelope)?)?;
+        fs::rename(&tmp, &out).with_context(|| format!("{}", out.display()))?;
         Ok(envelope)
     });
     let ok = match result {
@@ -202,8 +210,14 @@ impl Drop for Worktree {
     fn drop(&mut self) {
         if self.keep {
             println!("review worktree kept: {}", self.path.display());
-        } else if let Err(e) =
-            launch::utf8(&self.path).and_then(|p| git(&["worktree", "remove", "--force", p]))
+            return;
+        }
+        let removed =
+            launch::utf8(&self.path).and_then(|p| git(&["worktree", "remove", "--force", p]));
+        // Not registered (a checkout that failed early): only a directory may be left.
+        if let Err(e) = removed
+            && self.path.exists()
+            && fs::remove_dir_all(&self.path).is_err()
         {
             eprintln!("warning: cannot remove the review worktree: {e:#}");
         }
@@ -334,6 +348,11 @@ fn version(bin: &str) -> Option<String> {
 
 /// Git in the current repository.
 fn git(args: &[&str]) -> Result<String> {
+    Ok(String::from_utf8_lossy(&git_raw(args)?).trim().into())
+}
+
+/// Git's stdout as it is.
+fn git_raw(args: &[&str]) -> Result<Vec<u8>> {
     let out = Command::new("git")
         .args(args)
         .stdin(Stdio::null())
@@ -346,7 +365,7 @@ fn git(args: &[&str]) -> Result<String> {
             String::from_utf8_lossy(&out.stderr).trim()
         );
     }
-    Ok(String::from_utf8_lossy(&out.stdout).trim().into())
+    Ok(out.stdout)
 }
 
 #[cfg(test)]

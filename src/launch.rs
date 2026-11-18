@@ -43,12 +43,12 @@ impl Launch {
             let prompt = prompt.to_owned();
             std::thread::spawn(move || stdin.write_all(prompt.as_bytes()));
         }
-        let deadline = Instant::now() + timeout;
+        let started = Instant::now();
         loop {
             if let Some(status) = child.try_wait()? {
                 return Ok(status);
             }
-            if Instant::now() >= deadline {
+            if started.elapsed() >= timeout {
                 let _ = Command::new("kill")
                     .args(["-KILL", "--", &format!("-{}", child.id())])
                     .stderr(Stdio::null())

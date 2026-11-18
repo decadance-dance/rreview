@@ -17,6 +17,7 @@
 #   hang            starts a grandchild (pids appended to $FAKE_LOG.grandchild), then never replies
 #   hang-once       hangs like `hang` unless resumed (--resume), then replies
 #   forge           first writes $FAKE_FORGED into out/reliability.json, which the sandbox allows
+#   symlink         first plants out/reliability.json as a symlink to $FAKE_LOG.victim
 echo "claude $*" >> "${FAKE_LOG:-/dev/null}"
 case "$1" in
 --version) echo "9.9.9 (Claude Code)"; exit 0 ;;
@@ -32,11 +33,11 @@ if [ -n "$FAKE_REVIEW" ]; then
   if [ "$FAKE_REVIEW" = hang ] || { [ "$FAKE_REVIEW" = hang-once ] && [ $resumed = no ]; }; then
     sleep 60 & echo $! >> "$FAKE_LOG.grandchild"; sleep 60; exit 0
   fi
-  if [ "$FAKE_REVIEW" = forge ]; then
-    settings=; prev=
-    for a; do [ "$prev" = --settings ] && settings=$a; prev=$a; done
-    printf '%s' "$FAKE_FORGED" > "$(dirname "$settings")/out/reliability.json"
-  fi
+  settings=; prev=
+  for a; do [ "$prev" = --settings ] && settings=$a; prev=$a; done
+  out=$(dirname "$settings")/out/reliability.json
+  [ "$FAKE_REVIEW" = forge ] && printf '%s' "$FAKE_FORGED" > "$out"
+  [ "$FAKE_REVIEW" = symlink ] && ln -s "$FAKE_LOG.victim" "$out"
   printf '%s\n' "$FAKE_STDOUT"; exit 0
 fi
 fire_hooks() {

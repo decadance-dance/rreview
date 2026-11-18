@@ -70,6 +70,8 @@ fn fixture() -> Fixture {
     let base = git(&upstream, &["rev-parse", "HEAD"]);
     git(&upstream, &["checkout", "-q", "-b", "pr"]);
     fs::write(upstream.join("src/lib.rs"), "fn f() {}\n").unwrap();
+    // Sorts first in `git diff --name-only`, so a trim of git's output would eat its space.
+    fs::write(upstream.join(" leading.txt"), "x\n").unwrap();
     git(&upstream, &["add", "."]);
     git(&upstream, &["commit", "-q", "-m", "pr"]);
     let head = git(&upstream, &["rev-parse", "HEAD"]);
@@ -358,6 +360,21 @@ fn bad_replies_fail_the_pass() {
     let mut bad = second_bad["candidates"][0].clone();
     bad["confidence_score"] = json!(0.2);
     second_bad["candidates"].as_array_mut().unwrap().push(bad);
+    // The candidate's eleven values in struct order: serde's derived decoder takes a sequence.
+    let mut positional = envelope("src/lib.rs");
+    positional["candidates"][0] = json!([
+        "src/lib.rs",
+        1,
+        1,
+        2,
+        "t",
+        "r",
+        "g",
+        "i",
+        ["src/lib.rs:1"],
+        0.8,
+        "k"
+    ]);
     let cases: Vec<(&str, Scenario, &str)> = vec![
         (
             "malformed",
@@ -385,6 +402,11 @@ fn bad_replies_fail_the_pass() {
             "candidate 2",
         ),
         ("no json", claude_says("I found nothing."), "no JSON object"),
+        (
+            "positional candidate",
+            claude_says(&positional.to_string()),
+            "candidate 1 is not a JSON object",
+        ),
         (
             "forged out file",
             vec![
@@ -438,8 +460,10 @@ fn bad_replies_fail_the_pass() {
     }
 }
 
-fn assert_dead(fx: &Fixture) {
+/// The fakes started `count` grandchildren, and none of them is alive.
+fn assert_dead(fx: &Fixture, count: usize) {
     let pids = fs::read_to_string(fx.root.join("log.grandchild")).unwrap();
+    assert_eq!(pids.split_whitespace().count(), count, "{pids:?}");
     for pid in pids.split_whitespace() {
         let alive = || {
             Command::new("kill")
@@ -477,7 +501,7 @@ fn a_pass_that_never_replies_times_out_after_a_wrap_up() {
         assert!(run.stderr.contains(&want), "{run:?}");
         assert_eq!(fx.statuses(), ["started", "wrapup", "failed"]);
         assert_eq!(fx.out(), None);
-        assert_dead(&fx);
+        assert_dead(&fx, 2);
         fx.assert_worktree_removed();
     }
 }
@@ -513,17 +537,20 @@ fn a_timed_out_pass_is_resumed_for_its_wrap_up() {
                 .lines()
                 .next()
                 .unwrap();
-            format!("--output-format json --resume {id}\n")
+            format!(
+                "claude -p --safe-mode --settings {} --output-format json --resume {id}\n",
+                fx.runroot().join("claude-settings.json").display()
+            )
         } else {
-            "-o ".to_string()
-                + fx.runroot()
-                    .join("out/reliability.reply.txt")
-                    .to_str()
-                    .unwrap()
-                + " resume fake-thread - "
+            format!(
+                "codex exec --json -s read-only -C {} -o {} resume fake-thread - CODEX_HOME={}\n",
+                fx.runroot().join("wt").display(),
+                fx.runroot().join("out/reliability.reply.txt").display(),
+                fx.runroot().join("codex-home").display()
+            )
         };
         assert!(run.log.contains(&resumed), "want {resumed:?} in {run:?}");
-        assert_dead(&fx);
+        assert_dead(&fx, 1);
         fx.assert_worktree_removed();
     }
 }
@@ -588,4 +615,63 @@ fn live_reliability_pass_on_a_merged_pr() {
     assert!(Path::new(runroot).join("out/reliability.json").exists());
     assert!(!Path::new(runroot).join("wt").exists());
     let _ = fs::remove_dir_all(state);
+}
+
+#[test]
+fn a_failed_checkout_leaves_no_worktree() {
+    let fx = fixture();
+    let hook = fx.clone.join(".git/hooks/post-checkout");
+    fs::write(&hook, "#!/bin/sh\nexit 1\n").unwrap();
+    Command::new("chmod")
+        .args(["755", hook.to_str().unwrap()])
+        .status()
+        .unwrap();
+    let run = fx.run(&[], &claude_says(&envelope("src/lib.rs").to_string()));
+    assert_eq!(run.code, Some(2), "{run:?}");
+    assert!(
+        run.stderr.contains("cannot create the review worktree"),
+        "{run:?}"
+    );
+    fx.assert_worktree_removed();
+}
+
+#[test]
+fn a_changed_file_whose_name_starts_with_a_space_is_in_the_diff() {
+    let fx = fixture();
+    let env = envelope(" leading.txt");
+    let run = fx.run(&[], &claude_says(&env.to_string()));
+    assert_eq!(run.code, Some(0), "{run:?}");
+    assert_eq!(fx.out(), Some(env));
+}
+
+#[test]
+fn the_largest_timeout_does_not_overflow() {
+    let fx = fixture();
+    let run = fx.run(
+        &["--timeout", &u64::MAX.to_string()],
+        &claude_says(&envelope("src/lib.rs").to_string()),
+    );
+    assert_eq!(run.code, Some(0), "{run:?}");
+    assert_eq!(fx.statuses(), ["started", "completed"]);
+}
+
+/// The reviewer may write into out/; a symlink it plants there must be replaced, not followed.
+#[test]
+fn a_planted_out_symlink_is_replaced_not_followed() {
+    let fx = fixture();
+    let victim = fx.root.join("log.victim");
+    fs::write(&victim, "victim\n").unwrap();
+    let env = envelope("src/lib.rs");
+    let run = fx.run(
+        &[],
+        &[
+            ("FAKE_REVIEW", "symlink".into()),
+            ("FAKE_STDOUT", claude_result(&env.to_string())),
+        ],
+    );
+    assert_eq!(run.code, Some(0), "{run:?}");
+    assert_eq!(fs::read_to_string(&victim).unwrap(), "victim\n");
+    let out = fx.runroot().join("out/reliability.json");
+    assert!(fs::symlink_metadata(&out).unwrap().file_type().is_file());
+    assert_eq!(fx.out(), Some(env));
 }
