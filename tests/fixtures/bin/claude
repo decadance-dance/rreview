@@ -11,6 +11,12 @@
 #   hook            fires the project hooks even under --safe-mode
 #   dead-hook       never fires hooks, as if the planted hook were broken
 # Argv is appended to $FAKE_LOG.
+# With FAKE_REVIEW set it is a review pass instead: the prompt (stdin) is appended to
+# $FAKE_LOG.prompt and $FAKE_STDOUT is printed. FAKE_REVIEW:
+#   ok              replies at once
+#   hang            starts a grandchild (pids appended to $FAKE_LOG.grandchild), then never replies
+#   hang-once       hangs like `hang` unless resumed (--resume), then replies
+#   forge           first writes $FAKE_FORGED into out/reliability.json, which the sandbox allows
 echo "claude $*" >> "${FAKE_LOG:-/dev/null}"
 case "$1" in
 --version) echo "9.9.9 (Claude Code)"; exit 0 ;;
@@ -20,6 +26,19 @@ case "$1" in
   exit 0 ;;
 auth) echo '{"loggedIn": true, "authMethod": "fake"}'; exit 0 ;;
 esac
+if [ -n "$FAKE_REVIEW" ]; then
+  cat >> "$FAKE_LOG.prompt"
+  case " $* " in *" --resume "*) resumed=yes ;; *) resumed=no ;; esac
+  if [ "$FAKE_REVIEW" = hang ] || { [ "$FAKE_REVIEW" = hang-once ] && [ $resumed = no ]; }; then
+    sleep 60 & echo $! >> "$FAKE_LOG.grandchild"; sleep 60; exit 0
+  fi
+  if [ "$FAKE_REVIEW" = forge ]; then
+    settings=; prev=
+    for a; do [ "$prev" = --settings ] && settings=$a; prev=$a; done
+    printf '%s' "$FAKE_FORGED" > "$(dirname "$settings")/out/reliability.json"
+  fi
+  printf '%s\n' "$FAKE_STDOUT"; exit 0
+fi
 fire_hooks() {
   [ "$FAKE_CLAUDE" = dead-hook ] && return
   sh -c "$(sed -n 's/.*"command":"\([^"]*\)".*/\1/p' .claude/settings.json)"

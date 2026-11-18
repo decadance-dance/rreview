@@ -79,8 +79,7 @@ fn passes_with_working_isolation_and_launches_through_the_builders() {
         run.log
     );
     assert!(
-        run.log
-            .contains("codex exec --json -s read-only --ephemeral -C /"),
+        run.log.contains("codex exec --json -s read-only -C /"),
         "{}",
         run.log
     );

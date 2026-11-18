@@ -17,7 +17,7 @@ Non-goals (v1): posting comments to GitHub, fixing findings, reviewing non-GitHu
 
 ## 2. Pipeline
 
-1. **Prepare.** Resolve the PR with `gh pr view <n> --json number,headRefName,baseRefName,title,body,url`. Create a detached review worktree of the PR head (`git worktree add --detach <runroot>/wt <head-sha>`), never the author's worktree. Compute `base = merge-base(base, head)`. Create the run dir `<runroot>` (default `$XDG_STATE_HOME/rreview/<repo>/<pr>-<head-sha>/`).
+1. **Prepare.** Resolve the PR with `gh pr view <n> --json number,headRefName,baseRefName,title,body,url,headRefOid,baseRefOid,state,mergeCommit` (`--repo` passed through). Fetch `refs/pull/<n>/head` and the base branch from the PR's repository only when a commit is missing locally. Create a detached review worktree of the PR head (`git worktree add --detach <runroot>/wt <head-sha>`), never the author's worktree; it is removed at the end, also after a failure, unless `--keep-worktree`. Compute `base = merge-base(base, head)`, where `base` is the base branch tip, or for a merged PR the merge commit's first parent (today's base tip already contains the head). Create the run dir `<runroot>` (default `$XDG_STATE_HOME/rreview/<owner>/<name>/<pr>-<head-sha>/`, `~/.local/state` when unset); a rerun for the same head replaces it, and stops if a kept worktree is still there.
 2. **Panel** (parallel). Three roles, each one pass:
 
 | Role id | Lens | Input | Default agent |
@@ -51,8 +51,9 @@ Role-to-agent mapping is configurable per role (`--role-agent security=claude`),
 ```
 - Without the git common dir in `denyWrite`, `git commit` and `git branch` succeed from the worktree (*verified*).
 - `sandbox.network.allowedDomains` did not block `curl` (*verified*); the deny rules above are the network fallback. Open item.
+- Session transcripts: a reviewer pass leaves its normal session transcript in the user's Claude config dir (`$CLAUDE_CONFIG_DIR` or `~/.claude`). Accepted: a run-scoped config dir has no login, and `--no-session-persistence` would rule out the wrap-up, which resumes the session (`--session-id <uuid>`, then `--resume <uuid>`). rreview never edits the user's config dir.
 
-**Codex passes** run `codex exec --json -s read-only --ephemeral -C <worktree> -o <out>` (stdout is Codex's JSONL event log: the commands it ran and their output) with `CODEX_HOME=<runroot>/codex-home`, a fresh dir holding only a symlink to the user's `auth.json`. `--ignore-user-config` alone still loads `~/.codex/AGENTS.md` (*verified*); the clean home does not (*verified*). Open items: `-m gpt-6.1-sol` was rejected in a clean home with a ChatGPT login (default became `gpt-6-luna`); whether token refresh replaces the symlink.
+**Codex passes** run `codex exec --json -s read-only -C <worktree> -o <out>` (stdout is Codex's JSONL event log: the commands it ran and their output) with `CODEX_HOME=<runroot>/codex-home`, a fresh dir holding only a symlink to the user's `auth.json`. Not `--ephemeral`: the wrap-up resumes the session (`codex exec <same options> resume <thread-id> -`), so the session is kept, in that run-scoped home only. A resume with the exec-level `-s read-only -C` keeps the sandbox (*verified*: a write into the repo got "Operation not permitted"). `--ignore-user-config` alone still loads `~/.codex/AGENTS.md` (*verified*); the clean home does not (*verified*). Open items: `-m gpt-6.1-sol` was rejected in a clean home with a ChatGPT login (default became `gpt-6-luna`); whether token refresh replaces the symlink.
 
 **Repo-provided text** (AGENTS.md, CLAUDE.md, `.agents/checks`) may still be read as code. Prompts state it is untrusted evidence.
 
@@ -65,7 +66,7 @@ run(pass) -> raw text      // pass = {role, agent, model, effort, prompt, cwd, t
 wrapUp(pass, message) -> raw text   // "time is up, reply with the JSON now"
 ```
 
-- **headless** (default): `claude -p --output-format json` / `codex exec -o`. Timeout kills; wrap-up resumes the session (`claude -p --resume <id>`, `codex exec resume`).
+- **headless** (default): `claude -p --output-format json` / `codex exec -o`. The reply is Claude's `result` (a failed exit or `is_error` fails the pass) or Codex's `-o` file. Each agent runs in its own process group; a timeout kills the whole group and the error names the pass. Wrap-up resumes the session (`claude -p --resume <id>`, `codex exec resume <thread-id>`). Logs: `<runroot>/logs/<role>.{stdout,stderr}`.
 - **orca** (variant 5): `orca terminal create --worktree path:<wt> --title rreview:<role> --command "<same isolated command, interactive>"`, then `orca terminal send --text <prompt> --enter`, `orca terminal wait --for tui-idle`, then read `<runroot>/out/<role>.json` that the reviewer wrote (it may write only there). Close with `orca terminal close`. *Verified*: Orca lists such a terminal as a claude agent, tracks working/done, the sandbox blocks writes, Orca-created worktrees show no trust dialog. Do **not** use `orchestration worker-start`/`worker_done`: `worker_done` cannot reach the Orca runtime from inside the sandbox (EPERM, *verified*). The review worktree must be Orca-created (`orca worktree create`) in this mode, because Claude's trust dialog in an untrusted dir offers only "No, exit" under `--safe-mode`. Orca commands need to run from an Orca terminal (`ORCA_TERMINAL_HANDLE`).
 
 Panel passes run in parallel (max 3); coordinator and judge run in sequence. Budget: per-pass timeout plus a total budget; a pass still running near its timeout gets a wrap-up turn; a pass ending without valid JSON gets one more turn.
@@ -74,10 +75,10 @@ Panel passes run in parallel (max 3); coordinator and judge run in sequence. Bud
 
 All outputs live in `<runroot>`:
 - `meta.json`: PR, base, head, runner, role-to-agent map, versions of claude/codex.
-- `progress.jsonl`: one line per event `{ts, role, status: started|wrapup|completed|failed, agent, model, duration_ms, error?}`. The plugin tails it.
-- `out/<role>.json`: raw reviewer JSON (panelist envelope, coordinator review, judge array) following block/review's shapes (`panelistShape`, finding schema with `title`, `body`, `priority` 0-3, `confidence_score`, `code_location`).
+- `progress.jsonl`: one line per event `{ts, role, status: started|wrapup|completed|failed, agent, model, duration_ms, error?}`; `ts` is Unix epoch milliseconds, `duration_ms` counts from the pass's start, `model` is `default` until models are configurable. The plugin tails it.
+- `out/<role>.json`: the validated reviewer JSON (panelist envelope, coordinator review, judge array) following block/review's shapes (`panelistShape`, finding schema with `title`, `body`, `priority` 0-3, `confidence_score`, `code_location`). It exists only for a pass whose reply passed validation; anything else there (a reviewer may write into `out/`) is removed when the pass fails. A panelist candidate locates itself with `path`, `line_start`, `line_end`.
 - `result.json`: `{findings, ungated_findings, dropped_candidates, overall_correctness, overall_explanation, review_process, base, head, passes, degraded}` (block/review `Result`).
-- Validation: strict decoding, unknown fields rejected; one malformed candidate rejects the envelope; paths must be repo-relative and inside the diff's files.
+- Validation: strict decoding, unknown fields rejected; one malformed candidate rejects the envelope; paths must be repo-relative and inside the diff's files (`git diff --name-only base head`, matched exactly).
 
 ## 6. CLI
 
@@ -85,9 +86,12 @@ All outputs live in `<runroot>`:
 rreview <pr-number|url> [--repo owner/name] [--runner headless|orca] [--author claude|codex]
         [--role-agent role=agent]... [--role-model role=model]... [--role-effort role=effort]...
         [--context-file path] [--gate p<=2,conf>=0.8 | --all] [--json] [--keep-worktree]
+        [--timeout secs] [--only role]
 rreview show <runroot|pr>        # print result of the latest run
 rreview doctor                   # claude/codex/gh/orca versions, logins, sandbox self-test
 ```
+
+`--timeout` is the per-pass timeout (default 900 s); a pass that hits it gets one wrap-up turn of at most 180 s. `--only <role>` runs one panelist (a development flag; milestone 2 ports only `reliability`, so it is required for now).
 
 `rreview doctor` runs the isolation self-test on a throwaway repo and a detached worktree of it, through the same launch builders a review uses: a write into the worktree, a commit and a branch must fail, `git diff` must work, a planted project hook must not fire, Codex must not load the user's AGENTS.md. Checks need the effects on disk and tool-side evidence to agree, never the reviewer's reply alone: Claude's probe writes its exit codes to `out/`, Codex's run must show the probe in its `--json` event log. The planted hook has a positive control at no model cost: the same Claude launch without `--safe-mode` and with an empty `CLAUDE_CONFIG_DIR` (no user config, no login) must fire it. The AGENTS.md probe gives Codex a stand-in `HOME` whose `.codex/AGENTS.md` names a random canary that must not appear in the reply, plus a control run whose clean `CODEX_HOME` holds a canary that must appear; the user's own `~/.codex` and `~/.claude` are never touched. It prints one line per check (`ok`, `FAIL`, or `warn` for the optional `orca`) and exits 0 only when every required check passes, else 1. This turns section 3's *verified* facts into a check that runs on every machine and every CLI upgrade.
 

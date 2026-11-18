@@ -3,6 +3,7 @@
 
 use std::fs::{self, File};
 use std::io::{ErrorKind, Write};
+use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus, Stdio};
 use std::time::{Duration, Instant};
@@ -21,6 +22,9 @@ pub struct Launch {
 
 impl Launch {
     /// Runs with `prompt` on stdin. Stdout and stderr go to `<log>.stdout` and `<log>.stderr`.
+    /// The child leads its own process group, so a timeout kills everything it started.
+    // limit: in its own group the child misses the terminal's Ctrl-C; an interrupted rreview
+    // leaves a running reviewer behind.
     pub fn run(&self, prompt: &str, log: &Path, timeout: Duration) -> Result<ExitStatus> {
         let stdout = log.with_extension("stdout");
         let stderr = log.with_extension("stderr");
@@ -31,6 +35,7 @@ impl Launch {
             .stdin(Stdio::piped())
             .stdout(File::create(&stdout).with_context(|| format!("{}", stdout.display()))?)
             .stderr(File::create(&stderr).with_context(|| format!("{}", stderr.display()))?)
+            .process_group(0)
             .spawn()
             .with_context(|| format!("cannot start {}", self.program))?;
         // A writer thread, so a child that never reads stdin cannot block the timeout below.
@@ -44,15 +49,35 @@ impl Launch {
                 return Ok(status);
             }
             if Instant::now() >= deadline {
-                // limit: kills only the direct child; its own subprocesses may outlive it.
+                let _ = Command::new("kill")
+                    .args(["-KILL", "--", &format!("-{}", child.id())])
+                    .stderr(Stdio::null())
+                    .status();
                 let _ = child.kill();
                 let _ = child.wait();
-                bail!("{} timed out after {}s", self.program, timeout.as_secs());
+                return Err(TimedOut(format!(
+                    "{} timed out after {}s",
+                    self.program,
+                    timeout.as_secs()
+                ))
+                .into());
             }
             std::thread::sleep(Duration::from_millis(100));
         }
     }
 }
+
+/// A launch killed at its timeout; callers tell it from other failures to give a wrap-up turn.
+#[derive(Debug)]
+pub struct TimedOut(String);
+
+impl std::fmt::Display for TimedOut {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for TimedOut {}
 
 /// `claude -p --safe-mode --settings <runroot>/claude-settings.json --output-format json`.
 /// Writes the settings file: no edit/write/MCP tools, Bash sandboxed, writes denied in the
@@ -99,10 +124,11 @@ pub fn claude(worktree: &Path, git_common_dir: &Path, runroot: &Path) -> Result<
     })
 }
 
-/// `codex exec --json -s read-only --ephemeral -C <worktree> -o <runroot>/out/<out_name> -` with
+/// `codex exec --json -s read-only -C <worktree> -o <runroot>/out/<out_name> -` with
 /// `CODEX_HOME=<runroot>/codex-home`, a fresh dir holding only a symlink to `user_auth`, so
 /// Codex loads none of the user's config or AGENTS.md. The prompt goes on stdin; stdout is
 /// Codex's JSONL event log (the commands it ran and their output), the last message goes to `-o`.
+/// Not `--ephemeral`: the wrap-up resumes the session, which then lives in that run-scoped home.
 pub fn codex(worktree: &Path, runroot: &Path, out_name: &str, user_auth: &Path) -> Result<Launch> {
     let worktree = absolute(worktree)?;
     let user_auth = absolute(user_auth).context("Codex login (auth.json) not found")?;
@@ -131,7 +157,6 @@ pub fn codex(worktree: &Path, runroot: &Path, out_name: &str, user_auth: &Path) 
             "--json",
             "-s",
             "read-only",
-            "--ephemeral",
             "-C",
             utf8(&worktree)?,
             "-o",
@@ -265,7 +290,6 @@ mod tests {
                 "--json",
                 "-s",
                 "read-only",
-                "--ephemeral",
                 "-C",
                 wt.to_str().unwrap(),
                 "-o",
@@ -289,6 +313,41 @@ mod tests {
                 .is_symlink()
         );
         assert_eq!(fs::read_link(home.join("auth.json")).unwrap(), auth);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn timeout_kills_the_whole_process_tree() {
+        let root = fresh_temp_dir("rreview-test").unwrap();
+        let pid_file = root.join("grandchild.pid");
+        let launch = Launch {
+            program: "sh".into(),
+            args: vec![
+                "-c".into(),
+                format!("sleep 60 & echo $! > '{}'; sleep 60", pid_file.display()),
+            ],
+            env: vec![],
+            cwd: root.clone(),
+        };
+        let err = launch
+            .run("", &root.join("log"), Duration::from_secs(1))
+            .unwrap_err();
+        assert!(err.is::<TimedOut>(), "{err:#}");
+        assert_eq!(err.to_string(), "sh timed out after 1s");
+        let pid = fs::read_to_string(&pid_file).unwrap().trim().to_string();
+        let alive = || {
+            Command::new("kill")
+                .args(["-0", &pid])
+                .stderr(std::process::Stdio::null())
+                .status()
+                .unwrap()
+                .success()
+        };
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while alive() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        assert!(!alive(), "grandchild {pid} outlived the timeout");
         fs::remove_dir_all(root).unwrap();
     }
 
