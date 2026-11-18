@@ -17,6 +17,7 @@ use serde_json::json;
 
 use crate::coordinator::{self, PanelCandidate, PanelResult, Scope, Tagged};
 use crate::launch;
+use crate::orca::{self, Orca};
 use crate::panelist::{self, PrText, ROLES, Role};
 use crate::result::{self, Gate, PassReport, ReviewResult};
 use crate::runner::{Agent, Headless, Pass, Runner};
@@ -45,6 +46,8 @@ pub struct Args {
     pub timeout: Duration,
     /// The whole review's budget.
     pub budget: Duration,
+    /// `--runner orca`: passes in visible Orca terminals (spec §4).
+    pub orca: bool,
 }
 
 #[derive(Deserialize)]
@@ -135,6 +138,9 @@ impl Settings {
 
 /// Runs the review; returns the exit code: 0 no gated findings, 1 gated findings, 2 failed.
 pub fn run(args: &Args) -> Result<u8> {
+    if args.orca {
+        orca::check_env()?;
+    }
     let settings = Settings::new(args)?;
     let panel: Vec<&Role> = match &args.only {
         Some(id) => vec![panelist::role(id)?],
@@ -187,25 +193,69 @@ pub fn run(args: &Args) -> Result<u8> {
     let runroot = fs::canonicalize(&runroot)?;
     // The guard exists before the checkout: a failed one (a post-checkout hook) can leave a
     // registered, half-made worktree behind.
+    let ran = |r: &str| panel.iter().any(|p| p.id == r) || args.only.is_none();
+    if args.orca
+        && settings
+            .agents
+            .iter()
+            .any(|(r, a)| ran(r) && *a == Agent::Codex)
+    {
+        orca::check_codex_run_dir(&runroot)?;
+    }
     let mut wt = Worktree {
         path: runroot.join("wt"),
         keep: false,
+        orca_name: None,
     };
-    git(
-        &[
-            "worktree",
-            "add",
-            "--quiet",
-            "--detach",
-            launch::utf8(&wt.path)?,
-            head,
-        ],
+    let git_common_dir: PathBuf = git(
+        &["rev-parse", "--path-format=absolute", "--git-common-dir"],
         deadline,
-    )
-    .context("cannot create the review worktree")?;
+    )?
+    .into();
+    if args.orca {
+        // The pid and start time make the name the run's own: a concurrent run for the same
+        // PR head gets another one, so neither run's cleanup can reach the other's worktree.
+        let started = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let name = format!(
+            "rreview-{}-{}-{}-{started}",
+            pr.number,
+            &head[..12],
+            std::process::id()
+        );
+        orca::check_branch_free(&name)?;
+        // Set before the create: a create whose reply is lost is still found by its name.
+        wt.orca_name = Some(name.clone());
+        wt.path = orca::create_worktree(&git_common_dir, &name, head, deadline)
+            .context("cannot create the review worktree")?;
+        let at = git(
+            &["-C", launch::utf8(&wt.path)?, "rev-parse", "HEAD"],
+            deadline,
+        )?;
+        if at != head {
+            bail!(
+                "the Orca worktree {} is at {at}, not {head}",
+                wt.path.display()
+            );
+        }
+    } else {
+        git(
+            &[
+                "worktree",
+                "add",
+                "--quiet",
+                "--detach",
+                launch::utf8(&wt.path)?,
+                head,
+            ],
+            deadline,
+        )
+        .context("cannot create the review worktree")?;
+    }
     wt.keep = args.keep_worktree;
 
-    let ran = |r: &str| panel.iter().any(|p| p.id == r) || args.only.is_none();
     let roles: BTreeMap<_, _> = settings
         .agents
         .iter()
@@ -215,7 +265,7 @@ pub fn run(args: &Args) -> Result<u8> {
     let meta = json!({
         "pr": { "number": pr.number, "title": pr.title, "url": pr.url, "repo": format!("{owner}/{name}"),
                 "head_ref": pr.head_ref_name, "base_ref": pr.base_ref_name },
-        "base": base, "head": head, "runner": "headless", "roles": roles,
+        "base": base, "head": head, "runner": if args.orca { "orca" } else { "headless" }, "roles": roles,
         "versions": { "claude": version("claude", deadline), "codex": version("codex", deadline) },
     });
     fs::write(
@@ -223,15 +273,20 @@ pub fn run(args: &Args) -> Result<u8> {
         serde_json::to_string_pretty(&meta)?,
     )?;
 
-    let runner = Headless {
-        git_common_dir: git(
-            &["rev-parse", "--path-format=absolute", "--git-common-dir"],
-            deadline,
-        )?
-        .into(),
-        worktree: wt.path.clone(),
-        runroot: runroot.clone(),
-        codex_auth: launch::user_codex_auth()?,
+    let runner: Box<dyn Runner + Sync> = if args.orca {
+        Box::new(Orca::new(
+            wt.path.clone(),
+            git_common_dir,
+            runroot.clone(),
+            launch::user_codex_auth()?,
+        ))
+    } else {
+        Box::new(Headless {
+            git_common_dir,
+            worktree: wt.path.clone(),
+            runroot: runroot.clone(),
+            codex_auth: launch::user_codex_auth()?,
+        })
     };
     let ctx = Ctx {
         runner: &runner,
@@ -318,6 +373,9 @@ pub fn run(args: &Args) -> Result<u8> {
     }
     let mut degraded = results.iter().any(|r| r.status != "completed");
     if args.only.is_some() {
+        // Terminals close before their worktree goes.
+        drop(ctx);
+        drop(runner);
         drop(wt);
         eprintln!("run dir: {}", runroot.display());
         return Ok(if degraded { 2 } else { 0 });
@@ -341,6 +399,9 @@ pub fn run(args: &Args) -> Result<u8> {
     let review = match review {
         Ok(review) => review,
         Err(e) => {
+            // Terminals close before their worktree goes.
+            drop(ctx);
+            drop(runner);
             drop(wt);
             eprintln!("error: {e:#}\nrun dir: {}", runroot.display());
             return Ok(2);
@@ -364,6 +425,9 @@ pub fn run(args: &Args) -> Result<u8> {
             }
         }
     }
+    // Terminals close before their worktree goes.
+    drop(ctx);
+    drop(runner);
     drop(wt);
 
     let ungated = result::dedupe(findings, args.gate);
@@ -565,12 +629,20 @@ impl<R: Runner> Ctx<'_, R> {
 struct Worktree {
     path: PathBuf,
     keep: bool,
+    /// Set for an Orca-created worktree: it and its branch are found by this name.
+    orca_name: Option<String>,
 }
 
 impl Drop for Worktree {
     fn drop(&mut self) {
         if self.keep {
             eprintln!("review worktree kept: {}", self.path.display());
+            return;
+        }
+        if let Some(name) = &self.orca_name {
+            if let Err(e) = orca::remove_worktree(name) {
+                eprintln!("warning: cannot remove the review worktree: {e:#}");
+            }
             return;
         }
         let removed =

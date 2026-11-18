@@ -74,7 +74,7 @@ pub fn kill_group(child: &mut Child) {
 
 /// A launch killed at its timeout; callers tell it from other failures to give a wrap-up turn.
 #[derive(Debug)]
-pub struct TimedOut(String);
+pub struct TimedOut(pub String);
 
 impl std::fmt::Display for TimedOut {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
@@ -88,6 +88,56 @@ impl std::error::Error for TimedOut {}
 /// Writes the settings file: no edit/write/MCP tools, Bash sandboxed, writes denied in the
 /// worktree and the git common dir, allowed only in `<runroot>/out`.
 pub fn claude(worktree: &Path, git_common_dir: &Path, runroot: &Path) -> Result<Launch> {
+    let (settings, cwd) = claude_settings(worktree, git_common_dir, runroot)?;
+    Ok(Launch {
+        program: "claude".into(),
+        args: [
+            "-p",
+            "--safe-mode",
+            "--settings",
+            &settings,
+            "--output-format",
+            "json",
+        ]
+        .map(String::from)
+        .into(),
+        env: vec![],
+        cwd,
+    })
+}
+
+/// The same isolation as [`claude`] as an interactive session (the orca runner). The reply file
+/// is written by a sandboxed Bash redirect into `<runroot>/out`; Claude asks before such a write
+/// outside its working dirs (`dontAsk` refuses it), so `out` is added as a working dir and
+/// `acceptEdits` takes it without a dialog nobody would answer. The deny rules still remove
+/// Edit and Write, and the sandbox still refuses every other write.
+pub fn claude_tui(worktree: &Path, git_common_dir: &Path, runroot: &Path) -> Result<Launch> {
+    let (settings, cwd) = claude_settings(worktree, git_common_dir, runroot)?;
+    let out = absolute(&runroot.join("out"))?;
+    Ok(Launch {
+        program: "claude".into(),
+        args: [
+            "--safe-mode",
+            "--settings",
+            &settings,
+            "--permission-mode",
+            "acceptEdits",
+            "--add-dir",
+            utf8(&out)?,
+        ]
+        .map(String::from)
+        .into(),
+        env: vec![],
+        cwd,
+    })
+}
+
+/// Writes `<runroot>/claude-settings.json`; returns its path and the resolved worktree.
+fn claude_settings(
+    worktree: &Path,
+    git_common_dir: &Path,
+    runroot: &Path,
+) -> Result<(String, PathBuf)> {
     let worktree = absolute(worktree)?;
     let git_common_dir = absolute(git_common_dir)?;
     fs::create_dir_all(runroot.join("out")).with_context(|| format!("{}", runroot.display()))?;
@@ -112,21 +162,7 @@ pub fn claude(worktree: &Path, git_common_dir: &Path, runroot: &Path) -> Result<
     });
     fs::write(&settings_path, serde_json::to_string_pretty(&settings)?)
         .with_context(|| format!("{}", settings_path.display()))?;
-    Ok(Launch {
-        program: "claude".into(),
-        args: [
-            "-p",
-            "--safe-mode",
-            "--settings",
-            utf8(&settings_path)?,
-            "--output-format",
-            "json",
-        ]
-        .map(String::from)
-        .into(),
-        env: vec![],
-        cwd: worktree,
-    })
+    Ok((utf8(&settings_path)?.into(), worktree))
 }
 
 /// `codex exec --json -s read-only -C <worktree> -o <runroot>/replies/<out_name> -` with
@@ -138,9 +174,65 @@ pub fn claude(worktree: &Path, git_common_dir: &Path, runroot: &Path) -> Result<
 /// that Codex, writing unsandboxed, would follow.
 pub fn codex(worktree: &Path, runroot: &Path, out_name: &str, user_auth: &Path) -> Result<Launch> {
     let worktree = absolute(worktree)?;
-    let user_auth = absolute(user_auth).context("Codex login (auth.json) not found")?;
     fs::create_dir_all(runroot.join("replies"))
         .with_context(|| format!("{}", runroot.display()))?;
+    let (runroot, env) = codex_home(runroot, user_auth)?;
+    Ok(Launch {
+        program: "codex".into(),
+        args: [
+            "exec",
+            "--json",
+            "-s",
+            "read-only",
+            "-C",
+            utf8(&worktree)?,
+            "-o",
+            utf8(&runroot.join("replies").join(out_name))?,
+            "-",
+        ]
+        .map(String::from)
+        .into(),
+        env,
+        cwd: worktree,
+    })
+}
+
+/// The Codex TUI for the orca runner, in the same clean home. `-s read-only` would block the
+/// reply file too, so it runs `workspace-write` rooted at `<runroot>/out` with `/tmp` and
+/// `$TMPDIR` excluded: `out/` is its only writable dir; it reads the worktree by absolute path.
+/// `-a never` returns a refused command to the model instead of asking the user.
+pub fn codex_tui(worktree: &Path, runroot: &Path, user_auth: &Path) -> Result<Launch> {
+    let worktree = absolute(worktree)?;
+    fs::create_dir_all(runroot.join("out")).with_context(|| format!("{}", runroot.display()))?;
+    let (runroot, env) = codex_home(runroot, user_auth)?;
+    Ok(Launch {
+        program: "codex".into(),
+        args: [
+            "-C",
+            utf8(&runroot.join("out"))?,
+            "-s",
+            "workspace-write",
+            "-a",
+            "never",
+            "-c",
+            "sandbox_workspace_write.exclude_slash_tmp=true",
+            "-c",
+            "sandbox_workspace_write.exclude_tmpdir_env_var=true",
+            "-c",
+            "check_for_update_on_startup=false",
+        ]
+        .map(String::from)
+        .into(),
+        env,
+        cwd: worktree,
+    })
+}
+
+/// Creates `<runroot>/codex-home` with only the auth symlink; returns the resolved run root and
+/// the `CODEX_HOME` env.
+fn codex_home(runroot: &Path, user_auth: &Path) -> Result<(PathBuf, Vec<(String, String)>)> {
+    let user_auth = absolute(user_auth).context("Codex login (auth.json) not found")?;
+    fs::create_dir_all(runroot).with_context(|| format!("{}", runroot.display()))?;
     let runroot = absolute(runroot)?;
     let home = runroot.join("codex-home");
     fs::create_dir_all(&home).with_context(|| format!("{}", home.display()))?;
@@ -158,24 +250,7 @@ pub fn codex(worktree: &Path, runroot: &Path, out_name: &str, user_auth: &Path) 
             .with_context(|| format!("{}", link.display()))?,
         Err(e) => return Err(e).with_context(|| format!("{} is not a symlink", link.display())),
     }
-    Ok(Launch {
-        program: "codex".into(),
-        args: [
-            "exec",
-            "--json",
-            "-s",
-            "read-only",
-            "-C",
-            utf8(&worktree)?,
-            "-o",
-            utf8(&runroot.join("replies").join(out_name))?,
-            "-",
-        ]
-        .map(String::from)
-        .into(),
-        env: vec![("CODEX_HOME".into(), utf8(&home)?.into())],
-        cwd: worktree,
-    })
+    Ok((runroot, vec![("CODEX_HOME".into(), utf8(&home)?.into())]))
 }
 
 /// The user's Codex login: `$CODEX_HOME/auth.json`, else `~/.codex/auth.json`.

@@ -57,6 +57,16 @@ pub trait Runner {
     fn wrap_up(&self, pass: &Pass, message: &str, timeout: Duration) -> Result<String>;
 }
 
+/// Lets the review pick its runner at run time.
+impl Runner for Box<dyn Runner + Sync> {
+    fn run(&self, pass: &Pass) -> Result<String> {
+        (**self).run(pass)
+    }
+    fn wrap_up(&self, pass: &Pass, message: &str, timeout: Duration) -> Result<String> {
+        (**self).wrap_up(pass, message, timeout)
+    }
+}
+
 /// `claude -p` / `codex exec` in the review worktree. Each pass gets its own launch dir,
 /// `<runroot>/scratch/<role>`: Claude's settings and the one dir it may write (`out/`), Codex's
 /// home and its `-o` reply. No pass can write into another pass's dir, or into `<runroot>/out`
@@ -178,11 +188,11 @@ impl Runner for Headless {
 }
 
 /// Codex's `-o` file, in the pass's `replies/`.
-const REPLY: &str = "reply.txt";
+pub const REPLY: &str = "reply.txt";
 
 /// The model and effort flags of `pass`'s CLI. The values were checked when parsed (`main.rs`):
 /// none starts with `-`, so none reads as another flag.
-fn model_args(pass: &Pass) -> Vec<String> {
+pub fn model_args(pass: &Pass) -> Vec<String> {
     let mut args = vec![];
     match pass.agent {
         Agent::Claude => {

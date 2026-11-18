@@ -1,6 +1,7 @@
 mod coordinator;
 mod doctor;
 mod launch;
+mod orca;
 mod panelist;
 mod reply;
 mod result;
@@ -79,6 +80,8 @@ struct Cli {
 #[derive(Clone, Copy, ValueEnum)]
 enum RunnerKind {
     Headless,
+    /// Each pass in a visible Orca terminal (run from an Orca terminal).
+    Orca,
 }
 
 #[derive(Subcommand)]
@@ -138,24 +141,22 @@ fn main() -> ExitCode {
             };
         }
         Some(Command::Show { target, repo, json }) => review::show(&target, repo.as_deref(), json),
-        None => {
-            let RunnerKind::Headless = cli.runner;
-            review::run(&review::Args {
-                pr: cli.pr.unwrap_or_default(),
-                repo: cli.repo,
-                only: cli.only,
-                author: cli.author,
-                role_agents: cli.role_agents,
-                role_models: cli.role_models,
-                role_efforts: cli.role_efforts,
-                context_file: cli.context_file,
-                gate: if cli.all { Gate::NONE } else { cli.gate },
-                json: cli.json,
-                keep_worktree: cli.keep_worktree,
-                timeout: Duration::from_secs(cli.timeout),
-                budget: Duration::from_secs(cli.budget),
-            })
-        }
+        None => review::run(&review::Args {
+            pr: cli.pr.unwrap_or_default(),
+            repo: cli.repo,
+            only: cli.only,
+            author: cli.author,
+            role_agents: cli.role_agents,
+            role_models: cli.role_models,
+            role_efforts: cli.role_efforts,
+            context_file: cli.context_file,
+            gate: if cli.all { Gate::NONE } else { cli.gate },
+            json: cli.json,
+            keep_worktree: cli.keep_worktree,
+            timeout: Duration::from_secs(cli.timeout),
+            budget: Duration::from_secs(cli.budget),
+            orca: matches!(cli.runner, RunnerKind::Orca),
+        }),
     };
     match code {
         Ok(code) => ExitCode::from(code),
