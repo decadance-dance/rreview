@@ -1,0 +1,13 @@
+name: ci
+on:
+  pull_request:
+  push:
+    branches: [develop, main]
+jobs:
+  ci-ok:
+    name: ci-ok
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - run: rustup toolchain install # the toolchain and components in rust-toolchain.toml
+      - run: bin/check

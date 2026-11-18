@@ -1,0 +1,23 @@
+#!/bin/sh
+# Fake `claude` for doctor tests. FAKE_CLAUDE: ok (default); no-safe-mode; leak (runs the
+# probe unsandboxed, as if the sandbox let everything through). Argv is appended to $FAKE_LOG.
+echo "claude $*" >> "${FAKE_LOG:-/dev/null}"
+case "$1" in
+--version) echo "9.9.9 (Claude Code)"; exit 0 ;;
+--help)
+  echo "Usage: claude [options] [prompt]"
+  [ "$FAKE_CLAUDE" = no-safe-mode ] || echo "  --safe-mode  Disable user and project customizations"
+  exit 0 ;;
+auth) echo '{"loggedIn": true, "authMethod": "fake"}'; exit 0 ;;
+esac
+# A reviewer pass: the prompt on stdin names the probe script, whose dir holds out/.
+probe=$(grep -o "/[^']*/probe\.sh")
+out=$(dirname "$probe")/out
+if [ "$FAKE_CLAUDE" = leak ]; then
+  sh "$probe" > /dev/null 2>&1
+else
+  # What a working sandbox lets through: git diff and writes into out/.
+  git diff > "$out/diff.txt"
+  echo "write=1 commit=128 branch=128 diff=0" > "$out/probe.txt"
+fi
+echo '{"type": "result", "result": "done"}'

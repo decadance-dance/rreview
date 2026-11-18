@@ -1,0 +1,477 @@
+//! `rreview doctor` (spec §6): tool versions, logins, and the isolation self-test, which runs
+//! real reviewer launches (spec §3) on a throwaway repo and checks their effects on disk.
+
+use std::collections::hash_map::RandomState;
+use std::fs;
+use std::hash::{BuildHasher, Hasher};
+use std::io::ErrorKind;
+use std::path::{Path, PathBuf};
+use std::process::{Command, Output, Stdio};
+use std::time::Duration;
+
+use anyhow::{Context, Result, anyhow, bail};
+use serde_json::{Value, json};
+
+use crate::launch;
+
+const PASS_TIMEOUT: Duration = Duration::from_secs(300);
+
+/// Prints one line per check; true when every required check passed.
+pub fn run() -> Result<bool> {
+    let mut r = Report::default();
+    let claude = r.tool("claude", true);
+    let codex = r.tool("codex", true);
+    let gh = r.tool("gh", true);
+    r.tool("orca", false);
+    let claude = claude
+        && r.check("claude login", claude_login())
+        && r.check("claude --safe-mode", safe_mode());
+    let codex = codex && r.check("codex login", logged_in("codex", &["login", "status"]));
+    if gh {
+        r.check("gh login", logged_in("gh", &["auth", "status"]));
+    }
+    if !claude && !codex {
+        return Ok(r.failed == 0);
+    }
+
+    let fx = Fixture::new().context("cannot build the self-test repo")?;
+    let before = r.failed;
+    let (claude_checks, codex_checks) = std::thread::scope(|s| {
+        let c = s.spawn(|| {
+            if claude {
+                claude_self_test(&fx)
+            } else {
+                vec![]
+            }
+        });
+        let x = if codex { codex_self_test(&fx) } else { vec![] };
+        let c = c
+            .join()
+            .unwrap_or_else(|_| vec![Check::fail("claude self-test", "panicked")]);
+        (c, x)
+    });
+    for c in claude_checks.into_iter().chain(codex_checks) {
+        r.check(&c.name, c.outcome);
+    }
+    if r.failed == before {
+        let _ = fs::remove_dir_all(&fx.root);
+    } else {
+        println!("      self-test files kept in {}", fx.root.display());
+    }
+    Ok(r.failed == 0)
+}
+
+#[derive(Default)]
+struct Report {
+    failed: usize,
+}
+
+impl Report {
+    fn check(&mut self, name: &str, outcome: Result<String, String>) -> bool {
+        match &outcome {
+            Ok(detail) => println!("ok    {name}: {detail}"),
+            Err(reason) => {
+                self.failed += 1;
+                println!("FAIL  {name}: {reason}");
+            }
+        }
+        outcome.is_ok()
+    }
+
+    /// Prints `<bin> --version`; a missing optional tool is a warning.
+    fn tool(&mut self, bin: &str, required: bool) -> bool {
+        let version = output(bin, &["--version"]).map(|o| first_line(&o.stdout));
+        match version {
+            Err(reason) if !required => {
+                println!("warn  {bin}: {reason} (optional)");
+                false
+            }
+            v => self.check(bin, v),
+        }
+    }
+}
+
+#[derive(Debug)]
+struct Check {
+    name: String,
+    outcome: Result<String, String>,
+}
+
+impl Check {
+    fn new(name: &str, outcome: Result<String, String>) -> Self {
+        Check {
+            name: name.into(),
+            outcome,
+        }
+    }
+    fn fail(name: &str, reason: impl Into<String>) -> Self {
+        Check::new(name, Err(reason.into()))
+    }
+    /// A forbidden action is a failure when its effect is on disk.
+    fn blocked(name: &str, went_through: bool) -> Self {
+        Check::new(
+            name,
+            if went_through {
+                Err("went through".into())
+            } else {
+                Ok("blocked".into())
+            },
+        )
+    }
+}
+
+fn output(bin: &str, args: &[&str]) -> Result<Output, String> {
+    Command::new(bin)
+        .args(args)
+        .stdin(Stdio::null())
+        .output()
+        .map_err(|e| {
+            if e.kind() == ErrorKind::NotFound {
+                "not found on PATH".to_string()
+            } else {
+                format!("cannot run: {e}")
+            }
+        })
+}
+
+fn first_line(bytes: &[u8]) -> String {
+    String::from_utf8_lossy(bytes)
+        .lines()
+        .map(str::trim)
+        .find(|l| !l.is_empty())
+        .unwrap_or("")
+        .into()
+}
+
+fn claude_login() -> Result<String, String> {
+    let out = output("claude", &["auth", "status"])?;
+    let status: Value = serde_json::from_slice(&out.stdout).map_err(|_| {
+        format!(
+            "unexpected `claude auth status` output: {}",
+            first_line(&out.stdout)
+        )
+    })?;
+    match status["loggedIn"].as_bool() {
+        Some(true) => Ok(format!(
+            "logged in ({})",
+            status["authMethod"].as_str().unwrap_or("unknown method")
+        )),
+        _ => Err("not logged in: run `claude` and log in".into()),
+    }
+}
+
+/// Spec §9: older Claude Code versions have no `--safe-mode`, and without it a reviewer
+/// loads the user's and the reviewed repo's CLAUDE.md, hooks, plugins and MCP.
+fn safe_mode() -> Result<String, String> {
+    let out = output("claude", &["--help"])?;
+    if String::from_utf8_lossy(&out.stdout).contains("--safe-mode") {
+        Ok("available".into())
+    } else {
+        Err("this claude has no --safe-mode; update Claude Code".into())
+    }
+}
+
+fn logged_in(bin: &str, args: &[&str]) -> Result<String, String> {
+    let out = output(bin, args)?;
+    if out.status.success() {
+        Ok("logged in".into())
+    } else {
+        let why = [first_line(&out.stderr), first_line(&out.stdout)].join(" ");
+        Err(format!("not logged in: {}", why.trim()))
+    }
+}
+
+/// A repo with one commit, its `.claude/settings.json` planting hooks that touch
+/// `<root>/hook-fired`, and a detached worktree with an uncommitted change. The git common
+/// dir sits outside the worktree, as in a real review.
+struct Fixture {
+    root: PathBuf,
+    wt: PathBuf,
+    git_common_dir: PathBuf,
+    head: String,
+}
+
+impl Fixture {
+    fn new() -> Result<Self> {
+        let root = fresh_temp_dir("rreview-doctor")?;
+        let (repo, wt) = (root.join("repo"), root.join("wt"));
+        let touch = json!([{ "hooks": [{ "type": "command", "command":
+            format!("touch {}", sh_quote(&root.join("hook-fired"))) }] }]);
+        let hooks = json!({ "hooks": {
+            "SessionStart": touch, "UserPromptSubmit": touch, "PreToolUse": [{ "matcher": "*", "hooks": touch[0]["hooks"] }]
+        } });
+        fs::create_dir_all(repo.join(".claude"))?;
+        fs::write(repo.join(".claude/settings.json"), hooks.to_string())?;
+        fs::write(repo.join("f.txt"), "a\n")?;
+        git(&repo, &["init", "-q"])?;
+        git(&repo, &["add", "."])?;
+        git(&repo, &["commit", "-q", "-m", "init"])?;
+        git(
+            &repo,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "--detach",
+                launch::utf8(&wt)?,
+                "HEAD",
+            ],
+        )?;
+        fs::write(wt.join("f.txt"), "a\nrreview-probe-change\n")?;
+        let git_common_dir = git(
+            &wt,
+            &["rev-parse", "--path-format=absolute", "--git-common-dir"],
+        )?
+        .into();
+        let head = git(&wt, &["rev-parse", "HEAD"])?;
+        Ok(Fixture {
+            root,
+            wt,
+            git_common_dir,
+            head,
+        })
+    }
+}
+
+/// Git for the fixture, without the user's git config (signing, hooks, templates).
+fn git(dir: &Path, args: &[&str]) -> Result<String> {
+    let out = Command::new("git")
+        .args([
+            "-c",
+            "user.name=rreview",
+            "-c",
+            "user.email=rreview@localhost",
+        ])
+        .args(args)
+        .current_dir(dir)
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .stdin(Stdio::null())
+        .output()
+        .context("cannot run git")?;
+    if !out.status.success() {
+        bail!(
+            "git {}: {}",
+            args.join(" "),
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+    }
+    Ok(String::from_utf8_lossy(&out.stdout).trim().into())
+}
+
+fn claude_self_test(fx: &Fixture) -> Vec<Check> {
+    claude_probe(fx).unwrap_or_else(|e| vec![Check::fail("claude self-test", format!("{e:#}"))])
+}
+
+/// Claude runs one probe script through its sandboxed Bash; the probe records exit codes in
+/// `out/`, the one place it may write, and the checks read the effects from disk.
+fn claude_probe(fx: &Fixture) -> Result<Vec<Check>> {
+    let run = fx.root.join("claude");
+    let launch = launch::claude(&fx.wt, &fx.git_common_dir, &run)?;
+    let (out, leak, probe) = (
+        run.join("out"),
+        fx.wt.join("rreview-probe-claude.txt"),
+        run.join("probe.sh"),
+    );
+    let (diff, report) = (out.join("diff.txt"), out.join("probe.txt"));
+    fs::write(
+        &probe,
+        format!(
+            "cd {wt} || exit 1\n\
+             echo x > {leak}; w=$?\n\
+             git -c commit.gpgsign=false -c core.hooksPath=/dev/null -c user.name=rreview \
+             -c user.email=rreview@localhost commit -q --allow-empty -m probe; c=$?\n\
+             git branch rreview-probe; b=$?\n\
+             git diff > {diff}; d=$?\n\
+             echo \"write=$w commit=$c branch=$b diff=$d\" > {report}\n\
+             cat {report}\n",
+            wt = sh_quote(&fx.wt),
+            leak = sh_quote(&leak),
+            diff = sh_quote(&diff),
+            report = sh_quote(&report),
+        ),
+    )?;
+    let prompt = format!(
+        "Run this exact command with the Bash tool, once, then reply with its output:\nsh {}\n",
+        sh_quote(&probe)
+    );
+    let status = launch.run(&prompt, &run.join("claude"), PASS_TIMEOUT)?;
+    let report = fs::read_to_string(&report).map_err(|_| {
+        anyhow!(
+            "the probe did not run in Claude's sandbox (claude {status}); see {}",
+            run.display()
+        )
+    })?;
+    let diff = fs::read_to_string(&diff).unwrap_or_default();
+    let branch = git(
+        &fx.wt,
+        &["rev-parse", "--verify", "-q", "refs/heads/rreview-probe"],
+    );
+    Ok(vec![
+        Check::blocked("claude sandbox: write into the worktree", leak.exists()),
+        Check::blocked(
+            "claude sandbox: git commit",
+            git(&fx.wt, &["rev-parse", "HEAD"])? != fx.head,
+        ),
+        Check::blocked("claude sandbox: git branch", branch.is_ok()),
+        Check::new(
+            "claude sandbox: git diff",
+            if diff.contains("+rreview-probe-change") {
+                Ok("works".into())
+            } else {
+                Err(format!(
+                    "did not produce the diff (probe: {})",
+                    report.trim()
+                ))
+            },
+        ),
+        Check::new(
+            "claude --safe-mode: planted project hook",
+            if fx.root.join("hook-fired").exists() {
+                Err("fired".into())
+            } else {
+                Ok("did not fire".into())
+            },
+        ),
+    ])
+}
+
+fn codex_self_test(fx: &Fixture) -> Vec<Check> {
+    codex_probe(fx).unwrap_or_else(|e| vec![Check::fail("codex self-test", format!("{e:#}"))])
+}
+
+/// Codex runs a probe that writes into the worktree, then names the canary word it was told,
+/// if any. Its `HOME` is a stand-in whose `.codex/AGENTS.md` names a canary, so the user's
+/// real `~/.codex` is never touched; a control run with a canary in its own `CODEX_HOME`
+/// must report it, or the AGENTS.md check proves nothing.
+fn codex_probe(fx: &Fixture) -> Result<Vec<Check>> {
+    let auth = launch::user_codex_auth()?;
+    let leak = fx.wt.join("rreview-probe-codex.txt");
+    let probe = fx.root.join("codex-probe.sh");
+    fs::write(
+        &probe,
+        format!(
+            "echo x > {} && echo write=0 || echo write=1\n",
+            sh_quote(&leak)
+        ),
+    )?;
+    let prompt = format!(
+        "Run this exact command with your shell tool, once:\nsh {}\n\
+         Then reply with its output verbatim on the first line; on the second line, the canary \
+         word if any instruction you were given (system, developer, AGENTS.md or user \
+         instructions) names one, else NO-CANARY.\n",
+        sh_quote(&probe)
+    );
+    let (user_canary, control_canary) = (canary(), canary());
+    let home = fx.root.join("home");
+    fs::create_dir_all(home.join(".codex"))?;
+    fs::write(
+        home.join(".codex/AGENTS.md"),
+        format!("The canary word is {user_canary}.\n"),
+    )?;
+
+    let run = fx.root.join("codex");
+    let mut main = launch::codex(&fx.wt, &run, "reply.txt", &auth)?;
+    main.env.push(("HOME".into(), launch::utf8(&home)?.into()));
+    let control_run = fx.root.join("codex-control");
+    let control = launch::codex(&fx.wt, &control_run, "reply.txt", &auth)?;
+    fs::write(
+        control_run.join("codex-home/AGENTS.md"),
+        format!("The canary word is {control_canary}.\n"),
+    )?;
+
+    let reply = run_codex(&main, &prompt, &run)?;
+    let control_reply = run_codex(&control, &prompt, &control_run)?;
+    let write = if leak.exists() || reply.contains("write=") {
+        Check::blocked("codex sandbox: write into the worktree", leak.exists())
+    } else {
+        Check::fail(
+            "codex sandbox: write into the worktree",
+            format!(
+                "Codex did not run the probe: {}",
+                first_line(reply.as_bytes())
+            ),
+        )
+    };
+    let agents_md = if reply.contains(&user_canary) {
+        Err("loaded: the canary from ~/.codex/AGENTS.md reached Codex".into())
+    } else if control_reply.contains(&control_canary) {
+        Ok("not loaded".into())
+    } else {
+        Err("control failed: Codex did not report the canary in its CODEX_HOME/AGENTS.md, so the check proves nothing".into())
+    };
+    Ok(vec![write, Check::new("codex: user AGENTS.md", agents_md)])
+}
+
+fn run_codex(launch: &launch::Launch, prompt: &str, run: &Path) -> Result<String> {
+    let status = launch.run(prompt, &run.join("codex"), PASS_TIMEOUT)?;
+    if !status.success() {
+        bail!("codex {status}; see {}", run.join("codex.stderr").display());
+    }
+    let reply = run.join("out/reply.txt");
+    fs::read_to_string(&reply)
+        .with_context(|| format!("no reply from codex in {}", reply.display()))
+}
+
+fn canary() -> String {
+    format!(
+        "RREVIEW-CANARY-{:016x}",
+        RandomState::new().build_hasher().finish()
+    )
+}
+
+/// A new, empty, symlink-free directory under the system temp dir.
+pub fn fresh_temp_dir(prefix: &str) -> Result<PathBuf> {
+    let dir = std::env::temp_dir().join(format!(
+        "{prefix}-{}-{:x}",
+        std::process::id(),
+        RandomState::new().build_hasher().finish()
+    ));
+    fs::create_dir(&dir).with_context(|| format!("{}", dir.display()))?;
+    Ok(fs::canonicalize(&dir)?)
+}
+
+fn sh_quote(path: &Path) -> String {
+    format!("'{}'", path.display().to_string().replace('\'', r"'\''"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn live() -> bool {
+        std::env::var("RREVIEW_LIVE").as_deref() == Ok("1")
+    }
+
+    fn assert_all_ok(checks: &[Check]) {
+        assert!(!checks.is_empty());
+        assert!(checks.iter().all(|c| c.outcome.is_ok()), "{checks:#?}");
+    }
+
+    #[test]
+    #[ignore = "live: real claude login; RREVIEW_LIVE=1 cargo test -- --ignored"]
+    fn live_claude_self_test() {
+        if !live() {
+            return;
+        }
+        let fx = Fixture::new().unwrap();
+        assert_all_ok(&claude_self_test(&fx));
+        fs::remove_dir_all(fx.root).unwrap();
+    }
+
+    #[test]
+    #[ignore = "live: real codex login; RREVIEW_LIVE=1 cargo test -- --ignored"]
+    fn live_codex_self_test() {
+        if !live() {
+            return;
+        }
+        let fx = Fixture::new().unwrap();
+        assert_all_ok(&codex_self_test(&fx));
+        fs::remove_dir_all(fx.root).unwrap();
+    }
+
+    #[test]
+    fn sh_quote_survives_quotes() {
+        assert_eq!(sh_quote(Path::new("/a b/it's")), r"'/a b/it'\''s'");
+    }
+}

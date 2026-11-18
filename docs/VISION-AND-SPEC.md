@@ -89,7 +89,7 @@ rreview show <runroot|pr>        # print result of the latest run
 rreview doctor                   # claude/codex/gh/orca versions, logins, sandbox self-test
 ```
 
-`rreview doctor` runs the isolation self-test on a throwaway repo: a write and a commit must fail, `git diff` must work, a planted project hook must not fire, Codex must report no user AGENTS.md. This turns section 3's *verified* facts into a check that runs on every machine and every CLI upgrade.
+`rreview doctor` runs the isolation self-test on a throwaway repo and a detached worktree of it, through the same launch builders a review uses: a write into the worktree, a commit and a branch must fail, `git diff` must work, a planted project hook must not fire, Codex must not load the user's AGENTS.md. Checks read the effects on disk, not the reviewer's reply. The AGENTS.md probe gives Codex a stand-in `HOME` whose `.codex/AGENTS.md` names a random canary that must not appear in the reply, plus a control run whose clean `CODEX_HOME` holds a canary that must appear; the user's own `~/.codex` and `~/.claude` are never touched. It prints one line per check (`ok`, `FAIL`, or `warn` for the optional `orca`) and exits 0 only when every required check passes, else 1. This turns section 3's *verified* facts into a check that runs on every machine and every CLI upgrade.
 
 ## 7. Orca plugin (variant 6), after the CLI
 

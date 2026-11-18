@@ -1,0 +1,17 @@
+#!/bin/sh
+# Fake `codex` for doctor tests. FAKE_CODEX: ok (default); leak (runs the probe unsandboxed);
+# user-agents (reads $HOME/.codex/AGENTS.md like a Codex that ignores CODEX_HOME).
+# Argv and CODEX_HOME are appended to $FAKE_LOG.
+echo "codex $* CODEX_HOME=$CODEX_HOME" >> "${FAKE_LOG:-/dev/null}"
+case "$1" in
+--version) echo "codex-cli 9.9.9"; exit 0 ;;
+login) echo "Logged in using ChatGPT"; exit 0 ;;
+esac
+out=; prev=
+for a; do [ "$prev" = -o ] && out=$a; prev=$a; done
+probe=$(grep -o "/[^']*probe\.sh")
+if [ "$FAKE_CODEX" = leak ]; then result=$(sh "$probe"); else result=write=1; fi
+agents=$CODEX_HOME/AGENTS.md
+[ "$FAKE_CODEX" = user-agents ] && agents=$HOME/.codex/AGENTS.md
+canary=$(grep -o 'RREVIEW-CANARY-[0-9a-f]*' "$agents" 2> /dev/null || echo NO-CANARY)
+printf '%s\n%s\n' "$result" "$canary" > "$out"
