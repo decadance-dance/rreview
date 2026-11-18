@@ -16,11 +16,16 @@
 # $FAKE_MODE_<role>, else FAKE_REVIEW: ok, hang, hang-once (hangs unless resumed with
 # `resume fake-thread`), crash (exit 1), as for claude; no-reply exits 0 without writing the -o
 # file unless resumed.
+# The scenario comes from fake.env next to this file (rreview drops FAKE_* from a reviewer's
+# environment). The environment a launch (not a --version probe) got is appended to
+# $FAKE_LOG.env under "== codex".
+[ -f "${0%/*}/fake.env" ] && . "${0%/*}/fake.env"
 echo "codex $* CODEX_HOME=$CODEX_HOME" >> "${FAKE_LOG:-/dev/null}"
 case "$1" in
 --version) echo "codex-cli 9.9.9"; exit 0 ;;
 login) echo "Logged in using ChatGPT"; exit 0 ;;
 esac
+[ -n "$FAKE_LOG" ] && { echo "== codex"; env; } >> "$FAKE_LOG.env"
 out=; prev=
 for a; do [ "$prev" = -o ] && out=$a; prev=$a; done
 if [ -n "$FAKE_REVIEW" ]; then

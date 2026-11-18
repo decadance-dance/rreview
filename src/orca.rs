@@ -564,9 +564,14 @@ fn printable(text: &str) -> String {
 }
 
 /// Orca types `--command` into the terminal's login shell, so the launch becomes one shell line:
-/// `NAME='value' ... exec 'program' 'arg' ...`, every value and word single-quoted. `exec` leaves
-/// no shell behind the agent to receive later input. Not `exec env ...`: Orca then does not
-/// recognize the agent for `send` and types the prompt raw (*verified*, Orca 1.4.262).
+/// `<unset> NAME='value' ... exec 'program' 'arg' ...`, every value and word single-quoted.
+/// `exec` leaves no shell behind the agent to receive later input. Not `exec env ...`: Orca then
+/// does not recognize the agent for `send` and types the prompt raw (*verified*, Orca 1.4.262).
+/// The terminal's environment is Orca's and the login shell's, not rreview's, so `<unset>`
+/// drops there every exported variable the launch does not inherit (spec §3); the values never
+/// go on the line, which the shell may keep in its history.
+// limit: a POSIX-family login shell (sh, bash, zsh); a variable the shell cannot unset (a bash
+// exported function, a readonly one) still reaches the agent.
 fn shell_line(launch: &Launch) -> Result<String> {
     let quote = |w: &str| -> Result<String> {
         if w.chars().any(char::is_control) {
@@ -574,7 +579,18 @@ fn shell_line(launch: &Launch) -> Result<String> {
         }
         Ok(format!("'{}'", w.replace('\'', r"'\''")))
     };
-    let mut line = String::new();
+    for p in &launch.inherit {
+        let name = p.strip_suffix('*').unwrap_or(p);
+        if name.is_empty() || !name.chars().all(|c| c == '_' || c.is_ascii_alphanumeric()) {
+            bail!("cannot put the pattern {p:?} on a shell line");
+        }
+    }
+    // `command` skips an alias the user's shell may define for `env` or `sed`.
+    let mut line = format!(
+        "for v in $(command env | command sed -n 's/^\\([A-Za-z_][A-Za-z0-9_]*\\)=.*/\\1/p'); \
+         do case $v in {}) ;; *) unset $v ;; esac; done; ",
+        launch.inherit.join("|")
+    );
     for (k, v) in &launch.env {
         if k.is_empty() || !k.chars().all(|c| c == '_' || c.is_ascii_alphanumeric()) {
             bail!("cannot put the variable {k:?} on a shell line");
@@ -675,18 +691,86 @@ mod tests {
         let launch = Launch {
             program: "codex".into(),
             args: vec!["-C".into(), "/a b/it's".into()],
+            inherit: vec!["PATH", "LC_*"],
             env: vec![("CODEX_HOME".into(), "/h $x".into())],
             cwd: PathBuf::from("/"),
         };
-        assert_eq!(
-            shell_line(&launch).unwrap(),
-            r"CODEX_HOME='/h $x' exec 'codex' '-C' '/a b/it'\''s'"
+        assert!(
+            shell_line(&launch)
+                .unwrap()
+                .ends_with(r"CODEX_HOME='/h $x' exec 'codex' '-C' '/a b/it'\''s'")
         );
         let bad = Launch {
             args: vec!["a\nrm -rf x".into()],
             ..launch
         };
         assert!(shell_line(&bad).is_err());
+        let bad = Launch {
+            inherit: vec!["X) ;; *) rm -rf x"],
+            args: vec![],
+            ..bad
+        };
+        assert!(shell_line(&bad).is_err());
+    }
+
+    /// The terminal's shell has Orca's environment; the agent gets only what it inherits and
+    /// the launch's own env, in every shell family Orca may start.
+    #[test]
+    fn shell_line_drops_what_the_agent_does_not_inherit() {
+        let launch = Launch {
+            program: "env".into(),
+            args: vec![],
+            inherit: vec!["PATH", "HOME", "LC_*"],
+            env: vec![("CODEX_HOME".into(), "/run/codex-home".into())],
+            cwd: PathBuf::from("/"),
+        };
+        let line = shell_line(&launch).unwrap();
+        let mut ran = 0;
+        for shell in ["/bin/sh", "/bin/bash", "/bin/zsh"] {
+            if !Path::new(shell).exists() {
+                continue;
+            }
+            let out = Command::new(shell)
+                .args(["-c", &line])
+                .env_clear()
+                .env("PATH", "/usr/bin:/bin")
+                .env("HOME", "/home/u")
+                .env("LC_CTYPE", "C")
+                .env("GH_TOKEN", "canary")
+                .env("MULTI", "a\nGH_TOKEN=b\nHOME=c")
+                .env("CODEX_HOME", "/orca/account")
+                .output()
+                .unwrap();
+            let env = String::from_utf8(out.stdout).unwrap();
+            let names: Vec<_> = env.lines().filter_map(|l| l.split_once('=')).collect();
+            for want in [
+                ("PATH", "/usr/bin:/bin"),
+                ("HOME", "/home/u"),
+                ("LC_CTYPE", "C"),
+                ("CODEX_HOME", "/run/codex-home"),
+            ] {
+                assert!(names.contains(&want), "{shell}: no {want:?} in {env}");
+            }
+            for (k, _) in &names {
+                // The shell itself may add these on exec.
+                assert!(
+                    [
+                        "PATH",
+                        "HOME",
+                        "LC_CTYPE",
+                        "CODEX_HOME",
+                        "SHLVL",
+                        "_",
+                        "PWD",
+                        "OLDPWD"
+                    ]
+                    .contains(k),
+                    "{shell} passed {k}: {env}"
+                );
+            }
+            ran += 1;
+        }
+        assert!(ran > 0);
     }
 
     #[test]

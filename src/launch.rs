@@ -11,16 +11,60 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result, bail};
 use serde_json::json;
 
-/// One reviewer process: program, argument vector, extra env and working directory.
+/// What every reviewer inherits from the environment it starts in (spec §3); every other
+/// variable, such as a `GH_TOKEN` meant for rreview's own `gh`, is dropped. A trailing `*` makes
+/// a name a prefix.
+const INHERIT: &[&str] = &[
+    // Run at all, find the user's login (the macOS keychain), give the sandboxed Bash a shell.
+    "PATH",
+    "HOME",
+    "USER",
+    "LOGNAME",
+    "SHELL",
+    "TMPDIR",
+    // Locale and the terminal the TUI draws in (the Orca runner).
+    "LANG",
+    "LC_*",
+    "TZ",
+    "TERM",
+    "COLORTERM",
+    // Reach the API from a network behind a proxy or a private CA.
+    "HTTPS_PROXY",
+    "https_proxy",
+    "NO_PROXY",
+    "no_proxy",
+    "NODE_EXTRA_CA_CERTS",
+    "SSL_CERT_FILE",
+];
+
+/// Claude's own login and config: its config dir (an Orca account home, say), or a key or
+/// token given by env. Codex needs none: its login is the `auth.json` in its run-scoped home.
+const CLAUDE_INHERIT: &[&str] = &[
+    "CLAUDE_CONFIG_DIR",
+    "ANTHROPIC_API_KEY",
+    "CLAUDE_CODE_OAUTH_TOKEN",
+];
+
+/// One reviewer process: program, argument vector, the variables it inherits (see [`INHERIT`]),
+/// extra env and working directory.
 #[derive(Debug)]
 pub struct Launch {
     pub program: String,
     pub args: Vec<String>,
+    pub inherit: Vec<&'static str>,
     pub env: Vec<(String, String)>,
     pub cwd: PathBuf,
 }
 
 impl Launch {
+    /// Whether the reviewer inherits `name` from the environment it starts in.
+    pub fn inherits(&self, name: &str) -> bool {
+        self.inherit.iter().any(|p| match p.strip_suffix('*') {
+            Some(prefix) => name.starts_with(prefix),
+            None => name == *p,
+        })
+    }
+
     /// Runs with `prompt` on stdin. Stdout and stderr go to `<log>.stdout` and `<log>.stderr`.
     /// The child leads its own process group, so a timeout kills everything it started.
     // limit: in its own group the child misses the terminal's Ctrl-C; an interrupted rreview
@@ -30,6 +74,8 @@ impl Launch {
         let stderr = log.with_extension("stderr");
         let mut child = Command::new(&self.program)
             .args(&self.args)
+            .env_clear()
+            .envs(std::env::vars_os().filter(|(k, _)| k.to_str().is_some_and(|k| self.inherits(k))))
             .envs(self.env.iter().map(|(k, v)| (k, v)))
             .current_dir(&self.cwd)
             .stdin(Stdio::piped())
@@ -101,6 +147,7 @@ pub fn claude(worktree: &Path, git_common_dir: &Path, runroot: &Path) -> Result<
         ]
         .map(String::from)
         .into(),
+        inherit: [INHERIT, CLAUDE_INHERIT].concat(),
         env: vec![],
         cwd,
     })
@@ -127,6 +174,7 @@ pub fn claude_tui(worktree: &Path, git_common_dir: &Path, runroot: &Path) -> Res
         ]
         .map(String::from)
         .into(),
+        inherit: [INHERIT, CLAUDE_INHERIT].concat(),
         env: vec![],
         cwd,
     })
@@ -192,6 +240,7 @@ pub fn codex(worktree: &Path, runroot: &Path, out_name: &str, user_auth: &Path) 
         ]
         .map(String::from)
         .into(),
+        inherit: INHERIT.into(),
         env,
         cwd: worktree,
     })
@@ -223,6 +272,7 @@ pub fn codex_tui(worktree: &Path, runroot: &Path, user_auth: &Path) -> Result<La
         ]
         .map(String::from)
         .into(),
+        inherit: INHERIT.into(),
         env,
         cwd: worktree,
     })
@@ -409,6 +459,7 @@ mod tests {
                 "-c".into(),
                 format!("sleep 60 & echo $! > '{}'; sleep 60", pid_file.display()),
             ],
+            inherit: vec![],
             env: vec![],
             cwd: root.clone(),
         };

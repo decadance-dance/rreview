@@ -5,6 +5,9 @@ use std::path::PathBuf;
 use std::process::Command;
 use std::sync::atomic::{AtomicU32, Ordering};
 
+#[path = "fixtures/fake_env.rs"]
+mod fake_env;
+
 struct Run {
     root: String,
     passed: bool,
@@ -30,6 +33,9 @@ fn doctor(fakes: &[&str], scenario: &[(&str, &str)]) -> Run {
     for fake in fakes {
         std::os::unix::fs::symlink(fixtures.join(fake), bin.join(fake)).unwrap();
     }
+    let log = root.join("log").display().to_string();
+    let vars: Vec<_> = scenario.iter().map(|&(k, v)| (k, v.to_string())).collect();
+    fake_env::write(&bin, &[vec![("FAKE_LOG", log)], vars].concat());
     let out = Command::new(env!("CARGO_BIN_EXE_rreview"))
         .arg("doctor")
         .env("PATH", format!("{}:/usr/bin:/bin", bin.display()))

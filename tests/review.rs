@@ -9,6 +9,9 @@ use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
 
+#[path = "fixtures/fake_env.rs"]
+mod fake_env;
+
 /// An upstream repo `<root>/acme/widget` whose PR #7 head (`refs/pull/7/head`, on no branch)
 /// adds `src/lib.rs` on top of `base`, while `main` moved on; and a clone of it that has
 /// `main` only, so rreview must fetch the PR head.
@@ -150,6 +153,11 @@ impl Fixture {
 
     fn rreview(&self, pr: &Value, args: &[&str], scenario: &[(&str, String)]) -> Run {
         let (bin, codex_home) = self.install_fakes();
+        let fakes = [
+            ("FAKE_LOG", self.root.join("log").display().to_string()),
+            ("FAKE_GH_PR", pr.to_string()),
+        ];
+        fake_env::write(&bin, &[&fakes[..], scenario].concat());
         let out = Command::new(env!("CARGO_BIN_EXE_rreview"))
             .args(args)
             .current_dir(&self.clone)
@@ -329,6 +337,68 @@ fn claude_pass_end_to_end() {
     assert!(run.log.contains("gh pr view 7 --json number,"), "{run:?}");
     assert!(!run.log.contains("--repo"), "{run:?}");
     fx.assert_worktree_removed();
+}
+
+/// A token rreview holds for `gh` (and anything else not on the launch allowlist) never reaches
+/// a reviewer; what the CLIs need does, Claude's own config only to Claude (spec §3).
+#[test]
+fn reviewers_inherit_only_what_the_cli_needs() {
+    let fx = fixture();
+    let env = envelope("src/lib.rs");
+    let secrets = [
+        ("GH_TOKEN", "gh-canary".to_string()),
+        ("OTHER_SECRET", "other-canary".into()),
+        ("CLAUDE_CONFIG_DIR", "/claude-config".into()),
+        ("LC_CTYPE", "C".into()),
+    ];
+    let claude = fx.run(
+        &[],
+        &[&claude_says(&format!("```json\n{env}\n```"))[..], &secrets].concat(),
+    );
+    assert_eq!(claude.code, Some(0), "{claude:?}");
+    let codex = fx.run(
+        &["--role-agent", "reliability=codex"],
+        &[
+            &[
+                ("FAKE_REVIEW", "ok".into()),
+                ("FAKE_REPLY", env.to_string()),
+            ][..],
+            &secrets,
+        ]
+        .concat(),
+    );
+    assert_eq!(codex.code, Some(0), "{codex:?}");
+
+    let seen = fs::read_to_string(fx.root.join("log.env")).unwrap();
+    let section = |agent: &str| -> Vec<String> {
+        seen.split(&format!("== {agent}\n"))
+            .skip(1)
+            .flat_map(|s| s.split("\n== ").next().unwrap().lines())
+            .map(String::from)
+            .collect()
+    };
+    let (claude, codex) = (section("claude"), section("codex"));
+    assert!(!claude.is_empty() && !codex.is_empty(), "{seen}");
+    for line in claude.iter().chain(&codex) {
+        assert!(!line.contains("canary"), "a reviewer saw {line}");
+    }
+    let has = |env: &[String], line: &str| env.iter().any(|l| l == line);
+    let home = format!("HOME={}", fx.root.display());
+    for env in [&claude, &codex] {
+        assert!(has(env, &home) && has(env, "LC_CTYPE=C"), "{env:?}");
+    }
+    assert!(
+        has(&claude, "CLAUDE_CONFIG_DIR=/claude-config"),
+        "{claude:?}"
+    );
+    assert!(
+        !codex.iter().any(|l| l.starts_with("CLAUDE_CONFIG_DIR=")),
+        "{codex:?}"
+    );
+    assert!(
+        codex.iter().any(|l| l.starts_with("CODEX_HOME=")),
+        "{codex:?}"
+    );
 }
 
 #[test]
@@ -1708,12 +1778,24 @@ fn orca_pass_end_to_end() {
                 out.display()
             )
         };
-        assert!(
-            run.log.contains(&format!(
-                "orca terminal create --worktree path:{} --title rreview:reliability --command {command} --json\n",
-                wt.display()
-            )),
-            "{run:?}"
+        // The terminal's own environment is cleared down to what the agent inherits first.
+        let create = run
+            .log
+            .lines()
+            .find_map(|l| {
+                l.strip_prefix(&format!(
+                    "orca terminal create --worktree path:{} --title rreview:reliability --command for v in $(command env ",
+                    wt.display()
+                ))
+            })
+            .expect("terminal create");
+        assert!(create.ends_with(&format!("; {command} --json")), "{run:?}");
+        let keep = create.split("case $v in ").nth(1).unwrap();
+        assert!(keep.starts_with("PATH|HOME|"), "{keep}");
+        assert_eq!(
+            keep.contains("|CLAUDE_CONFIG_DIR|"),
+            agent == "claude",
+            "{keep}"
         );
         // Each wait gets what is left of the pass's 900 s.
         let ms: Vec<u64> = run
