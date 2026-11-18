@@ -140,7 +140,7 @@ impl Fixture {
             fs::create_dir_all(&codex_home).unwrap();
             fs::write(codex_home.join("auth.json"), "{}").unwrap();
             let fixtures = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/bin");
-            for fake in ["gh", "claude", "codex"] {
+            for fake in ["gh", "claude", "codex", "orca"] {
                 std::os::unix::fs::symlink(fixtures.join(fake), bin.join(fake)).unwrap();
             }
         }
@@ -1586,4 +1586,551 @@ fn role_models_and_efforts_reach_the_cli() {
         );
         assert!(!run.log.contains("gh pr view"), "{run:?}");
     }
+}
+
+/// `--runner orca` from an Orca terminal, with the fake `orca` in scenario `orca`.
+fn orca_run(fx: &Fixture, args: &[&str], orca: &str, reply: &Value) -> Run {
+    orca_run_with(fx, args, orca, &[("FAKE_REPLY", reply.to_string())])
+}
+
+fn orca_run_with(fx: &Fixture, args: &[&str], orca: &str, extra: &[(&str, String)]) -> Run {
+    let args = [&["--runner", "orca"], args].concat();
+    let mut scenario = vec![
+        ("ORCA_TERMINAL_HANDLE", "term_caller".to_string()),
+        ("FAKE_ORCA", orca.into()),
+    ];
+    scenario.extend(extra.iter().cloned());
+    fx.run(&args, &scenario)
+}
+
+/// The `orca` calls of a run, as `<noun> <verb>`.
+fn orca_calls(run: &Run) -> Vec<String> {
+    run.log
+        .lines()
+        .filter_map(|l| l.strip_prefix("orca "))
+        .map(|l| l.split(' ').take(2).collect::<Vec<_>>().join(" "))
+        .collect()
+}
+
+impl Fixture {
+    fn orca_name(&self) -> String {
+        format!("rreview-7-{}", &self.head[..12])
+    }
+
+    /// The Orca-made worktree and its branch are gone.
+    fn assert_orca_worktree_removed(&self) {
+        assert!(!self.root.join("orca-wt").join(self.orca_name()).exists());
+        let list = git(&self.clone, &["worktree", "list", "--porcelain"]);
+        assert_eq!(list.matches("worktree ").count(), 1, "{list}");
+        assert_eq!(git(&self.clone, &["branch", "--list", "rreview/*"]), "");
+    }
+}
+
+#[test]
+fn orca_pass_end_to_end() {
+    let env = envelope("src/lib.rs");
+    for agent in ["claude", "codex"] {
+        let fx = fixture();
+        let run = orca_run(
+            &fx,
+            &["--role-agent", &format!("reliability={agent}")],
+            "ok",
+            &env,
+        );
+        assert_eq!(run.code, Some(0), "{run:?}");
+        assert_eq!(fx.out(), Some(env.clone()));
+        assert_eq!(fx.statuses(), ["started", "completed"]);
+        let meta: Value =
+            serde_json::from_str(&fs::read_to_string(fx.runroot().join("meta.json")).unwrap())
+                .unwrap();
+        assert_eq!(meta["runner"], "orca");
+        assert_eq!(
+            orca_calls(&run),
+            [
+                "worktree create",
+                "terminal create",
+                "terminal wait",
+                "terminal send",
+                "terminal wait",
+                "terminal close",
+                "worktree rm"
+            ],
+            "{run:?}"
+        );
+        assert!(!run.log.contains("orchestration"), "{run:?}");
+
+        let (runroot, wt) = (fx.runroot(), fx.root.join("orca-wt").join(fx.orca_name()));
+        let name = fx.orca_name();
+        assert!(
+            run.log.contains(&format!(
+                "orca worktree create --repo path:{} --name {name} --branch rreview/{name} --base-branch {} --setup skip --json\n",
+                fx.clone.display(),
+                fx.head
+            )),
+            "{run:?}"
+        );
+        let out = runroot.join("scratch/reliability/out");
+        let command = if agent == "claude" {
+            format!(
+                "exec env 'claude' '--safe-mode' '--settings' '{}' '--permission-mode' 'acceptEdits' '--add-dir' '{}'",
+                runroot
+                    .join("scratch/reliability/claude-settings.json")
+                    .display(),
+                out.display()
+            )
+        } else {
+            format!(
+                "exec env 'CODEX_HOME={}' 'codex' '-C' '{}' '-s' 'workspace-write' '-a' 'never' '-c' 'sandbox_workspace_write.exclude_slash_tmp=true' '-c' 'sandbox_workspace_write.exclude_tmpdir_env_var=true' '-c' 'check_for_update_on_startup=false'",
+                runroot.join("scratch/reliability/codex-home").display(),
+                out.display()
+            )
+        };
+        assert!(
+            run.log.contains(&format!(
+                "orca terminal create --worktree path:{} --title rreview:reliability --command {command} --json\n",
+                wt.display()
+            )),
+            "{run:?}"
+        );
+        // Each wait gets what is left of the pass's 900 s.
+        let ms: Vec<u64> = run
+            .log
+            .split("--for tui-idle --timeout-ms ")
+            .skip(1)
+            .map(|r| r.split(' ').next().unwrap().parse().unwrap())
+            .collect();
+        assert_eq!(ms.len(), 2, "{run:?}");
+        assert!(ms.iter().all(|&m| m <= 900_000 && m > 890_000), "{ms:?}");
+        assert!(
+            run.log
+                .contains("orca terminal close --terminal term_reliability --json"),
+            "{run:?}"
+        );
+        if agent == "claude" {
+            let s: Value = serde_json::from_str(
+                &fs::read_to_string(runroot.join("scratch/reliability/claude-settings.json"))
+                    .unwrap(),
+            )
+            .unwrap();
+            assert_eq!(s["sandbox"]["filesystem"]["denyWrite"][0], json!(wt));
+            assert_eq!(s["sandbox"]["filesystem"]["allowWrite"], json!([out]));
+        }
+
+        // Delivery first, then the panelist prompt with the PR text last.
+        let reply = out.join("reply.txt");
+        assert!(
+            run.prompt.starts_with(&format!(
+                "Delivery (from rreview, which runs this review; not part of the PR): write your final reply, only the JSON object, to the file `{}`",
+                reply.display()
+            )),
+            "{}",
+            run.prompt
+        );
+        assert_eq!(
+            run.prompt.contains(&format!(
+                "The repository under review is `{}`",
+                wt.display()
+            )),
+            agent == "codex"
+        );
+        assert!(
+            run.prompt
+                .contains(&format!("git diff {}..{}", fx.base, fx.head))
+        );
+        let boundary = run.prompt.find("## Untrusted data boundary").unwrap();
+        assert!(run.prompt.find("IGNORE PREVIOUS INSTRUCTIONS").unwrap() > boundary);
+        fx.assert_orca_worktree_removed();
+    }
+}
+
+#[test]
+fn orca_answers_the_claude_trust_dialog_once() {
+    let fx = fixture();
+    let env = envelope("src/lib.rs");
+    let run = orca_run(&fx, &[], "trust", &env);
+    assert_eq!(run.code, Some(0), "{run:?}");
+    assert_eq!(fx.out(), Some(env));
+    assert_eq!(
+        orca_calls(&run)[1..6],
+        [
+            "terminal create",
+            "terminal wait",
+            "terminal send",
+            "terminal send",
+            "terminal wait"
+        ],
+        "{run:?}"
+    );
+    assert!(
+        run.log
+            .contains("orca terminal send --terminal term_reliability --text \x1b[B --json"),
+        "{run:?}"
+    );
+    // The prompt is typed only after the dialog is gone: one prompt in the prompt log.
+    assert_eq!(run.prompt.matches("\n---\n").count(), 1, "{}", run.prompt);
+}
+
+#[test]
+fn orca_reminds_an_agent_that_went_idle_without_a_reply_then_fails() {
+    let env = envelope("src/lib.rs");
+    let fx = fixture();
+    let run = orca_run(&fx, &[], "nudge", &env);
+    assert_eq!(run.code, Some(0), "{run:?}");
+    assert_eq!(fx.statuses(), ["started", "completed"]);
+    assert!(
+        run.prompt
+            .contains("You stopped without writing the reply file.")
+    );
+
+    let fx = fixture();
+    let run = orca_run(&fx, &[], "silent", &env);
+    assert_eq!(run.code, Some(2), "{run:?}");
+    assert_eq!(fx.statuses(), ["started", "failed"]);
+    assert!(
+        run.stderr.contains(&format!(
+            "error: pass reliability (claude): the agent went idle twice without writing {}",
+            fx.runroot()
+                .join("scratch/reliability/out/reply.txt")
+                .display()
+        )),
+        "{run:?}"
+    );
+    assert_eq!(run.prompt.matches("\n---\n").count(), 2, "{}", run.prompt);
+    assert_eq!(run.log.matches("orca terminal close").count(), 1, "{run:?}");
+    assert_eq!(fx.out(), None);
+    fx.assert_orca_worktree_removed();
+}
+
+#[test]
+fn orca_types_the_wrap_up_at_the_timeout_and_closes_the_terminal_after_it() {
+    let env = envelope("src/lib.rs");
+    let fx = fixture();
+    let run = orca_run(&fx, &["--timeout", "1"], "hang-once", &env);
+    assert_eq!(run.code, Some(0), "{run:?}");
+    assert_eq!(fx.statuses(), ["started", "wrapup", "completed"]);
+    assert_eq!(fx.out(), Some(env.clone()));
+    assert!(run.prompt.contains("Time is up."), "{}", run.prompt);
+    assert_eq!(run.log.matches("orca terminal close").count(), 1, "{run:?}");
+
+    let fx = fixture();
+    let run = orca_run(&fx, &["--timeout", "1"], "hang", &env);
+    assert_eq!(run.code, Some(2), "{run:?}");
+    assert_eq!(fx.statuses(), ["started", "wrapup", "failed"]);
+    assert!(
+        run.stderr.contains(
+            "pass reliability timed out after 1s; wrap-up: the wrap-up timed out after 1s"
+        ),
+        "{run:?}"
+    );
+    assert!(run.prompt.contains("Time is up."), "{}", run.prompt);
+    assert_eq!(run.log.matches("orca terminal close").count(), 1, "{run:?}");
+    assert_eq!(
+        orca_calls(&run).last().map(String::as_str),
+        Some("worktree rm"),
+        "{run:?}"
+    );
+    assert_eq!(fx.out(), None);
+    fx.assert_orca_worktree_removed();
+}
+
+#[test]
+fn orca_never_types_into_a_terminal_whose_agent_did_not_start() {
+    let fx = fixture();
+    let run = orca_run(
+        &fx,
+        &["--timeout", "1"],
+        "no-agent",
+        &envelope("src/lib.rs"),
+    );
+    assert_eq!(run.code, Some(2), "{run:?}");
+    assert_eq!(fx.statuses(), ["started", "wrapup", "failed"]);
+    assert!(
+        run.stderr.contains("the agent never became ready"),
+        "{run:?}"
+    );
+    assert!(!run.log.contains("orca terminal send"), "{run:?}");
+    assert_eq!(run.log.matches("orca terminal close").count(), 1, "{run:?}");
+    fx.assert_orca_worktree_removed();
+}
+
+#[test]
+fn orca_failures_before_the_agent_are_reported_and_cleaned_up() {
+    let env = envelope("src/lib.rs");
+    let fx = fixture();
+    let run = orca_run(&fx, &[], "no-ok", &env);
+    assert_eq!(run.code, Some(2), "{run:?}");
+    assert!(
+        run.stderr
+            .contains("orca terminal create: boom: no terminal"),
+        "{run:?}"
+    );
+    assert_eq!(fx.statuses(), ["started", "failed"]);
+    fx.assert_orca_worktree_removed();
+
+    for (scenario, error) in [
+        ("refused", "orca terminal send: the prompt was not accepted"),
+        ("blocked", "the agent stopped: agent-permission"),
+    ] {
+        let fx = fixture();
+        let run = orca_run(&fx, &[], scenario, &env);
+        assert_eq!(run.code, Some(2), "{run:?}");
+        assert!(run.stderr.contains(error), "{run:?}");
+        assert_eq!(fx.statuses(), ["started", "failed"]);
+        assert_eq!(run.log.matches("orca terminal close").count(), 1, "{run:?}");
+        fx.assert_orca_worktree_removed();
+    }
+
+    let fx = fixture();
+    let run = orca_run(&fx, &[], "wrong-head", &env);
+    assert_eq!(run.code, Some(2), "{run:?}");
+    assert!(
+        run.stderr
+            .contains(&format!("is at {}, not {}", fx.base, fx.head)),
+        "{run:?}"
+    );
+    assert!(!run.log.contains("orca terminal"), "{run:?}");
+    fx.assert_orca_worktree_removed();
+}
+
+#[test]
+fn orca_runner_needs_an_orca_terminal() {
+    let fx = fixture();
+    let run = fx.run(
+        &["--runner", "orca"],
+        &[("ORCA_TERMINAL_HANDLE", String::new())],
+    );
+    assert_eq!(run.code, Some(2), "{run:?}");
+    assert!(
+        run.stderr.contains(
+            "--runner orca must run from an Orca terminal (ORCA_TERMINAL_HANDLE is not set)"
+        ),
+        "{run:?}"
+    );
+    assert_eq!(run.log, "", "nothing may run before the check");
+}
+
+impl Fixture {
+    /// The fake's record of the role's terminal ends in `closed`.
+    fn assert_terminal_closed(&self, role: &str) {
+        let state = fs::read_to_string(self.root.join(format!("log.orca-{role}"))).unwrap();
+        assert_eq!(state.lines().last(), Some("closed"), "{role}: {state}");
+    }
+}
+
+#[test]
+fn orca_refuses_a_codex_run_dir_inside_a_git_checkout() {
+    let env = envelope("src/lib.rs");
+    let state = |fx: &Fixture| {
+        (
+            "XDG_STATE_HOME",
+            fx.clone.join("target/state").display().to_string(),
+        )
+    };
+    let fx = fixture();
+    let run = fx.run(
+        &["--runner", "orca", "--role-agent", "reliability=codex"],
+        &[
+            ("ORCA_TERMINAL_HANDLE", "term_caller".into()),
+            ("FAKE_REPLY", env.to_string()),
+            state(&fx),
+        ],
+    );
+    assert_eq!(run.code, Some(2), "{run:?}");
+    assert!(
+        run.stderr.contains(&format!(
+            "is inside the git checkout {}, where the Codex TUI stops at its trust prompt; set XDG_STATE_HOME to a directory outside any checkout",
+            fx.clone.display()
+        )),
+        "{run:?}"
+    );
+    assert!(!run.log.contains("orca "), "{run:?}");
+
+    // Claude passes are not affected.
+    let fx = fixture();
+    let run = fx.run(
+        &["--runner", "orca"],
+        &[
+            ("ORCA_TERMINAL_HANDLE", "term_caller".into()),
+            ("FAKE_REPLY", env.to_string()),
+            state(&fx),
+        ],
+    );
+    assert_eq!(run.code, Some(0), "{run:?}");
+}
+
+#[test]
+fn orca_cleans_up_a_worktree_whose_create_reply_was_lost() {
+    let env = envelope("src/lib.rs");
+    let fx = fixture();
+    let run = orca_run(&fx, &[], "lost-reply", &env);
+    assert_eq!(run.code, Some(2), "{run:?}");
+    assert!(
+        run.stderr.contains("cannot create the review worktree"),
+        "{run:?}"
+    );
+    fx.assert_orca_worktree_removed();
+
+    // Orca reports a branch it was not asked for: ours is removed, the other one is kept.
+    let fx = fixture();
+    git(&fx.clone, &["branch", "victim"]);
+    let run = orca_run(&fx, &[], "foreign-branch", &env);
+    assert_eq!(run.code, Some(2), "{run:?}");
+    assert!(
+        run.stderr.contains("made branch \"refs/heads/victim\""),
+        "{run:?}"
+    );
+    git(&fx.clone, &["rev-parse", "--verify", "refs/heads/victim"]);
+    fx.assert_orca_worktree_removed();
+
+    // A branch of that name that exists before the run is not ours: refused, never deleted.
+    let fx = fixture();
+    let branch = format!("rreview/{}", fx.orca_name());
+    git(&fx.clone, &["branch", &branch]);
+    let run = orca_run(&fx, &[], "ok", &env);
+    assert_eq!(run.code, Some(2), "{run:?}");
+    assert!(
+        run.stderr.contains("is left from an earlier run"),
+        "{run:?}"
+    );
+    assert!(!run.log.contains("orca worktree create"), "{run:?}");
+    git(
+        &fx.clone,
+        &["rev-parse", "--verify", &format!("refs/heads/{branch}")],
+    );
+}
+
+#[test]
+fn orca_send_and_wait_share_the_pass_deadline() {
+    let env = envelope("src/lib.rs");
+    let fx = fixture();
+    let started = Instant::now();
+    let run = fx.run(
+        &["--runner", "orca", "--timeout", "1"],
+        &[
+            ("ORCA_TERMINAL_HANDLE", "term_caller".into()),
+            ("FAKE_REPLY", env.to_string()),
+            ("FAKE_ORCA_SEND_DELAY", "3".into()),
+        ],
+    );
+    let elapsed = started.elapsed();
+    assert_eq!(run.code, Some(2), "{run:?}");
+    assert_eq!(fx.statuses(), ["started", "wrapup", "failed"]);
+    // Two sends of 3 s each would take 6 s; the pass (1 s) and its wrap-up (1 s) cut them off.
+    assert!(elapsed < Duration::from_millis(4500), "{elapsed:?} {run:?}");
+    assert!(
+        run.stderr
+            .contains("wrap-up: the wrap-up timed out after 1s"),
+        "{run:?}"
+    );
+    fx.assert_terminal_closed("reliability");
+    fx.assert_orca_worktree_removed();
+}
+
+#[test]
+fn orca_retries_a_close_that_failed() {
+    let env = envelope("src/lib.rs");
+    for orca in ["silent", "ok"] {
+        let fx = fixture();
+        let run = fx.run(
+            &["--runner", "orca", "--keep-worktree"],
+            &[
+                ("ORCA_TERMINAL_HANDLE", "term_caller".into()),
+                ("FAKE_ORCA", orca.into()),
+                ("FAKE_REPLY", env.to_string()),
+                ("FAKE_ORCA_CLOSE", "fail-once".into()),
+            ],
+        );
+        assert_eq!(run.code, Some(if orca == "ok" { 0 } else { 2 }), "{run:?}");
+        assert_eq!(run.log.matches("orca terminal close").count(), 2, "{run:?}");
+        fx.assert_terminal_closed("reliability");
+    }
+}
+
+#[test]
+fn orca_types_the_retry_turn_into_the_same_terminal() {
+    let env = envelope("src/lib.rs");
+    let fx = fixture();
+    let run = orca_run_with(
+        &fx,
+        &[],
+        "ok",
+        &[
+            ("FAKE_OUT_reliability", "{\"panelist\": }".into()),
+            ("FAKE_RESUME_reliability", env.to_string()),
+        ],
+    );
+    assert_eq!(run.code, Some(0), "{run:?}");
+    assert_eq!(fx.statuses(), ["started", "retry", "completed"]);
+    assert_eq!(fx.out(), Some(env));
+    assert_eq!(
+        run.log.matches("orca terminal create").count(),
+        1,
+        "{run:?}"
+    );
+    let sent: Vec<_> = run
+        .prompt
+        .split("\n---\n")
+        .filter(|t| !t.is_empty())
+        .collect();
+    assert_eq!(sent.len(), 2, "{}", run.prompt);
+    assert!(sent[1].contains("Your reply was rejected."), "{}", sent[1]);
+    assert!(sent[1].starts_with("Delivery (from rreview"), "{}", sent[1]);
+    fx.assert_terminal_closed("reliability");
+}
+
+#[test]
+fn orca_runs_the_full_pipeline_in_one_terminal_per_pass() {
+    let fx = fixture();
+    let coordinator = coordinator_review(
+        vec![review_finding(
+            "Handle the error",
+            1,
+            0.9,
+            &["reliability-1"],
+        )],
+        vec![dropped("security-1"), dropped("intent_contracts-1")],
+    );
+    let run = fx.full(
+        &["--runner", "orca"],
+        &[
+            ("ORCA_TERMINAL_HANDLE", "term_caller".into()),
+            (
+                "FAKE_OUT_intent_contracts",
+                panel_envelope("Intent & Contracts", "Overflow").to_string(),
+            ),
+            (
+                "FAKE_OUT_reliability",
+                panel_envelope("Reliability & Operations", "Handle the error").to_string(),
+            ),
+            (
+                "FAKE_OUT_security",
+                panel_envelope("Security & Trust Boundaries", "Injection").to_string(),
+            ),
+            ("FAKE_OUT_coordinator", coordinator.to_string()),
+            (
+                "FAKE_OUT_judge",
+                json!([restored("intent_contracts-1", "Check the overflow", 3, 0.7)]).to_string(),
+            ),
+        ],
+    );
+    assert_eq!(run.code, Some(1), "{run:?}");
+    let result = fx.result().unwrap();
+    assert_eq!(result["degraded"], false, "{result}");
+    for role in [
+        "intent_contracts",
+        "reliability",
+        "security",
+        "coordinator",
+        "judge",
+    ] {
+        assert_eq!(fx.statuses_of(role), ["started", "completed"], "{role}");
+        assert!(
+            run.log
+                .contains(&format!("--title rreview:{role} --command ")),
+            "{role}: {run:?}"
+        );
+        fx.assert_terminal_closed(role);
+    }
+    assert!(!run.log.contains("orchestration"), "{run:?}");
+    fx.assert_orca_worktree_removed();
 }

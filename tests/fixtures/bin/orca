@@ -1,0 +1,104 @@
+#!/bin/sh
+# Fake `orca` for the orca runner. Every call's argv is appended to $FAKE_LOG; a sent prompt goes
+# to $FAKE_LOG.prompt and $FAKE_LOG.prompt.<role>. `worktree create` makes a real git worktree
+# under $TMPDIR/orca-wt and `worktree rm` removes it. A terminal titled `rreview:<role>` gets the
+# handle `term_<role>` and plays the agent: a prompt (`terminal send --enter`) names the reply
+# file, and the next `terminal wait` that finds the agent idle writes the reply there: the first
+# turn $FAKE_OUT_<role> (default $FAKE_REPLY), later turns $FAKE_RESUME_<role> (default the same).
+# A wait that times out first sleeps its --timeout-ms. Per-terminal state is in
+# $FAKE_LOG.orca-<role>: `open`, `sent`, `closed`, ...
+# FAKE_ORCA:
+#   ok (default)    replies to every turn
+#   trust           the agent waits on its trust dialog until it gets Enter, then as ok
+#   nudge           replies only from the second turn (the reminder) on
+#   silent          never writes a reply
+#   hang            every wait after the prompt times out
+#   hang-once       waits time out until the wrap-up message ("Time is up"), which it answers
+#   no-agent        no agent ever comes up: every wait times out
+#   wrong-head      the worktree is checked out at the parent of the requested commit
+#   lost-reply      `worktree create` makes the worktree and branch, then fails without JSON
+#   foreign-branch  `worktree create` reports the branch `victim` instead of its own
+#   no-ok           `terminal create` exits 0 with "ok": false
+#   refused         `terminal send` of a prompt answers "accepted": false
+#   blocked         after the prompt the agent waits on a permission dialog
+# FAKE_ORCA_SEND_DELAY: seconds every prompt send takes. FAKE_ORCA_CLOSE=fail-once: the first
+# `terminal close` fails with runtime_unavailable.
+{ printf 'orca'; for a; do printf ' %s' "$a"; done; echo; } >> "${FAKE_LOG:-/dev/null}"
+scenario=${FAKE_ORCA:-ok}
+arg() { # the value of option $1 in the remaining args
+  want=$1; shift; prev=
+  for a; do [ "$prev" = "$want" ] && { printf '%s' "$a"; return; }; prev=$a; done
+}
+ok() { printf '{"ok":true,"result":%s}\n' "$1"; exit 0; }
+blocked() { printf '{"ok":true,"result":{"wait":{"satisfied":false,"status":"running","blockedReason":"%s"}}}\n' "$1"; exit 1; }
+timeout() {
+  sleep "$(awk "BEGIN { print $(arg --timeout-ms "$@") / 1000 }")"
+  echo '{"ok":false,"error":{"code":"timeout","message":"timeout"}}'; exit 1
+}
+role=$(arg --terminal "$@"); role=${role#term_}
+state="$FAKE_LOG.orca-$role"
+sent() { grep -c '^sent' "$state" 2> /dev/null || echo 0; }
+case "$1 $2" in
+"worktree create")
+  name=$(arg --name "$@"); branch=$(arg --branch "$@"); base=$(arg --base-branch "$@")
+  [ "$scenario" = wrong-head ] && base="$base^"
+  path="$TMPDIR/orca-wt/$name"
+  git worktree add -q -b "$branch" "$path" "$base" >&2 || exit 1
+  [ "$scenario" = lost-reply ] && { echo "transport closed" >&2; exit 1; }
+  [ "$scenario" = foreign-branch ] && branch=victim
+  ok "{\"worktree\":{\"path\":\"$path\",\"branch\":\"refs/heads/$branch\"}}" ;;
+"worktree rm")
+  path=$(arg --worktree "$@"); git worktree remove --force "${path#path:}" >&2 || exit 1
+  ok '{"removed":true}' ;;
+"terminal create")
+  [ "$scenario" = no-ok ] && { echo '{"ok":false,"error":{"code":"boom","message":"no terminal"}}'; exit 0; }
+  role=$(arg --title "$@"); role=${role#rreview:}
+  echo open >> "$FAKE_LOG.orca-$role"
+  ok "{\"terminal\":{\"handle\":\"term_$role\"}}" ;;
+"terminal close")
+  if [ "$FAKE_ORCA_CLOSE" = fail-once ] && ! grep -q close-failed "$state" 2> /dev/null; then
+    echo close-failed >> "$state"
+    echo '{"ok":false,"error":{"code":"runtime_unavailable","message":"runtime_unavailable"}}'; exit 1
+  fi
+  echo closed >> "$state"
+  ok '{"close":{"ptyKilled":true}}' ;;
+"terminal send")
+  text=$(arg --text "$@")
+  case " $* " in
+  *" --enter "*) ;;
+  *) [ "$text" = "$(printf '\r')" ] && echo trusted >> "$state"; ok '{"send":{"accepted":true}}' ;;
+  esac
+  [ -n "$FAKE_ORCA_SEND_DELAY" ] && sleep "$FAKE_ORCA_SEND_DELAY"
+  [ "$scenario" = refused ] && ok '{"send":{"accepted":false}}'
+  printf '%s\n---\n' "$text" >> "$FAKE_LOG.prompt"
+  printf '%s\n---\n' "$text" >> "$FAKE_LOG.prompt.$role"
+  echo sent >> "$state"
+  n=$(sent)
+  write=no
+  case "$scenario" in
+  ok | trust | foreign-branch) write=yes ;;
+  nudge) [ "$n" -ge 2 ] && write=yes ;;
+  hang-once) case "$text" in *"Time is up"*) write=yes; echo wrapped >> "$state" ;; esac ;;
+  esac
+  if [ $write = yes ]; then
+    eval "first=\${FAKE_OUT_$role-\$FAKE_REPLY}"
+    eval "later=\${FAKE_RESUME_$role-\$first}"
+    if [ "$n" = 1 ]; then printf '%s' "$first" > "$state.pending"; else printf '%s' "$later" > "$state.pending"; fi
+    printf '%s' "$text" | grep -o '/[^`'"'"' ]*/reply\.txt' | head -n 1 > "$state.path"
+  fi
+  ok '{"send":{"accepted":true}}' ;;
+"terminal wait")
+  case "$scenario" in
+  no-agent) timeout "$@" ;;
+  trust) grep -q trusted "$state" 2> /dev/null || blocked agent-trust-workspace ;;
+  hang) [ "$(sent)" -gt 0 ] && timeout "$@" ;;
+  blocked) [ "$(sent)" -gt 0 ] && blocked agent-permission ;;
+  hang-once) [ "$(sent)" -gt 0 ] && ! grep -q wrapped "$state" && timeout "$@" ;;
+  esac
+  if [ -f "$state.pending" ]; then
+    mv "$state.pending" "$(cat "$state.path")"
+  fi
+  ok '{"wait":{"satisfied":true,"status":"running"}}' ;;
+esac
+echo "fake orca: unexpected $*" >&2
+exit 3
