@@ -270,8 +270,9 @@ fn claude_self_test(fx: &Fixture) -> Vec<Check> {
 }
 
 /// Claude runs one probe script through its sandboxed Bash; the probe records exit codes in
-/// `out/`, the one place it may write, and the checks read the effects from disk.
+/// `out/`, the one place it may write. Every check needs both the report and the disk to agree.
 fn claude_probe(fx: &Fixture) -> Result<Vec<Check>> {
+    let control_fired = hook_control(fx)?;
     let run = fx.root.join("claude");
     let launch = launch::claude(&fx.wt, &fx.git_common_dir, &run)?;
     let (out, leak, probe) = (
@@ -302,9 +303,22 @@ fn claude_probe(fx: &Fixture) -> Result<Vec<Check>> {
         sh_quote(&probe)
     );
     let status = launch.run(&prompt, &run.join("claude"), PASS_TIMEOUT)?;
+    if !status.success() {
+        bail!(
+            "claude {status}; see {}",
+            run.join("claude.stderr").display()
+        );
+    }
     let report = fs::read_to_string(&report).map_err(|_| {
         anyhow!(
-            "the probe did not run in Claude's sandbox (claude {status}); see {}",
+            "the probe did not run in Claude's sandbox; see {}",
+            run.display()
+        )
+    })?;
+    let [write, commit, branch_code, diff_code] = parse_report(&report).ok_or_else(|| {
+        anyhow!(
+            "malformed probe report {:?}; see {}",
+            report.trim(),
             run.display()
         )
     })?;
@@ -314,32 +328,74 @@ fn claude_probe(fx: &Fixture) -> Result<Vec<Check>> {
         &["rev-parse", "--verify", "-q", "refs/heads/rreview-probe"],
     );
     Ok(vec![
-        Check::blocked("claude sandbox: write into the worktree", leak.exists()),
+        Check::blocked(
+            "claude sandbox: write into the worktree",
+            write == 0 || leak.exists(),
+        ),
         Check::blocked(
             "claude sandbox: git commit",
-            git(&fx.wt, &["rev-parse", "HEAD"])? != fx.head,
+            commit == 0 || git(&fx.wt, &["rev-parse", "HEAD"])? != fx.head,
         ),
-        Check::blocked("claude sandbox: git branch", branch.is_ok()),
+        Check::blocked(
+            "claude sandbox: git branch",
+            branch_code == 0 || branch.is_ok(),
+        ),
         Check::new(
             "claude sandbox: git diff",
-            if diff.contains("+rreview-probe-change") {
+            if diff_code == 0 && diff.contains("+rreview-probe-change") {
                 Ok("works".into())
             } else {
-                Err(format!(
-                    "did not produce the diff (probe: {})",
-                    report.trim()
-                ))
+                Err(format!("failed (probe: {})", report.trim()))
             },
         ),
         Check::new(
             "claude --safe-mode: planted project hook",
             if fx.root.join("hook-fired").exists() {
                 Err("fired".into())
+            } else if !control_fired {
+                Err("control failed: the hook did not fire even without --safe-mode, so this check proves nothing".into())
             } else {
                 Ok("did not fire".into())
             },
         ),
     ])
+}
+
+/// Positive control for the planted hook, without a model call: the same launch minus
+/// `--safe-mode`, with an empty `CLAUDE_CONFIG_DIR` (no user config, no login), fires the
+/// session-start hook and then fails for want of a login. Returns whether the hook fired.
+fn hook_control(fx: &Fixture) -> Result<bool> {
+    let run = fx.root.join("claude-hook-control");
+    let mut control = launch::claude(&fx.wt, &fx.git_common_dir, &run)?;
+    let config = run.join("config");
+    fs::create_dir_all(&config)?;
+    control.args.retain(|a| a != "--safe-mode");
+    control.env.extend([
+        ("CLAUDE_CONFIG_DIR".into(), launch::utf8(&config)?.into()),
+        // limit: other credential sources (cloud provider env, apiKeyHelper) are not cleared.
+        ("ANTHROPIC_API_KEY".into(), String::new()),
+        ("CLAUDE_CODE_OAUTH_TOKEN".into(), String::new()),
+    ]);
+    control.run("Reply with OK.", &run.join("claude"), PASS_TIMEOUT)?;
+    let marker = fx.root.join("hook-fired");
+    let fired = marker.exists();
+    if fired {
+        fs::remove_file(&marker)?;
+    }
+    Ok(fired)
+}
+
+/// `write=<n> commit=<n> branch=<n> diff=<n>`, exactly.
+fn parse_report(report: &str) -> Option<[i32; 4]> {
+    let mut codes = [0; 4];
+    let mut fields = report.trim().split(' ');
+    for (code, key) in codes
+        .iter_mut()
+        .zip(["write=", "commit=", "branch=", "diff="])
+    {
+        *code = fields.next()?.strip_prefix(key)?.parse().ok()?;
+    }
+    fields.next().is_none().then_some(codes)
 }
 
 fn codex_self_test(fx: &Fixture) -> Vec<Check> {
@@ -389,17 +445,20 @@ fn codex_probe(fx: &Fixture) -> Result<Vec<Check>> {
 
     let reply = run_codex(&main, &prompt, &run)?;
     let control_reply = run_codex(&control, &prompt, &control_run)?;
-    let write = if leak.exists() || reply.contains("write=") {
-        Check::blocked("codex sandbox: write into the worktree", leak.exists())
-    } else {
-        Check::fail(
-            "codex sandbox: write into the worktree",
-            format!(
-                "Codex did not run the probe: {}",
-                first_line(reply.as_bytes())
-            ),
-        )
-    };
+    let events = run.join("codex.stdout");
+    let write = Check::new(
+        "codex sandbox: write into the worktree",
+        if leak.exists() {
+            Err("went through".into())
+        } else if probe_saw_blocked_write(&fs::read_to_string(&events)?, &probe) {
+            Ok("blocked".into())
+        } else {
+            Err(format!(
+                "no evidence that Codex ran the probe and its write failed (no such command in {})",
+                events.display()
+            ))
+        },
+    );
     let agents_md = if reply.contains(&user_canary) {
         Err("loaded: the canary from ~/.codex/AGENTS.md reached Codex".into())
     } else if control_reply.contains(&control_canary) {
@@ -408,6 +467,26 @@ fn codex_probe(fx: &Fixture) -> Result<Vec<Check>> {
         Err("control failed: Codex did not report the canary in its CODEX_HOME/AGENTS.md, so the check proves nothing".into())
     };
     Ok(vec![write, Check::new("codex: user AGENTS.md", agents_md)])
+}
+
+/// Evidence from Codex's own event log (`--json`), not from the model's reply: a completed
+/// command that ran the probe and printed `write=1`.
+fn probe_saw_blocked_write(events: &str, probe: &Path) -> bool {
+    let probe = probe.to_string_lossy();
+    events
+        .lines()
+        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+        .any(|event| {
+            let item = &event["item"];
+            event["type"] == "item.completed"
+                && item["type"] == "command_execution"
+                && item["command"]
+                    .as_str()
+                    .is_some_and(|c| c.contains(&*probe))
+                && item["aggregated_output"]
+                    .as_str()
+                    .is_some_and(|o| o.contains("write=1"))
+        })
 }
 
 fn run_codex(launch: &launch::Launch, prompt: &str, run: &Path) -> Result<String> {
@@ -475,6 +554,23 @@ mod tests {
         let fx = Fixture::new().unwrap();
         assert_all_ok(&codex_self_test(&fx));
         fs::remove_dir_all(fx.root).unwrap();
+    }
+
+    #[test]
+    fn parse_report_takes_only_the_exact_shape() {
+        assert_eq!(
+            parse_report("write=1 commit=128 branch=128 diff=0\n"),
+            Some([1, 128, 128, 0])
+        );
+        for bad in [
+            "",
+            "write=1 commit=128 branch=128",
+            "write=1 commit=128 branch=128 diff=0 extra=1",
+            "commit=128 write=1 branch=128 diff=0",
+            "write=x commit=128 branch=128 diff=0",
+        ] {
+            assert_eq!(parse_report(bad), None, "{bad:?}");
+        }
     }
 
     #[test]

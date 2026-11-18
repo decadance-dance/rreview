@@ -1,6 +1,15 @@
 #!/bin/sh
-# Fake `claude` for doctor tests. FAKE_CLAUDE: ok (default); no-safe-mode; leak (runs the
-# probe unsandboxed, as if the sandbox let everything through); ignore (does not run the probe).
+# Fake `claude` for doctor tests. Like the real one it fires the project's hooks
+# (.claude/settings.json in its cwd) unless given --safe-mode, and without --safe-mode (the
+# doctor's hook control, which has no login) it then fails. FAKE_CLAUDE:
+#   ok (default)    behaves like a working sandbox
+#   no-safe-mode    --help does not offer --safe-mode
+#   leak            runs the probe unsandboxed, as if the sandbox let everything through
+#   ignore          does not run the probe
+#   lie             skips the probe and reports "write=0 commit=0 branch=0 diff=99"
+#   crash           writes the normal results, then exits 42
+#   hook            fires the project hooks even under --safe-mode
+#   dead-hook       never fires hooks, as if the planted hook were broken
 # Argv is appended to $FAKE_LOG.
 echo "claude $*" >> "${FAKE_LOG:-/dev/null}"
 case "$1" in
@@ -11,15 +20,26 @@ case "$1" in
   exit 0 ;;
 auth) echo '{"loggedIn": true, "authMethod": "fake"}'; exit 0 ;;
 esac
+fire_hooks() {
+  [ "$FAKE_CLAUDE" = dead-hook ] && return
+  sh -c "$(sed -n 's/.*"command":"\([^"]*\)".*/\1/p' .claude/settings.json)"
+}
+case " $* " in
+*" --safe-mode "*) [ "$FAKE_CLAUDE" = hook ] && fire_hooks ;;
+*) fire_hooks; echo '{"type": "result", "is_error": true, "result": "Not logged in"}'; exit 1 ;;
+esac
 # A reviewer pass: the prompt on stdin names the probe script, whose dir holds out/.
 probe=$(grep -o "/[^']*/probe\.sh")
-[ "$FAKE_CLAUDE" = ignore ] && { echo '{"type": "result", "result": "no"}'; exit 0; }
 out=$(dirname "$probe")/out
-if [ "$FAKE_CLAUDE" = leak ]; then
-  sh "$probe" > /dev/null 2>&1
-else
+case "$FAKE_CLAUDE" in
+ignore) echo '{"type": "result", "result": "no"}'; exit 0 ;;
+leak) sh "$probe" > /dev/null 2>&1 ;;
+lie) git diff > "$out/diff.txt"; echo "write=0 commit=0 branch=0 diff=99" > "$out/probe.txt" ;;
+*)
   # What a working sandbox lets through: git diff and writes into out/.
   git diff > "$out/diff.txt"
-  echo "write=1 commit=128 branch=128 diff=0" > "$out/probe.txt"
-fi
+  echo "write=1 commit=128 branch=128 diff=0" > "$out/probe.txt" ;;
+esac
 echo '{"type": "result", "result": "done"}'
+[ "$FAKE_CLAUDE" = crash ] && exit 42
+exit 0

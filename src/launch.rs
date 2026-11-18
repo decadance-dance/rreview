@@ -99,9 +99,10 @@ pub fn claude(worktree: &Path, git_common_dir: &Path, runroot: &Path) -> Result<
     })
 }
 
-/// `codex exec -s read-only --ephemeral -C <worktree> -o <runroot>/out/<out_name> -` with
+/// `codex exec --json -s read-only --ephemeral -C <worktree> -o <runroot>/out/<out_name> -` with
 /// `CODEX_HOME=<runroot>/codex-home`, a fresh dir holding only a symlink to `user_auth`, so
-/// Codex loads none of the user's config or AGENTS.md. The prompt goes on stdin.
+/// Codex loads none of the user's config or AGENTS.md. The prompt goes on stdin; stdout is
+/// Codex's JSONL event log (the commands it ran and their output), the last message goes to `-o`.
 pub fn codex(worktree: &Path, runroot: &Path, out_name: &str, user_auth: &Path) -> Result<Launch> {
     let worktree = absolute(worktree)?;
     let user_auth = absolute(user_auth).context("Codex login (auth.json) not found")?;
@@ -127,6 +128,7 @@ pub fn codex(worktree: &Path, runroot: &Path, out_name: &str, user_auth: &Path) 
         program: "codex".into(),
         args: [
             "exec",
+            "--json",
             "-s",
             "read-only",
             "--ephemeral",
@@ -260,6 +262,7 @@ mod tests {
             launch.args,
             [
                 "exec",
+                "--json",
                 "-s",
                 "read-only",
                 "--ephemeral",

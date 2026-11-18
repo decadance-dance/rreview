@@ -77,7 +77,8 @@ fn passes_with_working_isolation_and_launches_through_the_builders() {
         run.log
     );
     assert!(
-        run.log.contains("codex exec -s read-only --ephemeral -C /"),
+        run.log
+            .contains("codex exec --json -s read-only --ephemeral -C /"),
         "{}",
         run.log
     );
@@ -160,7 +161,7 @@ fn fails_when_the_agents_skip_the_probe_instead_of_passing_vacuously() {
     assert!(!run.passed);
     for line in [
         "FAIL  claude self-test: the probe did not run in Claude's sandbox",
-        "FAIL  codex sandbox: write into the worktree: Codex did not run the probe",
+        "FAIL  codex sandbox: write into the worktree: no evidence",
         "FAIL  codex: user AGENTS.md: control failed",
     ] {
         assert!(
@@ -169,4 +170,70 @@ fn fails_when_the_agents_skip_the_probe_instead_of_passing_vacuously() {
             run.stdout
         );
     }
+}
+
+#[test]
+fn fails_when_codex_claims_a_blocked_write_without_running_the_probe() {
+    let run = doctor(ALL, &[("FAKE_CODEX", "lie")]);
+    assert!(!run.passed, "{}", run.stdout);
+    assert!(
+        run.stdout
+            .contains("FAIL  codex sandbox: write into the worktree: no evidence"),
+        "{}",
+        run.stdout
+    );
+}
+
+#[test]
+fn fails_when_the_claude_probe_report_contradicts_the_sandbox() {
+    let run = doctor(ALL, &[("FAKE_CLAUDE", "lie")]);
+    assert!(!run.passed, "{}", run.stdout);
+    for line in [
+        "FAIL  claude sandbox: write into the worktree: went through",
+        "FAIL  claude sandbox: git commit: went through",
+        "FAIL  claude sandbox: git branch: went through",
+        "FAIL  claude sandbox: git diff: failed",
+    ] {
+        assert!(
+            run.stdout.contains(line),
+            "missing {line:?} in\n{}",
+            run.stdout
+        );
+    }
+}
+
+#[test]
+fn fails_when_the_claude_pass_exits_non_zero() {
+    let run = doctor(ALL, &[("FAKE_CLAUDE", "crash")]);
+    assert!(!run.passed, "{}", run.stdout);
+    assert!(
+        run.stdout
+            .contains("FAIL  claude self-test: claude exit status: 42"),
+        "{}",
+        run.stdout
+    );
+}
+
+#[test]
+fn fails_when_the_planted_hook_fires() {
+    let run = doctor(ALL, &[("FAKE_CLAUDE", "hook")]);
+    assert!(!run.passed, "{}", run.stdout);
+    assert!(
+        run.stdout
+            .contains("FAIL  claude --safe-mode: planted project hook: fired"),
+        "{}",
+        run.stdout
+    );
+}
+
+#[test]
+fn fails_when_the_planted_hook_cannot_fire_at_all() {
+    let run = doctor(ALL, &[("FAKE_CLAUDE", "dead-hook")]);
+    assert!(!run.passed, "{}", run.stdout);
+    assert!(
+        run.stdout
+            .contains("FAIL  claude --safe-mode: planted project hook: control failed"),
+        "{}",
+        run.stdout
+    );
 }
