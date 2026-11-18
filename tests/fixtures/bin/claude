@@ -11,13 +11,17 @@
 #   hook            fires the project hooks even under --safe-mode
 #   dead-hook       never fires hooks, as if the planted hook were broken
 # Argv is appended to $FAKE_LOG.
-# With FAKE_REVIEW set it is a review pass instead: the prompt (stdin) is appended to
-# $FAKE_LOG.prompt and $FAKE_STDOUT is printed. FAKE_REVIEW:
+# With FAKE_REVIEW set it is a review pass instead. The pass's role comes from the prompt
+# (a panelist's task id, the coordinator's or the judge's heading) or, on --resume, from the
+# session it resumes. The prompt (stdin) is appended to $FAKE_LOG.prompt and
+# $FAKE_LOG.prompt.<role>. It prints, first match wins: $FAKE_RESUME_<role> on a resumed turn,
+# $FAKE_OUT_<role>, $FAKE_STDOUT. The mode is $FAKE_MODE_<role>, else FAKE_REVIEW:
 #   ok              replies at once
 #   hang            starts a grandchild (pids appended to $FAKE_LOG.grandchild), then never replies
 #   hang-once       hangs like `hang` unless resumed (--resume), then replies
-#   forge           first writes $FAKE_FORGED into out/reliability.json, which the sandbox allows
-#   symlink         first plants out/reliability.json as a symlink to $FAKE_LOG.victim
+#   crash           prints nothing and exits 1
+#   forge           first writes $FAKE_FORGED into out/<role>.json, which the sandbox allows
+#   symlink         first plants out/<role>.json as a symlink to $FAKE_LOG.victim
 echo "claude $*" >> "${FAKE_LOG:-/dev/null}"
 case "$1" in
 --version) echo "9.9.9 (Claude Code)"; exit 0 ;;
@@ -28,17 +32,36 @@ case "$1" in
 auth) echo '{"loggedIn": true, "authMethod": "fake"}'; exit 0 ;;
 esac
 if [ -n "$FAKE_REVIEW" ]; then
-  cat >> "$FAKE_LOG.prompt"
-  case " $* " in *" --resume "*) resumed=yes ;; *) resumed=no ;; esac
-  if [ "$FAKE_REVIEW" = hang ] || { [ "$FAKE_REVIEW" = hang-once ] && [ $resumed = no ]; }; then
+  prompt=$(cat)
+  printf '%s\n' "$prompt" >> "$FAKE_LOG.prompt"
+  settings=; session=; resume=; prev=
+  for a; do
+    [ "$prev" = --settings ] && settings=$a
+    [ "$prev" = --session-id ] && session=$a
+    [ "$prev" = --resume ] && resume=$a
+    prev=$a
+  done
+  if [ -n "$resume" ]; then
+    resumed=yes role=$(grep "^$resume " "$FAKE_LOG.sessions" | cut -d' ' -f2)
+  else
+    case "$prompt" in
+    *"## Coordinator: reconcile"*) role=coordinator ;;
+    "You are the judge"*) role=judge ;;
+    *) role=$(printf '%s' "$prompt" | grep -o 'task id "[a-z_]*"' | head -n 1 | cut -d'"' -f2) ;;
+    esac
+    resumed=no; echo "$session $role" >> "$FAKE_LOG.sessions"
+  fi
+  printf '%s\n' "$prompt" >> "$FAKE_LOG.prompt.$role"
+  eval "mode=\${FAKE_MODE_$role:-\$FAKE_REVIEW} out=\${FAKE_OUT_$role-\$FAKE_STDOUT}"
+  [ $resumed = yes ] && eval "out=\${FAKE_RESUME_$role-\$out}"
+  if [ "$mode" = hang ] || { [ "$mode" = hang-once ] && [ $resumed = no ]; }; then
     sleep 60 & echo $! >> "$FAKE_LOG.grandchild"; sleep 60; exit 0
   fi
-  settings=; prev=
-  for a; do [ "$prev" = --settings ] && settings=$a; prev=$a; done
-  out=$(dirname "$settings")/out/reliability.json
-  if [ "$FAKE_REVIEW" = forge ]; then printf '%s' "$FAKE_FORGED" > "$out" || exit 97; fi
-  if [ "$FAKE_REVIEW" = symlink ]; then ln -s "$FAKE_LOG.victim" "$out" || exit 97; fi
-  printf '%s\n' "$FAKE_STDOUT"; exit 0
+  [ "$mode" = crash ] && exit 1
+  file=$(dirname "$settings")/out/$role.json
+  if [ "$mode" = forge ]; then printf '%s' "$FAKE_FORGED" > "$file" || exit 97; fi
+  if [ "$mode" = symlink ]; then ln -s "$FAKE_LOG.victim" "$file" || exit 97; fi
+  printf '%s\n' "$out"; exit 0
 fi
 fire_hooks() {
   [ "$FAKE_CLAUDE" = dead-hook ] && return

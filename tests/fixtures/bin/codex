@@ -9,9 +9,13 @@
 #   read            only reads the probe (cat) and logs that command with its output
 #   rebuild         reads the probe's last line and rebuilds the result line from it
 # Argv and CODEX_HOME are appended to $FAKE_LOG.
-# With FAKE_REVIEW set it is a review pass instead: the prompt (stdin) is appended to
-# $FAKE_LOG.prompt, a thread.started event is printed and $FAKE_REPLY goes to the -o file.
-# FAKE_REVIEW: ok, hang, hang-once (hangs unless resumed with `resume fake-thread`), as for claude.
+# With FAKE_REVIEW set it is a review pass instead. The role comes from the -o file's path
+# (<runroot>/scratch/<role>/replies/reply.txt). The prompt (stdin) is appended to $FAKE_LOG.prompt and
+# $FAKE_LOG.prompt.<role>, a thread.started event is printed, and the -o file gets, first match
+# wins: $FAKE_RESUME_<role> on a resumed turn, $FAKE_OUT_<role>, $FAKE_REPLY. The mode is
+# $FAKE_MODE_<role>, else FAKE_REVIEW: ok, hang, hang-once (hangs unless resumed with
+# `resume fake-thread`), crash (exit 1), as for claude; no-reply exits 0 without writing the -o
+# file unless resumed.
 echo "codex $* CODEX_HOME=$CODEX_HOME" >> "${FAKE_LOG:-/dev/null}"
 case "$1" in
 --version) echo "codex-cli 9.9.9"; exit 0 ;;
@@ -20,13 +24,20 @@ esac
 out=; prev=
 for a; do [ "$prev" = -o ] && out=$a; prev=$a; done
 if [ -n "$FAKE_REVIEW" ]; then
-  cat >> "$FAKE_LOG.prompt"
+  role=$(basename "$(dirname "$(dirname "$out")")")
+  prompt=$(cat)
+  printf '%s\n' "$prompt" >> "$FAKE_LOG.prompt"
+  printf '%s\n' "$prompt" >> "$FAKE_LOG.prompt.$role"
   echo '{"type":"thread.started","thread_id":"fake-thread"}'
   case " $* " in *" resume fake-thread - "*) resumed=yes ;; *) resumed=no ;; esac
-  if [ "$FAKE_REVIEW" = hang ] || { [ "$FAKE_REVIEW" = hang-once ] && [ $resumed = no ]; }; then
+  eval "mode=\${FAKE_MODE_$role:-\$FAKE_REVIEW} reply=\${FAKE_OUT_$role-\$FAKE_REPLY}"
+  [ $resumed = yes ] && eval "reply=\${FAKE_RESUME_$role-\$reply}"
+  if [ "$mode" = hang ] || { [ "$mode" = hang-once ] && [ $resumed = no ]; }; then
     sleep 60 & echo $! >> "$FAKE_LOG.grandchild"; sleep 60; exit 0
   fi
-  printf '%s' "$FAKE_REPLY" > "$out"; exit 0
+  [ "$mode" = crash ] && exit 1
+  [ "$mode" = no-reply ] && [ $resumed = no ] && exit 0
+  printf '%s' "$reply" > "$out"; exit 0
 fi
 probe=$(grep -o "/[^']*probe\.sh")
 [ "$FAKE_CODEX" = ignore ] && { echo "I would rather not." > "$out"; exit 0; }

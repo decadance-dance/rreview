@@ -573,7 +573,7 @@ fn run_codex(launch: &launch::Launch, prompt: &str, run: &Path) -> Result<String
     if !status.success() {
         bail!("codex {status}; see {}", run.join("codex.stderr").display());
     }
-    let reply = run.join("out/reply.txt");
+    let reply = run.join("replies/reply.txt");
     fs::read_to_string(&reply)
         .with_context(|| format!("no reply from codex in {}", reply.display()))
 }

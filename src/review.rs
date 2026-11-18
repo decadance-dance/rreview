@@ -1,31 +1,50 @@
-//! `rreview <pr>`: prepare the review worktree and run dir (spec §2.1), run the panel through
-//! a runner (spec §4), and leave `meta.json`, `progress.jsonl` and `out/<role>.json` (spec §5).
+//! `rreview <pr>`: prepare the review worktree and run dir (spec §2.1), run the panel, the
+//! coordinator and the judge through a runner (spec §2, §4), gate the findings and leave
+//! `meta.json`, `progress.jsonl`, `out/<role>.json` and `result.json` (spec §5).
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, OpenOptions};
-use std::io::Write;
+use std::io::{Read, Write};
+use std::os::unix::process::CommandExt;
 use std::path::{Component, Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::{Command, Output, Stdio};
+use std::thread::JoinHandle;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use anyhow::{Context, Result, bail};
-use serde::Deserialize;
+use anyhow::{Context, Result, anyhow, bail};
+use serde::{Deserialize, Serialize};
 use serde_json::json;
 
+use crate::coordinator::{self, PanelCandidate, PanelResult, Scope, Tagged};
 use crate::launch;
-use crate::panelist::{self, PrText};
+use crate::panelist::{self, PrText, ROLES, Role};
+use crate::result::{self, Gate, PassReport, ReviewResult};
 use crate::runner::{Agent, Headless, Pass, Runner};
 
 const WRAP_UP: &str = "Time is up. Stop reviewing now and reply with only the JSON object described in the first message, covering what you have checked so far.";
+const RETRY: &str = "Your reply was rejected. Reply again with only the JSON described in the first message, fixed; nothing else.";
 const WRAP_UP_TIMEOUT: Duration = Duration::from_secs(180);
+/// The passes after the panel, in order.
+const PIPELINE: [&str; 2] = ["coordinator", "judge"];
 
 pub struct Args {
     pub pr: String,
     pub repo: Option<String>,
-    pub only: String,
+    /// Run this panelist alone, without coordinator and judge (a development flag).
+    pub only: Option<String>,
+    /// The family that wrote the change; the defaults give most discovery and the judge to
+    /// the other one.
+    pub author: Agent,
     pub role_agents: Vec<(String, Agent)>,
+    pub role_models: Vec<(String, String)>,
+    pub role_efforts: Vec<(String, String)>,
+    pub context_file: Option<PathBuf>,
+    pub gate: Gate,
+    pub json: bool,
     pub keep_worktree: bool,
     pub timeout: Duration,
+    /// The whole review's budget.
+    pub budget: Duration,
 }
 
 #[derive(Deserialize)]
@@ -48,18 +67,89 @@ struct Oid {
     oid: String,
 }
 
-/// Runs the review; true when every pass completed.
-pub fn run(args: &Args) -> Result<bool> {
-    let role = panelist::role(&args.only)?;
-    let mut agent = role.default_agent;
-    for (r, a) in &args.role_agents {
-        panelist::role(r)?;
-        if r == role.id {
-            agent = *a;
-        }
-    }
+/// Agent, model and effort of every role (the three lenses, coordinator, judge).
+struct Settings {
+    agents: BTreeMap<&'static str, Agent>,
+    models: BTreeMap<&'static str, String>,
+    efforts: BTreeMap<&'static str, String>,
+}
 
-    let pr = view_pr(args)?;
+impl Settings {
+    fn new(args: &Args) -> Result<Settings> {
+        let all: Vec<&'static str> = ROLES.iter().map(|r| r.id).chain(PIPELINE).collect();
+        let id = |r: &str| {
+            all.iter()
+                .copied()
+                .find(|x| *x == r)
+                .with_context(|| format!("unknown role {r:?}; known: {}", all.join(", ")))
+        };
+        let flip = |a: Agent| match (args.author, a) {
+            (Agent::Claude, a) => a,
+            (Agent::Codex, Agent::Claude) => Agent::Codex,
+            (Agent::Codex, Agent::Codex) => Agent::Claude,
+        };
+        let mut agents: BTreeMap<_, _> = ROLES
+            .iter()
+            .map(|r| (r.id, flip(r.default_agent)))
+            .chain([
+                ("coordinator", flip(Agent::Claude)),
+                ("judge", flip(Agent::Codex)),
+            ])
+            .collect();
+        for (r, a) in &args.role_agents {
+            agents.insert(id(r)?, *a);
+        }
+        if agents["coordinator"] == agents["judge"] {
+            bail!(
+                "the coordinator and the judge must not share a model family, but both are {}; change one with --role-agent",
+                agents["judge"]
+            );
+        }
+        let mut models = BTreeMap::new();
+        for (r, m) in &args.role_models {
+            models.insert(id(r)?, m.clone());
+        }
+        let mut efforts = BTreeMap::new();
+        for (r, e) in &args.role_efforts {
+            let r = id(r)?;
+            let known: &[&str] = match agents[r] {
+                Agent::Claude => &["low", "medium", "high", "xhigh", "max"],
+                Agent::Codex => &["minimal", "low", "medium", "high", "xhigh"],
+            };
+            if !known.contains(&e.as_str()) {
+                bail!(
+                    "effort {e:?} for {r} ({}): known: {}",
+                    agents[r],
+                    known.join(", ")
+                );
+            }
+            efforts.insert(r, e.clone());
+        }
+        Ok(Settings {
+            agents,
+            models,
+            efforts,
+        })
+    }
+}
+
+/// Runs the review; returns the exit code: 0 no gated findings, 1 gated findings, 2 failed.
+pub fn run(args: &Args) -> Result<u8> {
+    let settings = Settings::new(args)?;
+    let panel: Vec<&Role> = match &args.only {
+        Some(id) => vec![panelist::role(id)?],
+        None => ROLES.iter().collect(),
+    };
+    let task = match &args.context_file {
+        Some(path) => fs::read_to_string(path)
+            .with_context(|| format!("--context-file {}", path.display()))?,
+        None => String::new(),
+    };
+    // None: a budget too large for the clock is no limit.
+    let deadline = Instant::now().checked_add(args.budget);
+
+    // The budget covers preparation too: gh, a fetch or a checkout hook can stall.
+    let pr = view_pr(&args.pr, args.repo.as_deref(), deadline)?;
     let (owner, name) = owner_and_name(&pr.url)?;
     let head = commit(&pr.head_ref_oid, "headRefOid")?;
     // A merged PR's base branch now contains its head; its diff is against the base before the merge.
@@ -67,14 +157,15 @@ pub fn run(args: &Args) -> Result<bool> {
         ("MERGED", Some(m)) => format!("{}^1", commit(&m.oid, "mergeCommit")?),
         _ => commit(&pr.base_ref_oid, "baseRefOid")?.to_string(),
     };
-    ensure_commits(&pr, &[head, &base_tip])?;
-    let base = git(&["merge-base", &base_tip, head])?;
+    ensure_commits(&pr, &[head, &base_tip], deadline)?;
+    let base = git(&["merge-base", &base_tip, head], deadline)?;
     // Raw bytes: names may start or end with spaces. A non-UTF-8 name cannot be named in JSON.
-    let diff_files: BTreeSet<String> = git_raw(&["diff", "--name-only", "-z", &base, head])?
-        .split(|b| *b == 0)
-        .filter_map(|f| String::from_utf8(f.to_vec()).ok())
-        .filter(|f| !f.is_empty())
-        .collect();
+    let diff_files: BTreeSet<String> =
+        git_raw(&["diff", "--name-only", "-z", &base, head], deadline)?
+            .split(|b| *b == 0)
+            .filter_map(|f| String::from_utf8(f.to_vec()).ok())
+            .filter(|f| !f.is_empty())
+            .collect();
 
     let runroot = state_home()?
         .join("rreview")
@@ -92,7 +183,7 @@ pub fn run(args: &Args) -> Result<bool> {
     if runroot.exists() {
         fs::remove_dir_all(&runroot).with_context(|| format!("{}", runroot.display()))?;
     }
-    fs::create_dir_all(&runroot).with_context(|| format!("{}", runroot.display()))?;
+    fs::create_dir_all(runroot.join("out")).with_context(|| format!("{}", runroot.display()))?;
     let runroot = fs::canonicalize(&runroot)?;
     // The guard exists before the checkout: a failed one (a post-checkout hook) can leave a
     // registered, half-made worktree behind.
@@ -100,23 +191,32 @@ pub fn run(args: &Args) -> Result<bool> {
         path: runroot.join("wt"),
         keep: false,
     };
-    git(&[
-        "worktree",
-        "add",
-        "--quiet",
-        "--detach",
-        launch::utf8(&wt.path)?,
-        head,
-    ])
+    git(
+        &[
+            "worktree",
+            "add",
+            "--quiet",
+            "--detach",
+            launch::utf8(&wt.path)?,
+            head,
+        ],
+        deadline,
+    )
     .context("cannot create the review worktree")?;
     wt.keep = args.keep_worktree;
 
-    let roles = BTreeMap::from([(role.id, agent.to_string())]);
+    let ran = |r: &str| panel.iter().any(|p| p.id == r) || args.only.is_none();
+    let roles: BTreeMap<_, _> = settings
+        .agents
+        .iter()
+        .filter(|(r, _)| ran(r))
+        .map(|(r, a)| (*r, a.to_string()))
+        .collect();
     let meta = json!({
         "pr": { "number": pr.number, "title": pr.title, "url": pr.url, "repo": format!("{owner}/{name}"),
                 "head_ref": pr.head_ref_name, "base_ref": pr.base_ref_name },
         "base": base, "head": head, "runner": "headless", "roles": roles,
-        "versions": { "claude": version("claude"), "codex": version("codex") },
+        "versions": { "claude": version("claude", deadline), "codex": version("codex", deadline) },
     });
     fs::write(
         runroot.join("meta.json"),
@@ -124,78 +224,339 @@ pub fn run(args: &Args) -> Result<bool> {
     )?;
 
     let runner = Headless {
-        git_common_dir: git(&["rev-parse", "--path-format=absolute", "--git-common-dir"])?.into(),
+        git_common_dir: git(
+            &["rev-parse", "--path-format=absolute", "--git-common-dir"],
+            deadline,
+        )?
+        .into(),
         worktree: wt.path.clone(),
         runroot: runroot.clone(),
         codex_auth: launch::user_codex_auth()?,
     };
-    let pass = Pass {
-        role: role.id,
-        agent,
-        prompt: panelist::prompt(
-            role,
-            &base,
-            head,
-            &PrText {
-                title: &pr.title,
-                body: &pr.body,
-            },
-        ),
+    let ctx = Ctx {
+        runner: &runner,
+        progress: Progress(runroot.join("progress.jsonl")),
+        runroot: &runroot,
+        deadline,
         timeout: args.timeout,
+        settings: &settings,
     };
-    let progress = Progress(runroot.join("progress.jsonl"));
-    let out = runroot.join("out").join(format!("{}.json", role.id));
-    let started = Instant::now();
-    progress.event(&pass, "started", started, None)?;
-    let result = run_pass(&runner, &pass, &progress, started).and_then(|raw| {
-        let envelope = panelist::parse(&raw, role, &diff_files)?;
-        // The reviewer can write into out/ (a symlink, say); a rename from the run root, which
-        // it cannot write, replaces whatever stands there without following it.
-        let tmp = runroot.join(format!(".{}.json.tmp", role.id));
-        fs::write(&tmp, serde_json::to_string_pretty(&envelope)?)?;
-        fs::rename(&tmp, &out).with_context(|| format!("{}", out.display()))?;
-        Ok(envelope)
+    let pr_text = PrText {
+        title: &pr.title,
+        body: &pr.body,
+        task: &task,
+    };
+
+    // Panel: the lenses in parallel threads.
+    let outcomes = std::thread::scope(|s| {
+        let threads: Vec<_> = panel
+            .iter()
+            .map(|role| {
+                let (ctx, diff_files) = (&ctx, &diff_files);
+                let prompt = panelist::prompt(role, &base, head, &pr_text);
+                s.spawn(move || {
+                    ctx.review_pass(role.id, prompt, |raw| {
+                        panelist::parse(raw, role, diff_files)
+                    })
+                })
+            })
+            .collect();
+        threads
+            .into_iter()
+            .map(|t| t.join().map_err(|_| anyhow!("a panel thread panicked")))
+            .collect::<Result<Vec<_>>>()
+    })?;
+    // Every candidate gets a stable id, `<role>-<n>`, which the coordinator accounts for.
+    let ids: Vec<Vec<String>> = panel
+        .iter()
+        .zip(&outcomes)
+        .map(|(role, (_, outcome))| match outcome {
+            Ok(env) => (1..=env.candidates.len())
+                .map(|n| format!("{}-{n}", role.id))
+                .collect(),
+            Err(_) => vec![],
+        })
+        .collect();
+    let mut results = vec![];
+    let mut candidates = vec![];
+    for ((role, (report, outcome)), ids) in panel.iter().zip(&outcomes).zip(&ids) {
+        match outcome {
+            Ok(env) => {
+                for (id, c) in ids.iter().zip(&env.candidates) {
+                    candidates.push(PanelCandidate {
+                        id: id.clone(),
+                        panelist: role.name,
+                        candidate: c,
+                    });
+                }
+                eprintln!(
+                    "{} ({}): {} candidates",
+                    role.id,
+                    report.agent,
+                    env.candidates.len()
+                );
+            }
+            Err(e) if args.only.is_some() => eprintln!("error: {e:#}"),
+            Err(e) => eprintln!("warning: {e:#}; the coordinator covers this lens"),
+        }
+        results.push(PanelResult {
+            panelist: role.name,
+            status: if outcome.is_ok() {
+                "completed"
+            } else {
+                "failed"
+            },
+            coverage_summary: outcome.as_ref().ok().map(|e| e.coverage_summary.as_str()),
+            candidates: outcome.as_ref().ok().map(|env| {
+                ids.iter()
+                    .zip(&env.candidates)
+                    .map(|(id, candidate)| Tagged { id, candidate })
+                    .collect()
+            }),
+            error: outcome.as_ref().err().map(|e| format!("{e:#}")),
+        });
+    }
+    let mut degraded = results.iter().any(|r| r.status != "completed");
+    if args.only.is_some() {
+        drop(wt);
+        eprintln!("run dir: {}", runroot.display());
+        return Ok(if degraded { 2 } else { 0 });
+    }
+
+    let wt_str = launch::utf8(&wt.path)?.to_string();
+    let scope = Scope {
+        worktree: &wt_str,
+        diff_files: &diff_files,
+    };
+    let roster: Vec<_> = panel.iter().map(|r| r.name).collect();
+    let prompt = coordinator::coordinator_prompt(&roster, &base, head, &pr_text, &results)?;
+    let (report, review) = ctx.review_pass("coordinator", prompt, |raw| {
+        coordinator::parse_review(raw, &scope, &candidates)
     });
-    let ok = match result {
-        Ok(envelope) => {
-            progress.event(&pass, "completed", started, None)?;
-            println!(
-                "{} ({agent}): {} candidates in {}",
-                role.id,
-                envelope.candidates.len(),
-                out.display()
-            );
-            true
-        }
+    let mut passes: Vec<PassReport> = outcomes
+        .into_iter()
+        .map(|(r, _)| r)
+        .chain([report])
+        .collect();
+    let review = match review {
+        Ok(review) => review,
         Err(e) => {
-            // The reviewer may write into out/; only a validated envelope may stand there.
-            let _ = fs::remove_file(&out);
-            let error = format!("pass {} ({agent}): {e:#}", role.id);
-            progress.event(&pass, "failed", started, Some(&error))?;
-            eprintln!("error: {error}");
-            false
+            drop(wt);
+            eprintln!("error: {e:#}\nrun dir: {}", runroot.display());
+            return Ok(2);
         }
     };
+
+    // The judge is a recovery pass: when it fails, the coordinator's findings stand.
+    let mut findings = review.findings.clone();
+    if !review.dropped_candidates.is_empty() {
+        let prompt =
+            coordinator::judge_prompt(&base, head, &review.findings, &review.dropped_candidates)?;
+        let (report, restored) = ctx.review_pass("judge", prompt, |raw| {
+            coordinator::parse_judge(raw, &scope, &review.dropped_candidates)
+        });
+        passes.push(report);
+        match restored {
+            Ok(restored) => findings.extend(restored),
+            Err(e) => {
+                degraded = true;
+                eprintln!("warning: {e:#}; the coordinator's findings stand");
+            }
+        }
+    }
     drop(wt);
-    println!("run dir: {}", runroot.display());
-    Ok(ok)
+
+    let ungated = result::dedupe(findings, args.gate);
+    let result = ReviewResult {
+        findings: ungated
+            .iter()
+            .filter(|f| args.gate.keep(f))
+            .cloned()
+            .collect(),
+        ungated_findings: ungated,
+        dropped_candidates: review.dropped_candidates,
+        overall_correctness: review.overall_correctness,
+        overall_explanation: review.overall_explanation,
+        review_process: review.review_process,
+        base,
+        head: head.into(),
+        passes,
+        degraded,
+    };
+    fs::write(
+        runroot.join("result.json"),
+        serde_json::to_string_pretty(&result)?,
+    )?;
+    eprintln!("run dir: {}", runroot.display());
+    print_result(&result, args.json)
 }
 
-/// One pass; a pass that times out gets one wrap-up turn (spec §4).
-fn run_pass(
-    runner: &impl Runner,
-    pass: &Pass,
-    progress: &Progress,
-    started: Instant,
-) -> Result<String> {
-    match runner.run(pass) {
-        Err(e) if e.is::<launch::TimedOut>() => {
-            progress.event(pass, "wrapup", started, None)?;
-            runner
-                .wrap_up(pass, WRAP_UP, WRAP_UP_TIMEOUT.min(pass.timeout))
-                .with_context(|| format!("{e:#}; wrap-up"))
+/// `rreview show`: the result in a run dir, or of the latest finished review of a PR.
+pub fn show(target: &str, repo: Option<&str>, json: bool) -> Result<u8> {
+    let file = if Path::new(target).is_dir() {
+        Path::new(target).join("result.json")
+    } else {
+        latest_result(target, repo)?
+    };
+    let text = fs::read_to_string(&file).with_context(|| format!("{}", file.display()))?;
+    let result: ReviewResult =
+        serde_json::from_str(&text).with_context(|| format!("{}", file.display()))?;
+    eprintln!("result: {}", file.display());
+    print_result(&result, json)
+}
+
+fn latest_result(pr: &str, repo: Option<&str>) -> Result<PathBuf> {
+    let pr = view_pr(pr, repo, None)?;
+    let (owner, name) = owner_and_name(&pr.url)?;
+    let dir = state_home()?.join("rreview").join(owner).join(name);
+    let prefix = format!("{}-", pr.number);
+    let mut latest: Option<(SystemTime, PathBuf)> = None;
+    for entry in fs::read_dir(&dir).with_context(|| format!("no reviews in {}", dir.display()))? {
+        let entry = entry?;
+        if !entry.file_name().to_string_lossy().starts_with(&prefix) {
+            continue;
         }
-        r => r,
+        let file = entry.path().join("result.json");
+        if let Ok(time) = fs::metadata(&file).and_then(|m| m.modified())
+            && latest.as_ref().is_none_or(|(t, _)| time > *t)
+        {
+            latest = Some((time, file));
+        }
+    }
+    latest.map(|(_, f)| f).with_context(|| {
+        format!(
+            "no finished review of PR #{} in {}",
+            pr.number,
+            dir.display()
+        )
+    })
+}
+
+/// Prints `result.json` (`--json`) or the human summary; returns the exit code.
+fn print_result(result: &ReviewResult, json: bool) -> Result<u8> {
+    if json {
+        println!("{}", serde_json::to_string_pretty(result)?);
+    } else {
+        print!("{}", result::summary(result));
+    }
+    Ok(if result.findings.is_empty() { 0 } else { 1 })
+}
+
+/// What every pass of one run shares.
+struct Ctx<'a, R> {
+    runner: &'a R,
+    progress: Progress,
+    runroot: &'a Path,
+    /// The end of the budget; None when it is too far away to represent.
+    deadline: Option<Instant>,
+    timeout: Duration,
+    settings: &'a Settings,
+}
+
+impl<R: Runner> Ctx<'_, R> {
+    fn left(&self) -> Duration {
+        self.deadline.map_or(Duration::MAX, |d| {
+            d.saturating_duration_since(Instant::now())
+        })
+    }
+
+    /// One pass, its progress events and its report. A valid reply is published as
+    /// `out/<role>.json`; a failed pass leaves nothing there.
+    fn review_pass<T: Serialize>(
+        &self,
+        role: &str,
+        prompt: String,
+        parse: impl Fn(&str) -> Result<T>,
+    ) -> (PassReport, Result<T>) {
+        let agent = self.settings.agents[role];
+        let pass = Pass {
+            role,
+            agent,
+            model: self.settings.models.get(role).map(String::as_str),
+            effort: self.settings.efforts.get(role).map(String::as_str),
+            prompt,
+            timeout: self.timeout.min(self.left()),
+        };
+        let started = Instant::now();
+        let out = self.runroot.join("out").join(format!("{role}.json"));
+        let result = (|| {
+            if pass.timeout.is_zero() {
+                bail!("the review's budget is spent");
+            }
+            self.progress.event(&pass, "started", started, None)?;
+            let value = self.turns(&pass, &parse, started)?;
+            // out/ is the host's: no reviewer can write there (reviewers write only into their
+            // own `scratch/<role>/`).
+            fs::write(&out, serde_json::to_string_pretty(&value)?)
+                .with_context(|| format!("{}", out.display()))?;
+            Ok(value)
+        })()
+        .with_context(|| format!("pass {role} ({agent})"));
+        let error = result.as_ref().err().map(|e| format!("{e:#}"));
+        let status = if error.is_some() {
+            "failed"
+        } else {
+            "completed"
+        };
+        // A lost progress line must not turn the pass's own outcome around.
+        if let Err(e) = self
+            .progress
+            .event(&pass, status, started, error.as_deref())
+        {
+            eprintln!("warning: {e:#}");
+        }
+        let report = PassReport {
+            role: role.into(),
+            agent: agent.to_string(),
+            model: pass.model.unwrap_or("default").into(),
+            effort: pass.effort.map(String::from),
+            status: status.into(),
+            duration_ms: started.elapsed().as_millis() as u64,
+            error,
+        };
+        (report, result)
+    }
+
+    /// The pass's turns (spec §4): a pass killed at its timeout gets one wrap-up turn; a reply
+    /// that does not validate gets one more turn with the reason. Then it has failed.
+    fn turns<T>(
+        &self,
+        pass: &Pass,
+        parse: &impl Fn(&str) -> Result<T>,
+        started: Instant,
+    ) -> Result<T> {
+        let raw = match self.runner.run(pass) {
+            Err(e) if e.is::<launch::TimedOut>() => {
+                let timeout = self.turn_timeout(pass);
+                if timeout.is_zero() {
+                    bail!("{e:#}; no budget left for a wrap-up");
+                }
+                self.progress.event(pass, "wrapup", started, None)?;
+                self.runner
+                    .wrap_up(pass, WRAP_UP, timeout)
+                    .with_context(|| format!("{e:#}; wrap-up"))?
+            }
+            r => r?,
+        };
+        let e = match parse(&raw) {
+            Ok(value) => return Ok(value),
+            Err(e) => e,
+        };
+        let timeout = self.turn_timeout(pass);
+        if timeout.is_zero() {
+            return Err(e);
+        }
+        self.progress
+            .event(pass, "retry", started, Some(&format!("{e:#}")))?;
+        let raw = self
+            .runner
+            .wrap_up(pass, &format!("{RETRY}\n\nThe reason: {e:#}"), timeout)
+            .with_context(|| format!("{e:#}; retry"))?;
+        parse(&raw).with_context(|| format!("{e:#}; retry"))
+    }
+
+    fn turn_timeout(&self, pass: &Pass) -> Duration {
+        WRAP_UP_TIMEOUT.min(pass.timeout).min(self.left())
     }
 }
 
@@ -209,11 +570,11 @@ struct Worktree {
 impl Drop for Worktree {
     fn drop(&mut self) {
         if self.keep {
-            println!("review worktree kept: {}", self.path.display());
+            eprintln!("review worktree kept: {}", self.path.display());
             return;
         }
         let removed =
-            launch::utf8(&self.path).and_then(|p| git(&["worktree", "remove", "--force", p]));
+            launch::utf8(&self.path).and_then(|p| git(&["worktree", "remove", "--force", p], None));
         // Not registered (a checkout that failed early): only a directory may be left.
         if let Err(e) = removed
             && self.path.exists()
@@ -237,30 +598,30 @@ impl Progress {
         let ts = SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis();
         let mut event = json!({
             "ts": ts as u64, "role": pass.role, "status": status, "agent": pass.agent.to_string(),
-            // limit: no --role-model yet (#4); the CLI picks its default model.
-            "model": "default", "duration_ms": started.elapsed().as_millis() as u64,
+            "model": pass.model.unwrap_or("default"), "duration_ms": started.elapsed().as_millis() as u64,
         });
         if let Some(error) = error {
             event["error"] = error.into();
         }
+        // One write per line: passes run in parallel threads and append to the same file.
         let mut file = OpenOptions::new().create(true).append(true).open(&self.0)?;
-        writeln!(file, "{event}").with_context(|| format!("{}", self.0.display()))
+        file.write_all(format!("{event}\n").as_bytes())
+            .with_context(|| format!("{}", self.0.display()))
     }
 }
 
-fn view_pr(args: &Args) -> Result<Pr> {
+fn view_pr(pr: &str, repo: Option<&str>, deadline: Option<Instant>) -> Result<Pr> {
     let mut cmd = Command::new("gh");
-    cmd.args(["pr", "view", &args.pr, "--json"]).arg(
+    cmd.args(["pr", "view", pr, "--json"]).arg(
         "number,title,body,url,headRefName,baseRefName,headRefOid,baseRefOid,state,mergeCommit",
     );
-    if let Some(repo) = &args.repo {
+    if let Some(repo) = repo {
         cmd.args(["--repo", repo]);
     }
-    let out = cmd.stdin(Stdio::null()).output().context("cannot run gh")?;
+    let out = output(&mut cmd, deadline).context("cannot run gh")?;
     if !out.status.success() {
         bail!(
-            "gh pr view {}: {}",
-            args.pr,
+            "gh pr view {pr}: {}",
             String::from_utf8_lossy(&out.stderr).trim()
         );
     }
@@ -300,19 +661,23 @@ fn commit<'a>(oid: &'a str, field: &str) -> Result<&'a str> {
 }
 
 /// Fetches the PR head and its base branch from the PR's repository when a commit is missing.
-fn ensure_commits(pr: &Pr, revs: &[&str]) -> Result<()> {
-    let missing = |rev: &str| git(&["cat-file", "-e", &format!("{rev}^{{commit}}")]).is_err();
+fn ensure_commits(pr: &Pr, revs: &[&str], deadline: Option<Instant>) -> Result<()> {
+    let missing =
+        |rev: &str| git(&["cat-file", "-e", &format!("{rev}^{{commit}}")], deadline).is_err();
     if !revs.iter().any(|r| missing(r)) {
         return Ok(());
     }
-    git(&[
-        "fetch",
-        "--quiet",
-        "--no-tags",
-        repo_url(&pr.url)?,
-        &format!("refs/pull/{}/head", pr.number),
-        &format!("refs/heads/{}", pr.base_ref_name),
-    ])
+    git(
+        &[
+            "fetch",
+            "--quiet",
+            "--no-tags",
+            repo_url(&pr.url)?,
+            &format!("refs/pull/{}/head", pr.number),
+            &format!("refs/heads/{}", pr.base_ref_name),
+        ],
+        deadline,
+    )
     .context("cannot fetch the PR")?;
     match revs.iter().find(|r| missing(r)) {
         Some(rev) => bail!(
@@ -332,12 +697,8 @@ fn state_home() -> Result<PathBuf> {
     }
 }
 
-fn version(bin: &str) -> Option<String> {
-    let out = Command::new(bin)
-        .arg("--version")
-        .stdin(Stdio::null())
-        .output()
-        .ok()?;
+fn version(bin: &str, deadline: Option<Instant>) -> Option<String> {
+    let out = output(Command::new(bin).arg("--version"), deadline).ok()?;
     let v = String::from_utf8_lossy(&out.stdout)
         .lines()
         .next()?
@@ -346,18 +707,16 @@ fn version(bin: &str) -> Option<String> {
     (out.status.success() && !v.is_empty()).then_some(v)
 }
 
-/// Git in the current repository.
-fn git(args: &[&str]) -> Result<String> {
-    Ok(String::from_utf8_lossy(&git_raw(args)?).trim().into())
+/// Git in the current repository, stopped at `deadline`.
+fn git(args: &[&str], deadline: Option<Instant>) -> Result<String> {
+    Ok(String::from_utf8_lossy(&git_raw(args, deadline)?)
+        .trim()
+        .into())
 }
 
 /// Git's stdout as it is.
-fn git_raw(args: &[&str]) -> Result<Vec<u8>> {
-    let out = Command::new("git")
-        .args(args)
-        .stdin(Stdio::null())
-        .output()
-        .context("cannot run git")?;
+fn git_raw(args: &[&str], deadline: Option<Instant>) -> Result<Vec<u8>> {
+    let out = output(Command::new("git").args(args), deadline).context("cannot run git")?;
     if !out.status.success() {
         bail!(
             "git {}: {}",
@@ -366,6 +725,55 @@ fn git_raw(args: &[&str]) -> Result<Vec<u8>> {
         );
     }
     Ok(out.stdout)
+}
+
+/// Runs `cmd` to its end with no stdin. With a deadline (the review's budget), it runs in its
+/// own process group, which is killed at the deadline; past the deadline it does not start.
+fn output(cmd: &mut Command, deadline: Option<Instant>) -> Result<Output> {
+    cmd.stdin(Stdio::null());
+    let Some(deadline) = deadline else {
+        return Ok(cmd.output()?);
+    };
+    let program = cmd.get_program().to_string_lossy().into_owned();
+    let spent = || anyhow!("the review's budget ran out while preparing ({program})");
+    if Instant::now() >= deadline {
+        return Err(spent());
+    }
+    let mut child = cmd
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .process_group(0)
+        .spawn()?;
+    // Reader threads, so a full pipe cannot stall the child while we wait on it.
+    fn read(pipe: Option<impl Read + Send + 'static>) -> JoinHandle<Vec<u8>> {
+        std::thread::spawn(move || {
+            let mut buf = vec![];
+            if let Some(mut pipe) = pipe {
+                let _ = pipe.read_to_end(&mut buf);
+            }
+            buf
+        })
+    }
+    let (stdout, stderr) = (read(child.stdout.take()), read(child.stderr.take()));
+    loop {
+        // A descendant can hold the pipes after the leader exits, so the drain is under the
+        // deadline too: done only when the leader has exited and both pipes reached EOF.
+        if let Some(status) = child.try_wait()?
+            && stdout.is_finished()
+            && stderr.is_finished()
+        {
+            return Ok(Output {
+                status,
+                stdout: stdout.join().unwrap_or_default(),
+                stderr: stderr.join().unwrap_or_default(),
+            });
+        }
+        if Instant::now() >= deadline {
+            launch::kill_group(&mut child);
+            return Err(spent());
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
 }
 
 #[cfg(test)]

@@ -5,7 +5,7 @@ use std::fs::{self, File};
 use std::io::{ErrorKind, Write};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
-use std::process::{Command, ExitStatus, Stdio};
+use std::process::{Child, Command, ExitStatus, Stdio};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
@@ -49,12 +49,7 @@ impl Launch {
                 return Ok(status);
             }
             if started.elapsed() >= timeout {
-                let _ = Command::new("kill")
-                    .args(["-KILL", "--", &format!("-{}", child.id())])
-                    .stderr(Stdio::null())
-                    .status();
-                let _ = child.kill();
-                let _ = child.wait();
+                kill_group(&mut child);
                 return Err(TimedOut(format!(
                     "{} timed out after {}s",
                     self.program,
@@ -65,6 +60,16 @@ impl Launch {
             std::thread::sleep(Duration::from_millis(100));
         }
     }
+}
+
+/// Kills `child`, which leads its own process group, and everything it started.
+pub fn kill_group(child: &mut Child) {
+    let _ = Command::new("kill")
+        .args(["-KILL", "--", &format!("-{}", child.id())])
+        .stderr(Stdio::null())
+        .status();
+    let _ = child.kill();
+    let _ = child.wait();
 }
 
 /// A launch killed at its timeout; callers tell it from other failures to give a wrap-up turn.
@@ -124,20 +129,23 @@ pub fn claude(worktree: &Path, git_common_dir: &Path, runroot: &Path) -> Result<
     })
 }
 
-/// `codex exec --json -s read-only -C <worktree> -o <runroot>/out/<out_name> -` with
+/// `codex exec --json -s read-only -C <worktree> -o <runroot>/replies/<out_name> -` with
 /// `CODEX_HOME=<runroot>/codex-home`, a fresh dir holding only a symlink to `user_auth`, so
 /// Codex loads none of the user's config or AGENTS.md. The prompt goes on stdin; stdout is
 /// Codex's JSONL event log (the commands it ran and their output), the last message goes to `-o`.
 /// Not `--ephemeral`: the wrap-up resumes the session, which then lives in that run-scoped home.
+/// The reply goes outside `out/`: a Claude reviewer may write there and could plant a symlink
+/// that Codex, writing unsandboxed, would follow.
 pub fn codex(worktree: &Path, runroot: &Path, out_name: &str, user_auth: &Path) -> Result<Launch> {
     let worktree = absolute(worktree)?;
     let user_auth = absolute(user_auth).context("Codex login (auth.json) not found")?;
-    fs::create_dir_all(runroot.join("out")).with_context(|| format!("{}", runroot.display()))?;
+    fs::create_dir_all(runroot.join("replies"))
+        .with_context(|| format!("{}", runroot.display()))?;
     let runroot = absolute(runroot)?;
     let home = runroot.join("codex-home");
     fs::create_dir_all(&home).with_context(|| format!("{}", home.display()))?;
     let link = home.join("auth.json");
-    // Several passes of one run share the home; the link may already be there.
+    // A wrap-up or retry turn reuses the pass's home; the link may already be there.
     match fs::read_link(&link) {
         Ok(target) if target == user_auth => {}
         Ok(target) => bail!(
@@ -160,7 +168,7 @@ pub fn codex(worktree: &Path, runroot: &Path, out_name: &str, user_auth: &Path) 
             "-C",
             utf8(&worktree)?,
             "-o",
-            utf8(&runroot.join("out").join(out_name))?,
+            utf8(&runroot.join("replies").join(out_name))?,
             "-",
         ]
         .map(String::from)
@@ -293,7 +301,7 @@ mod tests {
                 "-C",
                 wt.to_str().unwrap(),
                 "-o",
-                root.join("run/out/security.json").to_str().unwrap(),
+                root.join("run/replies/security.json").to_str().unwrap(),
                 "-"
             ]
         );

@@ -1,5 +1,5 @@
-//! `rreview <pr> --only reliability` against fake `gh`, `claude` and `codex`
-//! (tests/fixtures/bin) on a fixture repository built in a temp dir.
+//! `rreview <pr>` (the full pipeline, and `--only reliability`) against fake `gh`, `claude` and
+//! `codex` (tests/fixtures/bin) on a fixture repository built in a temp dir.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -108,11 +108,32 @@ impl Fixture {
             .join(format!("state/rreview/acme/widget/7-{}", self.head))
     }
 
+    /// `rreview 7 --only reliability <args>`.
     fn run(&self, args: &[&str], scenario: &[(&str, String)]) -> Run {
-        self.run_pr(&self.pr(), args, scenario)
+        let args: Vec<_> = ["7", "--only", "reliability"]
+            .iter()
+            .chain(args)
+            .copied()
+            .collect();
+        self.rreview(&self.pr(), &args, scenario)
     }
 
     fn run_pr(&self, pr: &Value, args: &[&str], scenario: &[(&str, String)]) -> Run {
+        let args: Vec<_> = ["7", "--only", "reliability"]
+            .iter()
+            .chain(args)
+            .copied()
+            .collect();
+        self.rreview(pr, &args, scenario)
+    }
+
+    /// `rreview 7 <args>`: the full pipeline.
+    fn full(&self, args: &[&str], scenario: &[(&str, String)]) -> Run {
+        let args: Vec<_> = ["7"].iter().chain(args).copied().collect();
+        self.rreview(&self.pr(), &args, scenario)
+    }
+
+    fn rreview(&self, pr: &Value, args: &[&str], scenario: &[(&str, String)]) -> Run {
         let (bin, codex_home) = (self.root.join("bin"), self.root.join("codex"));
         if !bin.exists() {
             fs::create_dir_all(&bin).unwrap();
@@ -124,7 +145,6 @@ impl Fixture {
             }
         }
         let out = Command::new(env!("CARGO_BIN_EXE_rreview"))
-            .args(["7", "--only", "reliability"])
             .args(args)
             .current_dir(&self.clone)
             .env("PATH", format!("{}:/usr/bin:/bin", bin.display()))
@@ -146,6 +166,25 @@ impl Fixture {
             log: read("log"),
             prompt: read("log.prompt"),
         }
+    }
+
+    fn prompt_of(&self, role: &str) -> String {
+        fs::read_to_string(self.root.join(format!("log.prompt.{role}"))).unwrap_or_default()
+    }
+
+    fn result(&self) -> Option<Value> {
+        fs::read_to_string(self.runroot().join("result.json"))
+            .ok()
+            .map(|s| serde_json::from_str(&s).unwrap())
+    }
+
+    /// Each role's statuses in progress.jsonl, in order.
+    fn statuses_of(&self, role: &str) -> Vec<String> {
+        self.progress()
+            .iter()
+            .filter(|e| e["role"] == role)
+            .map(|e| e["status"].as_str().unwrap().to_string())
+            .collect()
     }
 
     fn progress(&self) -> Vec<Value> {
@@ -230,7 +269,7 @@ fn claude_pass_end_to_end() {
     assert_eq!(fx.out(), Some(env));
     let runroot = fx.runroot();
     assert!(
-        run.stdout.contains("reliability (claude): 1 candidates"),
+        run.stderr.contains("reliability (claude): 1 candidates"),
         "{run:?}"
     );
     let meta: Value =
@@ -262,7 +301,7 @@ fn claude_pass_end_to_end() {
     }
 
     // Launched through the builder, in the review worktree, with a session id for a wrap-up.
-    let settings = runroot.join("claude-settings.json");
+    let settings = runroot.join("scratch/reliability/claude-settings.json");
     assert!(
         run.log.contains(&format!(
             "claude -p --safe-mode --settings {} --output-format json --session-id ",
@@ -310,8 +349,10 @@ fn codex_pass_with_repo_and_kept_worktree() {
         run.log.contains(&format!(
             "codex exec --json -s read-only -C {} -o {} - CODEX_HOME={}",
             runroot.join("wt").display(),
-            runroot.join("out/reliability.reply.txt").display(),
-            runroot.join("codex-home").display()
+            runroot
+                .join("scratch/reliability/replies/reply.txt")
+                .display(),
+            runroot.join("scratch/reliability/codex-home").display()
         )),
         "{run:?}"
     );
@@ -351,7 +392,8 @@ fn merged_pr_is_reviewed_against_the_base_before_its_merge() {
 }
 
 /// Every way a reply can be wrong fails the pass, leaves no `out/reliability.json` (not even
-/// one the reviewer wrote there itself), and removes the worktree.
+/// one the reviewer wrote there itself), and removes the worktree. A reply that does not
+/// validate gets one retry turn first (the fake repeats itself); a failed CLI does not.
 #[test]
 fn bad_replies_fail_the_pass() {
     let mut unknown = envelope("src/lib.rs");
@@ -422,11 +464,15 @@ fn bad_replies_fail_the_pass() {
             claude_says(&second_bad.to_string()),
             "candidate 2",
         ),
-        ("no json", claude_says("I found nothing."), "no JSON object"),
+        (
+            "no json",
+            claude_says("I found nothing."),
+            "no JSON in the reply",
+        ),
         (
             "positional candidate",
             claude_says(&positional.to_string()),
-            "candidate 1 is not a JSON object",
+            "/candidates[0] is not a JSON object",
         ),
         (
             "forged out file",
@@ -435,7 +481,7 @@ fn bad_replies_fail_the_pass() {
                 ("FAKE_FORGED", envelope("src/lib.rs").to_string()),
                 ("FAKE_STDOUT", claude_result("not json")),
             ],
-            "no JSON object",
+            "no JSON in the reply",
         ),
         (
             "claude error",
@@ -470,8 +516,17 @@ fn bad_replies_fail_the_pass() {
             run.stderr.contains(want),
             "{name}: want {want:?} in {run:?}"
         );
-        assert_eq!(fx.statuses(), ["started", "failed"], "{name}");
-        let failed = &fx.progress()[1];
+        let retried = !name.contains("claude");
+        let want_statuses: &[&str] = if retried {
+            &["started", "retry", "failed"]
+        } else {
+            &["started", "failed"]
+        };
+        assert_eq!(fx.statuses(), want_statuses, "{name}");
+        if retried {
+            assert!(run.stderr.contains("; retry: "), "{name}: {run:?}");
+        }
+        let failed = fx.progress().pop().unwrap();
         assert!(
             failed["error"].as_str().unwrap().contains(want),
             "{name}: {failed}"
@@ -560,14 +615,20 @@ fn a_timed_out_pass_is_resumed_for_its_wrap_up() {
                 .unwrap();
             format!(
                 "claude -p --safe-mode --settings {} --output-format json --resume {id}\n",
-                fx.runroot().join("claude-settings.json").display()
+                fx.runroot()
+                    .join("scratch/reliability/claude-settings.json")
+                    .display()
             )
         } else {
             format!(
                 "codex exec --json -s read-only -C {} -o {} resume fake-thread - CODEX_HOME={}\n",
                 fx.runroot().join("wt").display(),
-                fx.runroot().join("out/reliability.reply.txt").display(),
-                fx.runroot().join("codex-home").display()
+                fx.runroot()
+                    .join("scratch/reliability/replies/reply.txt")
+                    .display(),
+                fx.runroot()
+                    .join("scratch/reliability/codex-home")
+                    .display()
             )
         };
         assert!(run.log.contains(&resumed), "want {resumed:?} in {run:?}");
@@ -621,13 +682,13 @@ fn live_reliability_pass_on_a_merged_pr() {
         .env("XDG_STATE_HOME", &state)
         .output()
         .unwrap();
-    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
         out.status.success(),
-        "{stdout}\n{}",
-        String::from_utf8_lossy(&out.stderr)
+        "{}\n{stderr}",
+        String::from_utf8_lossy(&out.stdout)
     );
-    let runroot = stdout
+    let runroot = stderr
         .lines()
         .find_map(|l| l.strip_prefix("run dir: "))
         .unwrap();
@@ -676,9 +737,10 @@ fn the_largest_timeout_does_not_overflow() {
     assert_eq!(fx.statuses(), ["started", "completed"]);
 }
 
-/// The reviewer may write into out/; a symlink it plants there must be replaced, not followed.
+/// A symlink the reviewer plants in the one dir it may write (its scratch out/) is never
+/// followed: the host publishes into its own out/.
 #[test]
-fn a_planted_out_symlink_is_replaced_not_followed() {
+fn a_planted_out_symlink_is_not_followed() {
     let fx = fixture();
     let victim = fx.root.join("log.victim");
     fs::write(&victim, "victim\n").unwrap();
@@ -692,7 +754,836 @@ fn a_planted_out_symlink_is_replaced_not_followed() {
     );
     assert_eq!(run.code, Some(0), "{run:?}");
     assert_eq!(fs::read_to_string(&victim).unwrap(), "victim\n");
+    let planted = fx
+        .runroot()
+        .join("scratch/reliability/out/reliability.json");
+    assert!(
+        fs::symlink_metadata(&planted)
+            .unwrap()
+            .file_type()
+            .is_symlink()
+    );
     let out = fx.runroot().join("out/reliability.json");
     assert!(fs::symlink_metadata(&out).unwrap().file_type().is_file());
     assert_eq!(fx.out(), Some(env));
+}
+
+// The full pipeline. Default agents: intent_contracts codex, reliability claude, security
+// codex, coordinator claude, judge codex.
+
+fn panel_envelope(name: &str, title: &str) -> Value {
+    let mut env = envelope("src/lib.rs");
+    env["panelist"] = name.into();
+    env["candidates"][0]["title"] = title.into();
+    env
+}
+
+/// A coordinator finding covering the panel candidates `ids`.
+fn review_finding(title: &str, priority: u8, confidence: f64, ids: &[&str]) -> Value {
+    json!({"title": format!("[P{priority}] {title}"), "body": "Because.", "priority": priority,
+        "confidence_score": confidence, "candidate_ids": ids,
+        "code_location": {"absolute_file_path": "src/lib.rs", "line_range": {"start": 1, "end": 1}}})
+}
+
+/// A judge restoration of the dropped candidate `id`.
+fn restored(id: &str, title: &str, priority: u8, confidence: f64) -> Value {
+    let mut f = review_finding(title, priority, confidence, &[]);
+    let f = f.as_object_mut().unwrap();
+    f.remove("candidate_ids");
+    f.insert("candidate_id".into(), id.into());
+    json!(f)
+}
+
+fn dropped(id: &str) -> Value {
+    json!({"candidate_id": id, "drop_reason": "disproved", "evidence": "src/lib.rs:1 guards it"})
+}
+
+fn coordinator_review(findings: Vec<Value>, dropped: Vec<Value>) -> Value {
+    json!({"findings": findings, "dropped_candidates": dropped,
+        "overall_correctness": "patch is incorrect", "overall_explanation": "One defect.",
+        "overall_confidence_score": 0.8, "review_process": "Read the diff."})
+}
+
+/// Every pass replies at once: three candidates (`intent_contracts-1` "Overflow",
+/// `reliability-1` "Handle the error", `security-1` "Injection"); the coordinator keeps a P1 and
+/// drops two; the judge restores a P3 one.
+fn pipeline() -> Scenario {
+    let coordinator = coordinator_review(
+        vec![review_finding(
+            "Handle the error",
+            1,
+            0.9,
+            &["reliability-1"],
+        )],
+        vec![dropped("security-1"), dropped("intent_contracts-1")],
+    );
+    vec![
+        ("FAKE_REVIEW", "ok".into()),
+        (
+            "FAKE_OUT_intent_contracts",
+            panel_envelope("Intent & Contracts", "Overflow").to_string(),
+        ),
+        (
+            "FAKE_OUT_reliability",
+            claude_result(
+                &panel_envelope("Reliability & Operations", "Handle the error").to_string(),
+            ),
+        ),
+        (
+            "FAKE_OUT_security",
+            panel_envelope("Security & Trust Boundaries", "Injection").to_string(),
+        ),
+        (
+            "FAKE_OUT_coordinator",
+            claude_result(&coordinator.to_string()),
+        ),
+        (
+            "FAKE_OUT_judge",
+            json!([restored("intent_contracts-1", "Check the overflow", 3, 0.7)]).to_string(),
+        ),
+    ]
+}
+
+fn with(mut scenario: Scenario, extra: &[(&'static str, String)]) -> Scenario {
+    scenario.extend(extra.iter().cloned());
+    scenario
+}
+
+#[test]
+fn full_pipeline_gates_findings_and_writes_result_json() {
+    let fx = fixture();
+    let task = fx.root.join("task.md");
+    fs::write(&task, "AC-SECRET-1: f returns 42\n").unwrap();
+    let run = fx.full(&["--context-file", task.to_str().unwrap()], &pipeline());
+    assert_eq!(run.code, Some(1), "{run:?}");
+
+    let result = fx.result().unwrap();
+    let titles = |key: &str| -> Vec<String> {
+        result[key]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|f| format!("{} {} {}", f["title"], f["priority"], f["stage"]))
+            .collect()
+    };
+    assert_eq!(
+        titles("findings"),
+        ["\"Handle the error\" 1 \"coordinator\""]
+    );
+    assert_eq!(
+        titles("ungated_findings"),
+        [
+            "\"Handle the error\" 1 \"coordinator\"",
+            "\"Check the overflow\" 3 \"judge\""
+        ]
+    );
+    assert_eq!(result["dropped_candidates"].as_array().unwrap().len(), 2);
+    assert_eq!(result["findings"][0]["file"], "src/lib.rs");
+    assert_eq!(result["overall_correctness"], "patch is incorrect");
+    assert_eq!(result["base"], fx.base.as_str());
+    assert_eq!(result["head"], fx.head.as_str());
+    assert_eq!(result["degraded"], false);
+    let passes: Vec<_> = result["passes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|p| format!("{} {} {}", p["role"], p["agent"], p["status"]))
+        .collect();
+    assert_eq!(
+        passes,
+        [
+            "\"intent_contracts\" \"codex\" \"completed\"",
+            "\"reliability\" \"claude\" \"completed\"",
+            "\"security\" \"codex\" \"completed\"",
+            "\"coordinator\" \"claude\" \"completed\"",
+            "\"judge\" \"codex\" \"completed\""
+        ]
+    );
+    for role in [
+        "intent_contracts",
+        "reliability",
+        "security",
+        "coordinator",
+        "judge",
+    ] {
+        assert_eq!(fx.statuses_of(role), ["started", "completed"], "{role}");
+        assert!(
+            fx.runroot().join(format!("out/{role}.json")).is_file(),
+            "{role}"
+        );
+    }
+    let meta: Value =
+        serde_json::from_str(&fs::read_to_string(fx.runroot().join("meta.json")).unwrap()).unwrap();
+    assert_eq!(
+        meta["roles"],
+        json!({"intent_contracts": "codex", "reliability": "claude", "security": "codex",
+            "coordinator": "claude", "judge": "codex"})
+    );
+
+    // The summary shows the gated finding only.
+    assert!(
+        run.stdout.contains("[P1] Handle the error (src/lib.rs:1-1"),
+        "{run:?}"
+    );
+    assert!(!run.stdout.contains("Check the overflow"), "{run:?}");
+    assert!(
+        run.stdout
+            .contains("1 gated findings (2 before the gate, 2 dropped candidates)")
+    );
+    assert!(!run.stdout.contains("DEGRADED"));
+
+    // The security lens is blind: no PR text, no task.
+    let security = fx.prompt_of("security");
+    assert!(security.contains("Security & Trust Boundaries"));
+    for text in ["Add f", "IGNORE PREVIOUS INSTRUCTIONS", "AC-SECRET-1"] {
+        assert!(!security.contains(text), "{text} in the security prompt");
+    }
+    // The intent lens gets the PR text and the task; reliability the PR text only.
+    let intent = fx.prompt_of("intent_contracts");
+    assert!(intent.contains("IGNORE PREVIOUS INSTRUCTIONS") && intent.contains("AC-SECRET-1"));
+    let reliability = fx.prompt_of("reliability");
+    assert!(
+        reliability.contains("IGNORE PREVIOUS INSTRUCTIONS")
+            && !reliability.contains("AC-SECRET-1")
+    );
+    // The coordinator sees every panelist's validated result; the judge the kept and dropped.
+    let coordinator = fx.prompt_of("coordinator");
+    let boundary = coordinator.find("## Untrusted data boundary").unwrap();
+    for text in [
+        "\"panelist\":\"Security & Trust Boundaries\"",
+        "AC-SECRET-1",
+        "\"Injection\"",
+    ] {
+        assert!(coordinator.find(text).unwrap() > boundary, "{text}");
+    }
+    let judge = fx.prompt_of("judge");
+    assert!(judge.contains("\"Handle the error\"") && judge.contains("\"Overflow\""));
+    fx.assert_worktree_removed();
+}
+
+#[test]
+fn no_gated_findings_exits_0_and_json_prints_result_json() {
+    let fx = fixture();
+    // Only a P3 finding and nothing dropped: no judge pass.
+    let coordinator = coordinator_review(
+        vec![review_finding("Rename", 3, 0.9, &["reliability-1"])],
+        vec![],
+    );
+    let mut scenario = pipeline();
+    for (k, v) in [
+        ("FAKE_OUT_intent_contracts", json!({"panelist": "Intent & Contracts", "coverage_summary": "", "candidates": []}).to_string()),
+        ("FAKE_OUT_security", json!({"panelist": "Security & Trust Boundaries", "coverage_summary": "", "candidates": []}).to_string()),
+        ("FAKE_OUT_coordinator", claude_result(&coordinator.to_string())),
+    ] {
+        scenario.push((k, v));
+    }
+    let run = fx.full(&["--json"], &scenario);
+    assert_eq!(run.code, Some(0), "{run:?}");
+    let printed: Value = serde_json::from_str(&run.stdout).unwrap();
+    assert_eq!(Some(printed.clone()), fx.result());
+    assert_eq!(printed["findings"], json!([]));
+    assert_eq!(printed["ungated_findings"].as_array().unwrap().len(), 1);
+    assert!(fx.statuses_of("judge").is_empty());
+
+    // `--all` reports it; `--gate` moves the bar.
+    let fx = fixture();
+    assert_eq!(fx.full(&["--all"], &scenario).code, Some(1));
+    let fx = fixture();
+    assert_eq!(fx.full(&["--gate", "p<=3"], &scenario).code, Some(1));
+    let fx = fixture();
+    let run = fx.full(&["--gate", "p<=3,conf>=0.95"], &scenario);
+    assert_eq!(run.code, Some(0), "{run:?}");
+
+    // `show` prints the latest result of a run dir or a PR.
+    let show = |args: &[&str]| fx.rreview(&fx.pr(), args, &[]);
+    let by_dir = show(&["show", fx.runroot().to_str().unwrap()]);
+    assert_eq!(by_dir.code, Some(0), "{by_dir:?}");
+    assert!(
+        by_dir
+            .stdout
+            .contains("0 gated findings (1 before the gate"),
+        "{by_dir:?}"
+    );
+    let by_pr = show(&["show", "7", "--json"]);
+    assert_eq!(by_pr.code, Some(0), "{by_pr:?}");
+    assert_eq!(
+        serde_json::from_str::<Value>(&by_pr.stdout).ok(),
+        fx.result()
+    );
+}
+
+#[test]
+fn a_failed_panelist_degrades_the_review() {
+    let fx = fixture();
+    // The coordinator covers the lens with a finding of its own, tied to no candidate.
+    let coordinator = coordinator_review(
+        vec![
+            review_finding("Handle the error", 1, 0.9, &["reliability-1"]),
+            review_finding("Sanitize the input", 2, 0.8, &[]),
+        ],
+        vec![dropped("intent_contracts-1")],
+    );
+    let run = fx.full(
+        &[],
+        &with(
+            pipeline(),
+            &[
+                ("FAKE_MODE_security", "crash".into()),
+                (
+                    "FAKE_OUT_coordinator",
+                    claude_result(&coordinator.to_string()),
+                ),
+            ],
+        ),
+    );
+    assert_eq!(run.code, Some(1), "{run:?}");
+    assert!(
+        run.stderr
+            .contains("warning: pass security (codex): codex exit status: 1"),
+        "{run:?}"
+    );
+    let result = fx.result().unwrap();
+    assert_eq!(result["degraded"], true);
+    assert_eq!(result["passes"][2]["status"], "failed");
+    assert_eq!(fx.statuses_of("security"), ["started", "failed"]);
+    assert!(!fx.runroot().join("out/security.json").exists());
+    // The coordinator is told, so it covers the lens.
+    let coordinator = fx.prompt_of("coordinator");
+    assert!(
+        coordinator.contains(r#"{"panelist":"Security & Trust Boundaries","status":"failed","error":"pass security (codex): codex exit status: 1"#),
+        "{coordinator}"
+    );
+    assert!(run.stdout.contains("DEGRADED"), "{run:?}");
+}
+
+#[test]
+fn a_failed_judge_keeps_the_coordinator_findings_and_degrades() {
+    let fx = fixture();
+    let run = fx.full(
+        &[],
+        &with(pipeline(), &[("FAKE_OUT_judge", "not an array".into())]),
+    );
+    assert_eq!(run.code, Some(1), "{run:?}");
+    assert!(
+        run.stderr.contains("the coordinator's findings stand"),
+        "{run:?}"
+    );
+    let result = fx.result().unwrap();
+    assert_eq!(result["degraded"], true);
+    assert_eq!(result["ungated_findings"].as_array().unwrap().len(), 1);
+    assert_eq!(fx.statuses_of("judge"), ["started", "retry", "failed"]);
+    assert!(
+        run.stdout
+            .contains("DEGRADED: not every independent pass completed (failed: judge)")
+    );
+}
+
+#[test]
+fn a_failed_coordinator_fails_the_review() {
+    let fx = fixture();
+    let run = fx.full(
+        &[],
+        &with(pipeline(), &[("FAKE_MODE_coordinator", "crash".into())]),
+    );
+    assert_eq!(run.code, Some(2), "{run:?}");
+    assert!(
+        run.stderr
+            .contains("error: pass coordinator (claude): claude"),
+        "{run:?}"
+    );
+    assert_eq!(fx.result(), None);
+    assert_eq!(fx.statuses_of("coordinator"), ["started", "failed"]);
+    assert!(fx.statuses_of("judge").is_empty());
+    fx.assert_worktree_removed();
+
+    // A review that leaves a candidate unaccounted for fails too, after its retry.
+    let fx = fixture();
+    let short = coordinator_review(
+        vec![review_finding(
+            "Handle the error",
+            1,
+            0.9,
+            &["reliability-1"],
+        )],
+        vec![],
+    );
+    let run = fx.full(
+        &[],
+        &with(
+            pipeline(),
+            &[("FAKE_OUT_coordinator", claude_result(&short.to_string()))],
+        ),
+    );
+    assert_eq!(run.code, Some(2), "{run:?}");
+    assert!(
+        run.stderr
+            .contains("candidate intent_contracts-1 has no disposition"),
+        "{run:?}"
+    );
+    assert_eq!(
+        fx.statuses_of("coordinator"),
+        ["started", "retry", "failed"]
+    );
+
+    // The right count with one id repeated: two candidates vanish (review finding 1).
+    let fx = fixture();
+    let repeated = coordinator_review(
+        vec![],
+        vec![
+            dropped("security-1"),
+            dropped("security-1"),
+            dropped("security-1"),
+        ],
+    );
+    let run = fx.full(
+        &[],
+        &with(
+            pipeline(),
+            &[("FAKE_OUT_coordinator", claude_result(&repeated.to_string()))],
+        ),
+    );
+    assert_eq!(run.code, Some(2), "{run:?}");
+    assert!(
+        run.stderr
+            .contains("candidate security-1 has more than one disposition"),
+        "{run:?}"
+    );
+    assert_eq!(fx.result(), None);
+
+    // The review wrapped in an array (review finding 3).
+    let fx = fixture();
+    let wrapped = json!([coordinator_review(
+        vec![review_finding(
+            "Handle the error",
+            1,
+            0.9,
+            &["reliability-1"]
+        )],
+        vec![dropped("security-1"), dropped("intent_contracts-1")],
+    )]);
+    let run = fx.full(
+        &[],
+        &with(
+            pipeline(),
+            &[("FAKE_OUT_coordinator", claude_result(&wrapped.to_string()))],
+        ),
+    );
+    assert_eq!(run.code, Some(2), "{run:?}");
+    assert!(
+        run.stderr.contains("the reply is not a JSON object"),
+        "{run:?}"
+    );
+}
+
+/// A judge finding that restores no dropped candidate, or a judge reply of another shape, is
+/// rejected (review findings 2, 3): the coordinator's findings stand and the run is degraded.
+#[test]
+fn the_judge_restores_only_dropped_candidates() {
+    for (name, reply, want) in [
+        (
+            "new finding",
+            json!([restored("reliability-9", "Invent a P1", 1, 0.95)]).to_string(),
+            "\"reliability-9\" is not a dropped candidate's id",
+        ),
+        (
+            "kept candidate",
+            json!([restored("reliability-1", "Restore a kept one", 1, 0.95)]).to_string(),
+            "\"reliability-1\" is not a dropped candidate's id",
+        ),
+        (
+            "wrapped",
+            json!({"unexpected": [restored("intent_contracts-1", "Check", 1, 0.95)]}).to_string(),
+            "the reply is not a JSON array",
+        ),
+    ] {
+        let fx = fixture();
+        let run = fx.full(&[], &with(pipeline(), &[("FAKE_OUT_judge", reply)]));
+        assert_eq!(run.code, Some(1), "{name}: {run:?}");
+        assert!(
+            run.stderr.contains(want),
+            "{name}: want {want:?} in {run:?}"
+        );
+        let result = fx.result().unwrap();
+        assert_eq!(result["degraded"], true, "{name}");
+        assert_eq!(
+            result["ungated_findings"].as_array().unwrap().len(),
+            1,
+            "{name}"
+        );
+        assert_eq!(
+            fx.statuses_of("judge"),
+            ["started", "retry", "failed"],
+            "{name}"
+        );
+    }
+}
+
+/// A Codex turn that exits 0 without a final message gets the one retry (review finding 4).
+#[test]
+fn a_codex_turn_without_a_final_message_is_retried() {
+    let fx = fixture();
+    let judge = json!([restored("intent_contracts-1", "Check the overflow", 3, 0.7)]).to_string();
+    let run = fx.full(
+        &[],
+        &with(
+            pipeline(),
+            &[
+                ("FAKE_MODE_judge", "no-reply".into()),
+                ("FAKE_RESUME_judge", judge),
+            ],
+        ),
+    );
+    assert_eq!(run.code, Some(1), "{run:?}");
+    assert_eq!(fx.statuses_of("judge"), ["started", "retry", "completed"]);
+    let retry = fx
+        .progress()
+        .into_iter()
+        .find(|e| e["status"] == "retry")
+        .unwrap();
+    assert!(
+        retry["error"]
+            .as_str()
+            .unwrap()
+            .contains("the reply is empty"),
+        "{retry}"
+    );
+    let result = fx.result().unwrap();
+    assert_eq!(result["degraded"], false);
+    assert_eq!(result["ungated_findings"].as_array().unwrap().len(), 2);
+
+    // A nonzero exit still fails at once.
+    let fx = fixture();
+    let run = fx.full(
+        &[],
+        &with(pipeline(), &[("FAKE_MODE_judge", "crash".into())]),
+    );
+    assert_eq!(fx.statuses_of("judge"), ["started", "failed"], "{run:?}");
+}
+
+/// The budget stops a stalled preparation step (review finding 5): no checkout, no pass.
+#[test]
+fn the_budget_covers_preparation() {
+    let fx = fixture();
+    let started = Instant::now();
+    let run = fx.full(
+        &["--budget", "1"],
+        &with(pipeline(), &[("FAKE_GH_DELAY", "5".into())]),
+    );
+    let took = started.elapsed();
+    assert_eq!(run.code, Some(2), "{run:?}");
+    assert!(took < Duration::from_millis(2500), "took {took:?}: {run:?}");
+    assert!(
+        run.stderr
+            .contains("the review's budget ran out while preparing (gh)"),
+        "{run:?}"
+    );
+    assert!(!fx.runroot().exists(), "{run:?}");
+    // The fake gh's `sleep` was killed with it.
+    assert_dead(&fx, 1);
+}
+
+/// The budget also covers draining a preparation step's output: a gh that exits while its child
+/// still holds the pipes is stopped at the deadline, and the child is killed with it.
+#[test]
+fn the_budget_covers_draining_preparation_output() {
+    let fx = fixture();
+    let started = Instant::now();
+    let run = fx.full(
+        &["--budget", "1"],
+        &with(pipeline(), &[("FAKE_GH_LINGER", "5".into())]),
+    );
+    let took = started.elapsed();
+    assert_eq!(run.code, Some(2), "{run:?}");
+    assert!(took < Duration::from_millis(2500), "took {took:?}: {run:?}");
+    assert!(
+        run.stderr
+            .contains("the review's budget ran out while preparing (gh)"),
+        "{run:?}"
+    );
+    assert!(!fx.runroot().exists(), "{run:?}");
+    assert_dead(&fx, 1);
+}
+
+/// Each pass writes only into its own scratch dir; validated replies live in the host's out/
+/// (review finding 8). A later pass's writable dir holds no earlier pass's artifact.
+#[test]
+fn passes_get_their_own_scratch_and_cannot_reach_published_replies() {
+    let fx = fixture();
+    let run = fx.full(
+        &[],
+        &with(
+            pipeline(),
+            &[
+                ("FAKE_MODE_coordinator", "forge".into()),
+                ("FAKE_FORGED", "forged".into()),
+            ],
+        ),
+    );
+    assert_eq!(run.code, Some(1), "{run:?}");
+    let runroot = fx.runroot();
+    for role in ["reliability", "coordinator"] {
+        let dir = runroot.join("scratch").join(role);
+        let s: Value =
+            serde_json::from_str(&fs::read_to_string(dir.join("claude-settings.json")).unwrap())
+                .unwrap();
+        assert_eq!(
+            s["sandbox"]["filesystem"]["allowWrite"],
+            json!([dir.join("out")]),
+            "{role}"
+        );
+        assert!(
+            run.log.contains(&format!(
+                "--settings {} ",
+                dir.join("claude-settings.json").display()
+            )),
+            "{role}: {run:?}"
+        );
+    }
+    for role in ["intent_contracts", "security", "judge"] {
+        let dir = runroot.join("scratch").join(role);
+        assert!(
+            run.log.contains(&format!(
+                "-o {} - CODEX_HOME={}",
+                dir.join("replies/reply.txt").display(),
+                dir.join("codex-home").display()
+            )),
+            "{role}: {run:?}"
+        );
+    }
+    // The coordinator wrote where it may; the panel's published replies are untouched.
+    assert_eq!(
+        fs::read_to_string(runroot.join("scratch/coordinator/out/coordinator.json")).unwrap(),
+        "forged"
+    );
+    let published: Value =
+        serde_json::from_str(&fs::read_to_string(runroot.join("out/reliability.json")).unwrap())
+            .unwrap();
+    assert_eq!(published["panelist"], "Reliability & Operations");
+    let coordinator: Value =
+        serde_json::from_str(&fs::read_to_string(runroot.join("out/coordinator.json")).unwrap())
+            .unwrap();
+    assert_eq!(
+        coordinator["findings"][0]["candidate_ids"],
+        json!(["reliability-1"])
+    );
+}
+
+#[test]
+fn an_invalid_reply_gets_one_retry_turn() {
+    let fx = fixture();
+    let good = fx_coordinator_reply();
+    let run = fx.full(
+        &[],
+        &with(
+            pipeline(),
+            &[
+                ("FAKE_OUT_coordinator", claude_result("Looks fine to me.")),
+                ("FAKE_RESUME_coordinator", good),
+                ("FAKE_OUT_intent_contracts", "{\"panelist\": }".into()),
+                (
+                    "FAKE_RESUME_intent_contracts",
+                    panel_envelope("Intent & Contracts", "Overflow").to_string(),
+                ),
+            ],
+        ),
+    );
+    assert_eq!(run.code, Some(1), "{run:?}");
+    assert_eq!(
+        fx.statuses_of("coordinator"),
+        ["started", "retry", "completed"]
+    );
+    assert_eq!(
+        fx.statuses_of("intent_contracts"),
+        ["started", "retry", "completed"]
+    );
+    let retry = fx
+        .progress()
+        .into_iter()
+        .find(|e| e["status"] == "retry" && e["role"] == "coordinator")
+        .unwrap();
+    assert!(
+        retry["error"]
+            .as_str()
+            .unwrap()
+            .contains("no JSON in the reply"),
+        "{retry}"
+    );
+    // The retry resumes the session and says why.
+    let coordinator = fx.prompt_of("coordinator");
+    assert!(
+        coordinator.contains("Your reply was rejected.")
+            && coordinator.contains("no JSON in the reply"),
+        "{coordinator}"
+    );
+    assert!(run.log.contains(" --resume "), "{run:?}");
+    assert!(run.log.contains("resume fake-thread -"), "{run:?}");
+    let logs = fx.runroot().join("logs");
+    for log in [
+        "coordinator.stdout",
+        "coordinator-turn2.stdout",
+        "intent_contracts-turn2.stdout",
+    ] {
+        assert!(logs.join(log).is_file(), "{log}");
+    }
+    assert_eq!(fx.result().unwrap()["degraded"], false);
+}
+
+fn fx_coordinator_reply() -> String {
+    pipeline()
+        .into_iter()
+        .find(|(k, _)| *k == "FAKE_OUT_coordinator")
+        .unwrap()
+        .1
+}
+
+#[test]
+fn a_coordinator_that_times_out_gets_a_wrap_up() {
+    let fx = fixture();
+    let run = fx.full(
+        &["--timeout", "1"],
+        &with(pipeline(), &[("FAKE_MODE_coordinator", "hang-once".into())]),
+    );
+    assert_eq!(run.code, Some(1), "{run:?}");
+    assert_eq!(
+        fx.statuses_of("coordinator"),
+        ["started", "wrapup", "completed"]
+    );
+    assert!(fx.prompt_of("coordinator").contains("Time is up."));
+    assert_dead(&fx, 1);
+}
+
+#[test]
+fn the_budget_caps_every_pass() {
+    let fx = fixture();
+    let started = Instant::now();
+    let run = fx.full(
+        &["--budget", "2"],
+        &with(pipeline(), &[("FAKE_MODE_coordinator", "hang".into())]),
+    );
+    assert!(started.elapsed() < Duration::from_secs(15), "{run:?}");
+    assert_eq!(run.code, Some(2), "{run:?}");
+    assert!(
+        run.stderr
+            .contains("error: pass coordinator (claude): claude timed out after"),
+        "{run:?}"
+    );
+    assert!(
+        run.stderr.contains("no budget left for a wrap-up"),
+        "{run:?}"
+    );
+    assert_dead(&fx, 1);
+}
+
+#[test]
+fn coordinator_and_judge_never_share_a_family() {
+    for args in [
+        &["--role-agent", "judge=claude"][..],
+        &["--role-agent", "coordinator=codex"],
+        &["--author", "codex", "--role-agent", "judge=codex"],
+    ] {
+        let fx = fixture();
+        let run = fx.full(args, &pipeline());
+        assert_eq!(run.code, Some(2), "{args:?}: {run:?}");
+        assert!(
+            run.stderr.contains("must not share a model family"),
+            "{run:?}"
+        );
+        assert!(
+            !run.log.contains("gh pr view"),
+            "checked before any work: {run:?}"
+        );
+    }
+
+    // `--author codex` flips every default.
+    let fx = fixture();
+    let mut scenario = pipeline();
+    for (k, v) in scenario.iter_mut() {
+        if k.starts_with("FAKE_OUT_") {
+            let message = match *k {
+                "FAKE_OUT_reliability" | "FAKE_OUT_coordinator" => serde_json::from_str::<Value>(v)
+                    .unwrap()["result"]
+                    .as_str()
+                    .unwrap()
+                    .to_string(),
+                _ => v.clone(),
+            };
+            *v = match *k {
+                "FAKE_OUT_reliability" | "FAKE_OUT_coordinator" => message,
+                _ => claude_result(&message),
+            };
+        }
+    }
+    let run = fx.full(&["--author", "codex"], &scenario);
+    assert_eq!(run.code, Some(1), "{run:?}");
+    let meta: Value =
+        serde_json::from_str(&fs::read_to_string(fx.runroot().join("meta.json")).unwrap()).unwrap();
+    assert_eq!(
+        meta["roles"],
+        json!({"intent_contracts": "claude", "reliability": "codex", "security": "claude",
+            "coordinator": "codex", "judge": "claude"})
+    );
+}
+
+#[test]
+fn role_models_and_efforts_reach_the_cli() {
+    let fx = fixture();
+    let run = fx.full(
+        &[
+            "--role-model",
+            "coordinator=opus",
+            "--role-effort",
+            "coordinator=max",
+            "--role-model",
+            "judge=gpt-5.5",
+            "--role-effort",
+            "judge=minimal",
+        ],
+        &pipeline(),
+    );
+    assert_eq!(run.code, Some(1), "{run:?}");
+    assert!(
+        run.log
+            .contains("--output-format json --model opus --effort max --session-id "),
+        "{run:?}"
+    );
+    assert!(
+        run.log
+            .contains("-m gpt-5.5 -c model_reasoning_effort=minimal - CODEX_HOME="),
+        "{run:?}"
+    );
+    let coordinator = fx
+        .progress()
+        .into_iter()
+        .find(|e| e["role"] == "coordinator")
+        .unwrap();
+    assert_eq!(coordinator["model"], "opus");
+    let judge = &fx.result().unwrap()["passes"][4];
+    assert_eq!(
+        (&judge["model"], &judge["effort"]),
+        (&json!("gpt-5.5"), &json!("minimal"))
+    );
+
+    for (args, want) in [
+        (
+            &["--role-effort", "judge=max"][..],
+            "effort \"max\" for judge (codex)",
+        ),
+        (&["--role-model", "judge=--yolo"], "bad model name"),
+        (
+            &["--role-agent", "nobody=claude"],
+            "unknown role \"nobody\"",
+        ),
+        (&["--gate", "p<=9"], "the priority is 0-3"),
+        (&["--budget", "0"], "--budget"),
+        (&["--all", "--gate", "p<=1"], "cannot be used with"),
+    ] {
+        let fx = fixture();
+        let run = fx.full(args, &pipeline());
+        assert_eq!(run.code, Some(2), "{args:?}: {run:?}");
+        assert!(
+            run.stderr.contains(want),
+            "{args:?}: want {want:?} in {run:?}"
+        );
+        assert!(!run.log.contains("gh pr view"), "{run:?}");
+    }
 }
