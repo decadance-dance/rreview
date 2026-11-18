@@ -105,8 +105,14 @@ pub fn claude(worktree: &Path, git_common_dir: &Path, runroot: &Path) -> Result<
         },
         "disableBundledSkills": true
     });
-    fs::write(&settings_path, serde_json::to_string_pretty(&settings)?)
-        .with_context(|| format!("{}", settings_path.display()))?;
+    // Parallel passes of one run rewrite the same file; a rename never shows a half-written one.
+    let tmp = runroot.join(format!(
+        ".claude-settings.{:?}.tmp",
+        std::thread::current().id()
+    ));
+    fs::write(&tmp, serde_json::to_string_pretty(&settings)?)
+        .with_context(|| format!("{}", tmp.display()))?;
+    fs::rename(&tmp, &settings_path).with_context(|| format!("{}", settings_path.display()))?;
     Ok(Launch {
         program: "claude".into(),
         args: [
@@ -124,31 +130,37 @@ pub fn claude(worktree: &Path, git_common_dir: &Path, runroot: &Path) -> Result<
     })
 }
 
-/// `codex exec --json -s read-only -C <worktree> -o <runroot>/out/<out_name> -` with
+/// `codex exec --json -s read-only -C <worktree> -o <runroot>/replies/<out_name> -` with
 /// `CODEX_HOME=<runroot>/codex-home`, a fresh dir holding only a symlink to `user_auth`, so
 /// Codex loads none of the user's config or AGENTS.md. The prompt goes on stdin; stdout is
 /// Codex's JSONL event log (the commands it ran and their output), the last message goes to `-o`.
 /// Not `--ephemeral`: the wrap-up resumes the session, which then lives in that run-scoped home.
+/// The reply goes outside `out/`: a Claude reviewer may write there and could plant a symlink
+/// that Codex, writing unsandboxed, would follow.
 pub fn codex(worktree: &Path, runroot: &Path, out_name: &str, user_auth: &Path) -> Result<Launch> {
     let worktree = absolute(worktree)?;
     let user_auth = absolute(user_auth).context("Codex login (auth.json) not found")?;
-    fs::create_dir_all(runroot.join("out")).with_context(|| format!("{}", runroot.display()))?;
+    fs::create_dir_all(runroot.join("replies"))
+        .with_context(|| format!("{}", runroot.display()))?;
     let runroot = absolute(runroot)?;
     let home = runroot.join("codex-home");
     fs::create_dir_all(&home).with_context(|| format!("{}", home.display()))?;
     let link = home.join("auth.json");
-    // Several passes of one run share the home; the link may already be there.
-    match fs::read_link(&link) {
-        Ok(target) if target == user_auth => {}
-        Ok(target) => bail!(
-            "{} points at {}, not {}",
-            link.display(),
-            target.display(),
-            user_auth.display()
-        ),
-        Err(e) if e.kind() == ErrorKind::NotFound => std::os::unix::fs::symlink(&user_auth, &link)
-            .with_context(|| format!("{}", link.display()))?,
-        Err(e) => return Err(e).with_context(|| format!("{} is not a symlink", link.display())),
+    // Several passes of one run share the home, in parallel: the link may already be there.
+    match std::os::unix::fs::symlink(&user_auth, &link) {
+        Err(e) if e.kind() == ErrorKind::AlreadyExists => match fs::read_link(&link) {
+            Ok(target) if target == user_auth => {}
+            Ok(target) => bail!(
+                "{} points at {}, not {}",
+                link.display(),
+                target.display(),
+                user_auth.display()
+            ),
+            Err(e) => {
+                return Err(e).with_context(|| format!("{} is not a symlink", link.display()));
+            }
+        },
+        r => r.with_context(|| format!("{}", link.display()))?,
     }
     Ok(Launch {
         program: "codex".into(),
@@ -160,7 +172,7 @@ pub fn codex(worktree: &Path, runroot: &Path, out_name: &str, user_auth: &Path) 
             "-C",
             utf8(&worktree)?,
             "-o",
-            utf8(&runroot.join("out").join(out_name))?,
+            utf8(&runroot.join("replies").join(out_name))?,
             "-",
         ]
         .map(String::from)
@@ -293,7 +305,7 @@ mod tests {
                 "-C",
                 wt.to_str().unwrap(),
                 "-o",
-                root.join("run/out/security.json").to_str().unwrap(),
+                root.join("run/replies/security.json").to_str().unwrap(),
                 "-"
             ]
         );

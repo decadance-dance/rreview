@@ -43,6 +43,9 @@ impl std::str::FromStr for Agent {
 pub struct Pass<'a> {
     pub role: &'a str,
     pub agent: Agent,
+    /// The CLI's own default when unset.
+    pub model: Option<&'a str>,
+    pub effort: Option<&'a str>,
     pub prompt: String,
     pub timeout: Duration,
 }
@@ -64,15 +67,20 @@ pub struct Headless {
 
 impl Headless {
     fn launch(&self, pass: &Pass) -> Result<Launch> {
-        match pass.agent {
-            Agent::Claude => launch::claude(&self.worktree, &self.git_common_dir, &self.runroot),
+        let mut launch = match pass.agent {
+            Agent::Claude => launch::claude(&self.worktree, &self.git_common_dir, &self.runroot)?,
             Agent::Codex => launch::codex(
                 &self.worktree,
                 &self.runroot,
                 &reply_name(pass.role),
                 &self.codex_auth,
-            ),
-        }
+            )?,
+        };
+        // Codex's options go before its trailing `-` (the prompt on stdin).
+        let stdin = (pass.agent == Agent::Codex).then(|| launch.args.pop());
+        launch.args.extend(model_args(pass));
+        launch.args.extend(stdin.flatten());
+        Ok(launch)
     }
 
     fn log(&self, pass: &Pass, step: &str) -> Result<PathBuf> {
@@ -91,7 +99,7 @@ impl Headless {
         log: &Path,
         timeout: Duration,
     ) -> Result<String> {
-        let reply = self.runroot.join("out").join(reply_name(pass.role));
+        let reply = self.runroot.join("replies").join(reply_name(pass.role));
         let _ = fs::remove_file(&reply);
         let status = launch.run(prompt, log, timeout)?;
         let stderr = log.with_extension("stderr");
@@ -153,9 +161,34 @@ impl Runner for Headless {
     }
 }
 
-/// Codex's `-o` file for a pass; `out/<role>.json` is only ever the validated envelope.
+/// Codex's `-o` file for a pass, in `<runroot>/replies/`.
 fn reply_name(role: &str) -> String {
     format!("{role}.reply.txt")
+}
+
+/// The model and effort flags of `pass`'s CLI. The values were checked when parsed (`main.rs`):
+/// none starts with `-`, so none reads as another flag.
+fn model_args(pass: &Pass) -> Vec<String> {
+    let mut args = vec![];
+    match pass.agent {
+        Agent::Claude => {
+            if let Some(m) = pass.model {
+                args.extend(["--model".into(), m.into()]);
+            }
+            if let Some(e) = pass.effort {
+                args.extend(["--effort".into(), e.into()]);
+            }
+        }
+        Agent::Codex => {
+            if let Some(m) = pass.model {
+                args.extend(["-m".into(), m.into()]);
+            }
+            if let Some(e) = pass.effort {
+                args.extend(["-c".into(), format!("model_reasoning_effort={e}")]);
+            }
+        }
+    }
+    args
 }
 
 /// The thread id from Codex's `thread.started` event.
