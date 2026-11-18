@@ -175,7 +175,7 @@ The two setups differ only in which objects the clone held, and no reviewer log 
 | rreview #10 reviewer-writable `out/` (suggestion) | matched | missed |
 
 - **Findings returned:** 20 in the first setup, 11 in the rerun.
-- **Must-fix matched:** 2 in the first setup, 3 in the rerun. Together the two runs matched 4 different must-fix defects.
+- **Must-fix matched:** 2 in the first setup, 3 in the rerun. Both first-setup matches recur in the rerun, so together the two runs matched 3 different must-fix defects. That is 4 detected if you count the rreview #10 defect that a lens found and the coordinator dropped.
 
 ## Follow-ups
 - #13: the panel misses defects in validators, boundary inputs, failure paths and async ordering (12 of 15 must-fix missed).
@@ -216,9 +216,9 @@ PATH="$PWD/../bin:$PATH" XDG_STATE_HOME=<scratch>/state RR_BODY=body.md RR_BASE=
   rreview <n> --repo <o>/<r> --head "$head" --context-file issue.md
 
 # proof: nothing later entered the clone
-test "$(git cat-file --batch-all-objects --batch-check | wc -l)" = "$before"
+test "$(git cat-file --batch-all-objects --batch-check | wc -l)" = "$before" || exit 1
 for c in $(gh api --paginate repos/<o>/<r>/pulls/<n>/commits --jq '.[].sha' | sed -n "/^$head\$/,\$p" | tail -n +2); do
-  ! git cat-file -e "$c" 2>/dev/null
+  git cat-file -e "$c" 2>/dev/null && { echo "later commit $c is present"; exit 1; }
 done
 ```
 
