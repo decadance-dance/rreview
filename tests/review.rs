@@ -409,13 +409,17 @@ fn head_reviews_an_earlier_commit_of_the_pr() {
     git(&fx.upstream, &["update-ref", "refs/pull/7/head", &later]);
     git(&fx.upstream, &["checkout", "-q", "main"]);
     let mut pr = fx.pr();
-    pr["headRefOid"] = later.into();
+    pr["headRefOid"] = later.clone().into();
+    let commits = ("FAKE_GH_COMMITS", format!("{}\n{later}", fx.head));
 
     // later.txt is not in the earlier head's diff, so a candidate there fails validation.
     let run = fx.run_pr(
         &pr,
         &["--head", &fx.head],
-        &claude_says(&envelope("later.txt").to_string()),
+        &with(
+            claude_says(&envelope("later.txt").to_string()),
+            &[commits.clone()],
+        ),
     );
     assert_eq!(run.code, Some(2), "{run:?}");
     assert!(
@@ -426,9 +430,17 @@ fn head_reviews_an_earlier_commit_of_the_pr() {
     let run = fx.run_pr(
         &pr,
         &["--head", &fx.head],
-        &claude_says(&envelope("src/lib.rs").to_string()),
+        &with(
+            claude_says(&envelope("src/lib.rs").to_string()),
+            &[commits.clone()],
+        ),
     );
     assert_eq!(run.code, Some(0), "{run:?}");
+    assert!(
+        run.log
+            .contains("gh api --paginate --jq .[].sha repos/acme/widget/pulls/7/commits"),
+        "{run:?}"
+    );
     let meta: Value =
         serde_json::from_str(&fs::read_to_string(fx.runroot().join("meta.json")).unwrap()).unwrap();
     assert_eq!(meta["head"], fx.head.as_str());
@@ -2308,4 +2320,61 @@ fn orca_types_nothing_before_orca_recognizes_the_agent() {
         let state = fs::read_to_string(fx.root.join("log.orca-reliability")).unwrap();
         assert!(state.matches("show").count() >= 3, "{state}");
     }
+}
+
+/// `--head` must be a commit of the named PR: a commit of another branch that the clone has
+/// is refused before any checkout or fetch.
+#[test]
+fn head_outside_the_pr_is_refused() {
+    let fx = fixture();
+    let run = fx.run(
+        &["--head", &fx.main],
+        &with(
+            claude_says(&envelope("b.txt").to_string()),
+            &[("FAKE_GH_COMMITS", fx.head.clone())],
+        ),
+    );
+    assert_eq!(run.code, Some(2), "{run:?}");
+    assert!(
+        run.stderr
+            .contains(&format!("--head {} is not a commit of PR #7", fx.main)),
+        "{run:?}"
+    );
+    assert!(!run.log.contains("claude -p"), "{run:?}");
+    assert!(!fx.runroot().exists());
+    assert!(
+        !fx.root
+            .join(format!("state/rreview/acme/widget/7-{}", fx.main))
+            .exists()
+    );
+}
+
+/// The default gate keeps a P2 at confidence 0.6 (calibration, docs/calibration.md); the old
+/// bar `conf>=0.8` does not.
+#[test]
+fn the_default_gate_keeps_a_p2_at_confidence_0_6() {
+    let coordinator = coordinator_review(
+        vec![review_finding(
+            "Handle the error",
+            2,
+            0.6,
+            &["reliability-1"],
+        )],
+        vec![],
+    );
+    let scenario = with(
+        pipeline(),
+        &[
+            ("FAKE_OUT_intent_contracts", json!({"panelist": "Intent & Contracts", "coverage_summary": "", "candidates": []}).to_string()),
+            ("FAKE_OUT_security", json!({"panelist": "Security & Trust Boundaries", "coverage_summary": "", "candidates": []}).to_string()),
+            ("FAKE_OUT_coordinator", claude_result(&coordinator.to_string())),
+        ],
+    );
+    let fx = fixture();
+    let run = fx.full(&[], &scenario);
+    assert_eq!(run.code, Some(1), "{run:?}");
+    assert!(run.stdout.starts_with("[P2] Handle the error"), "{run:?}");
+    let fx = fixture();
+    let run = fx.full(&["--gate", "conf>=0.8"], &scenario);
+    assert_eq!(run.code, Some(0), "{run:?}");
 }

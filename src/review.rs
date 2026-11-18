@@ -160,7 +160,7 @@ pub fn run(args: &Args) -> Result<u8> {
     let pr = view_pr(&args.pr, args.repo.as_deref(), deadline)?;
     let (owner, name) = owner_and_name(&pr.url)?;
     let head = match &args.head {
-        Some(h) => h.as_str(),
+        Some(h) => pr_commit(h, &pr, owner, name, deadline)?,
         None => commit(&pr.head_ref_oid, "headRefOid")?,
     };
     // A merged PR's base branch now contains its head; its diff is against the base before the merge.
@@ -703,6 +703,40 @@ fn view_pr(pr: &str, repo: Option<&str>, deadline: Option<Instant>) -> Result<Pr
         );
     }
     serde_json::from_slice(&out.stdout).context("unexpected `gh pr view` output")
+}
+
+/// `--head` must be one of the PR's commits as GitHub lists them now, so a run filed under PR
+/// `<n>` reviews that PR. A head that a force-push removed is no longer listed.
+fn pr_commit<'a>(
+    sha: &'a str,
+    pr: &Pr,
+    owner: &str,
+    name: &str,
+    deadline: Option<Instant>,
+) -> Result<&'a str> {
+    let path = format!("repos/{owner}/{name}/pulls/{}/commits", pr.number);
+    let out = output(
+        Command::new("gh").args(["api", "--paginate", "--jq", ".[].sha", &path]),
+        deadline,
+    )
+    .context("cannot run gh")?;
+    if !out.status.success() {
+        bail!(
+            "gh api {path}: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+    }
+    // ponytail: GitHub lists at most 250 commits of a PR; a later commit of a longer PR is refused.
+    if !String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .any(|l| l.trim() == sha)
+    {
+        bail!(
+            "--head {sha} is not a commit of PR #{} (a head that a force-push removed from the PR cannot be reviewed as that PR)",
+            pr.number
+        );
+    }
+    Ok(sha)
 }
 
 /// `<owner>/<name>` from the PR URL (`.../<owner>/<name>/pull/<n>`), checked to be plain
