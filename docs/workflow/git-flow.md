@@ -15,7 +15,7 @@ Source: Vincent Driessen, "A successful Git branching model", https://nvie.com/p
 
 ## Permanent branches
 ### Do
-- Treat `main` as released code: every commit on it is a release with its own tag.
+- Treat `main` as released code: every merge into it is a release, tagged `X.Y.Z` right after it lands.
 - Treat `develop` as "the next release not yet out". Finished issues land here.
 - Keep both branches forever.
 

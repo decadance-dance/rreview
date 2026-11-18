@@ -36,7 +36,7 @@ TL;DR: A `release-<ver>` branch comes off `develop`, a `hotfix-<ver>` branch off
 ## Hotfix branch (`hotfix-*`)
 ### Do
 - Use it only when something broke for users and the next release cannot wait. It is the only branch that comes off `main`: `git checkout -b hotfix-1.2.1 origin/main`.
-- Give it its own issue by the release issue template above (checklist before the merge, post-merge steps as notes) and mark only the hotfix issue with milestone `1.2.1`: the closed issues waiting on `develop` ship with the next release. The notes' input is the hotfix issue and the hotfix PR into `main`, not `develop`'s history.
+- Give it its own issue (`Hotfix 1.2.1`) with the release issue's checklist: version bumped in `Cargo.toml` and `Cargo.lock`; the hotfix issue marked with milestone `1.2.1`; notes ready; `ci-ok` green and the cross-model review done on the draft PR into `main`. The post-merge steps go in the issue as notes. Mark only the hotfix issue with the milestone: the closed issues waiting on `develop` ship with the next release. The notes' input is the hotfix issue and the hotfix PR into `main`, not `develop`'s history.
 - Finish it like a release: version bump, a PR into `main`, the tag and the GitHub Release on `main`, then a PR from the same branch into `develop`.
 
 ### Don't
