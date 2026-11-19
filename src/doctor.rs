@@ -124,15 +124,20 @@ pub fn run(with_orca: bool) -> Result<bool> {
     for (fx, failed) in [Some(&fx), ofx.as_ref()].into_iter().zip(failed) {
         let Some(fx) = fx else { continue };
         if failed {
-            println!(
-                "      self-test files kept in {0}; remove it with: rm -rf '{0}'",
-                fx.root.display()
-            );
+            println!("{}", kept_note(&fx.root));
         } else {
             let _ = fs::remove_dir_all(&fx.root);
         }
     }
     Ok(r.failed == 0)
+}
+
+fn kept_note(root: &Path) -> String {
+    format!(
+        "      self-test files kept in {}; remove it with: rm -rf {}",
+        root.display(),
+        sh_quote(root)
+    )
 }
 
 /// How a self-test's reviewer runs: as the headless runner launches it, or as the orca runner
@@ -1072,6 +1077,11 @@ mod tests {
         ] {
             assert!(!runs_only(bad, p), "{bad}");
         }
+    }
+
+    #[test]
+    fn the_kept_fixture_note_quotes_its_path() {
+        assert!(kept_note(Path::new("/tmp/it's")).ends_with(r"rm -rf '/tmp/it'\''s'"));
     }
 
     #[test]
