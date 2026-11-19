@@ -2584,6 +2584,25 @@ fn orca_a_slow_wait_ends_the_pass_only_at_its_deadline() {
 }
 
 #[test]
+fn orca_an_orca_transport_timeout_in_a_wait_is_a_slice_timeout() {
+    let env = envelope("src/lib.rs");
+    let fx = fixture();
+    let run = orca_run_with(
+        &fx,
+        &["--timeout", "40"],
+        "ok",
+        &[
+            ("FAKE_REPLY", env.to_string()),
+            ("FAKE_ORCA_WAIT", "runtime-timeout-once".into()),
+        ],
+    );
+    assert_eq!(run.code, Some(0), "{run:?}");
+    assert_eq!(fx.statuses(), ["started", "completed"], "{run:?}");
+    assert_eq!(run.log.matches("--for tui-idle").count(), 3, "{run:?}");
+    assert!(!run.prompt.contains("Time is up."), "{}", run.prompt);
+}
+
+#[test]
 fn orca_waits_out_a_dialog_the_agent_clears_itself() {
     let env = envelope("src/lib.rs");
     let fx = fixture();

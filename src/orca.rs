@@ -689,7 +689,9 @@ fn wait_slice(handle: &str, slice: Duration, deadline: Option<Instant>) -> Resul
     }
     if out["ok"] != true {
         return match out["error"]["code"].as_str() {
-            Some("timeout") => Ok(Wait::TimedOut),
+            // `runtime_timeout`: the CLI's own transport timeout (`--timeout-ms` + 5 s) on a
+            // runtime briefly too slow; the turn goes on until its deadline.
+            Some("timeout" | "runtime_timeout") => Ok(Wait::TimedOut),
             _ => bail!("orca terminal wait: {}", error(&out)),
         };
     }

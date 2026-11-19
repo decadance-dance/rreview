@@ -38,6 +38,11 @@
 #                   on, `terminal show` reports a dialog that opened just now
 #   dialog-retry    the first prompt is answered as ok; from the second (the retry) on, as
 #                   dialog-wrapup
+#   dialog-clears   waits time out until the wrap-up, which is answered as ok; the first look
+#                   after the prompt sees a dialog that opened just now, the second takes 8 s
+#                   and finds it gone
+# FAKE_ORCA_WAIT=runtime-timeout-once: the first `terminal wait` after a prompt fails with Orca's
+# transport timeout `runtime_timeout`.
 #   lost-create     `terminal create` opens the terminal, then fails without JSON
 #   late-worktree   `worktree create` never answers; 1 s after rreview killed it, the app makes
 #                   the worktree anyway and writes $FAKE_LOG.late
@@ -190,6 +195,14 @@ case "$1 $2" in
       echo looked >> "$state"
       [ "$(grep -c '^looked' "$state")" -gt 1 ] && dialog="{\"source\":\"hook\",\"since\":$((now - 60000))}"
     fi ;;
+  dialog-clears)
+    if [ "$(sent)" -gt 0 ]; then
+      echo looked >> "$state"
+      case "$(grep -c '^looked' "$state")" in
+      1) dialog="{\"source\":\"hook\",\"since\":$now}" ;;
+      2) sleep 8 ;;
+      esac
+    fi ;;
   dialog-wrapup | dialog-retry) [ "$(sent)" -gt 1 ] && dialog="{\"source\":\"hook\",\"since\":$now}" ;;
   dialog-brief)
     if [ "$(sent)" -gt 0 ] && ! grep -q '^brief' "$state"; then
@@ -227,7 +240,7 @@ case "$1 $2" in
   ok | trust | foreign-branch | slow-agent | dialog-brief) write=yes ;;
   nudge) [ "$n" -ge 2 ] && write=yes ;;
   dialog-retry) [ "$n" = 1 ] && write=yes ;;
-  hang-once) case "$text" in *"Time is up"*) write=yes; echo wrapped >> "$state" ;; esac ;;
+  hang-once | dialog-clears) case "$text" in *"Time is up"*) write=yes; echo wrapped >> "$state" ;; esac ;;
   esac
   if [ $write = yes ]; then
     eval "first=\${FAKE_OUT_$role-\$FAKE_REPLY}"
@@ -243,6 +256,10 @@ case "$1 $2" in
   ok "{\"send\":{\"accepted\":true,\"prompt\":{\"provider\":\"$provider\"}}}" ;;
 "terminal wait")
   [ -n "$FAKE_ORCA_WAIT_DELAY" ] && [ "$(sent)" -gt 0 ] && sleep "$FAKE_ORCA_WAIT_DELAY"
+  if [ "$FAKE_ORCA_WAIT" = runtime-timeout-once ] && [ "$(sent)" -gt 0 ] && ! grep -q '^rto' "$state"; then
+    echo rto >> "$state"
+    echo '{"ok":false,"error":{"code":"runtime_timeout","message":"Timed out waiting for the Orca runtime"}}'; exit 1
+  fi
   case "$scenario" in
   no-agent) timeout "$@" ;;
   trust) grep -q trusted "$state" 2> /dev/null || blocked agent-trust-workspace ;;
@@ -251,7 +268,7 @@ case "$1 $2" in
   dialog | dialog-wrapup) [ "$(sent)" -gt 0 ] && timeout "$@" ;;
   dialog-retry) [ "$(sent)" -gt 1 ] && timeout "$@" ;;
   dialog-brief) [ "$(sent)" -gt 0 ] && ! grep -q '^brief' "$state" && timeout "$@" ;;
-  hang-once) [ "$(sent)" -gt 0 ] && ! grep -q wrapped "$state" && timeout "$@" ;;
+  hang-once | dialog-clears) [ "$(sent)" -gt 0 ] && ! grep -q wrapped "$state" && timeout "$@" ;;
   esac
   if [ -f "$state.pending" ]; then
     mv "$state.pending" "$(cat "$state.path")"
