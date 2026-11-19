@@ -65,6 +65,17 @@ fn main_checkout(git_common_dir: &Path) -> &Path {
     }
 }
 
+/// Orca knows the worktree the caller's working dir is in; `rreview doctor` opens its
+/// terminals there.
+pub fn check_current_worktree() -> Result<()> {
+    orca(
+        &["worktree", "show", "--worktree", "current"],
+        Instant::now().checked_add(CLOSE),
+    )
+    .context("run `rreview doctor --runner orca` from a directory of an Orca worktree")
+    .map(drop)
+}
+
 /// The Codex TUI starts in `<runroot>/out`; inside a git checkout it stops at its trust prompt,
 /// which rreview does not answer for Codex. Such a run dir is refused before anything starts.
 pub fn check_codex_run_dir(runroot: &Path) -> Result<()> {
@@ -225,6 +236,10 @@ pub struct Orca {
     git_common_dir: PathBuf,
     runroot: PathBuf,
     codex_auth: PathBuf,
+    /// The Orca worktree selector the terminals open in.
+    terminal_worktree: String,
+    /// Added to every launch's env.
+    env: Vec<(String, String)>,
     terminals: Mutex<HashMap<String, Term>>,
 }
 
@@ -236,29 +251,47 @@ impl Orca {
         codex_auth: PathBuf,
     ) -> Self {
         Orca {
+            terminal_worktree: format!("path:{}", worktree.display()),
             worktree,
             git_common_dir,
             runroot,
             codex_auth,
+            env: vec![],
             terminals: Mutex::default(),
         }
     }
 
-    fn scratch(&self, pass: &Pass) -> PathBuf {
-        self.runroot.join("scratch").join(pass.role)
+    /// Terminals open in the Orca worktree `selector` instead of the review worktree, which
+    /// Orca need not track (`rreview doctor`'s throwaway repo); the agent still starts in the
+    /// review worktree (the shim enters it).
+    pub fn terminals_in(mut self, selector: &str) -> Self {
+        self.terminal_worktree = selector.into();
+        self
+    }
+
+    /// Sets `name=value` for every launch, over an inherited value.
+    pub fn with_env(mut self, name: &str, value: &str) -> Self {
+        self.env.push((name.into(), value.into()));
+        self
+    }
+
+    /// The pass's own dir, `<runroot>/scratch/<role>`.
+    pub fn scratch(&self, role: &str) -> PathBuf {
+        self.runroot.join("scratch").join(role)
     }
 
     fn reply(&self, pass: &Pass) -> PathBuf {
-        self.scratch(pass).join("out").join(REPLY)
+        self.scratch(pass.role).join("out").join(REPLY)
     }
 
     fn launch(&self, pass: &Pass) -> Result<Launch> {
-        let dir = self.scratch(pass);
+        let dir = self.scratch(pass.role);
         let mut launch = match pass.agent {
             Agent::Claude => launch::claude_tui(&self.worktree, &self.git_common_dir, &dir)?,
             Agent::Codex => launch::codex_tui(&self.worktree, &dir, &self.codex_auth)?,
         };
         launch.args.extend(model_args(pass));
+        launch.env.extend(self.env.iter().cloned());
         Ok(launch)
     }
 
@@ -356,13 +389,17 @@ impl Runner for Orca {
         // limit: the shim runs this executable by path; replacing it mid-run (a rebuild) breaks
         // the later launches of the run.
         let exe = std::env::current_exe().context("cannot find the rreview executable")?;
-        let command = shell_line(&self.launch(pass)?, &self.scratch(pass).join("bin"), &exe)?;
+        let command = shell_line(
+            &self.launch(pass)?,
+            &self.scratch(pass.role).join("bin"),
+            &exe,
+        )?;
         let v = orca(
             &[
                 "terminal",
                 "create",
                 "--worktree",
-                &format!("path:{}", launch::utf8(&self.worktree)?),
+                &self.terminal_worktree,
                 "--title",
                 &format!("rreview:{}", pass.role),
                 "--command",
@@ -592,7 +629,8 @@ fn printable(text: &str) -> String {
 /// Orca types `--command` into the terminal's login shell, whose environment is Orca's and the
 /// shell's own, not rreview's. So the agent starts through a shim, `<bin>/<program>`, that hands
 /// it to `<exe> exec-reviewer` (this binary): that builds the environment from nothing at the
-/// last exec (spec §3), each inherited variable that is set plus the launch's own env. Nothing
+/// last exec (spec §3), each inherited variable that is set plus the launch's own env, in the
+/// launch's working dir (the terminal starts in the Orca worktree it opened in). Nothing
 /// the shell holds can slip past it: a read-only export, a name that is no identifier, an
 /// exported function. Only names go into an argv, never an inherited value. The line is
 /// `PATH='<bin>':"$PATH" exec 'program' 'arg' ...`, every word single-quoted, no value on it
@@ -626,8 +664,9 @@ fn shell_line(launch: &Launch, bin: &Path, exe: &Path) -> Result<String> {
     let bin_q = quote(launch::utf8(&bin)?)?;
     let mut shim = format!(
         "#!/bin/sh\n# rreview: {} with only the variables it inherits (spec §3).\n\
-         PATH=${{PATH#{bin_q}:}}\nexec {} exec-reviewer",
+         PATH=${{PATH#{bin_q}:}}\ncd {} || exit 1\nexec {} exec-reviewer",
         launch.program,
+        quote(launch::utf8(&launch.cwd)?)?,
         quote(launch::utf8(exe)?)?
     );
     for k in &launch.inherit {
@@ -777,6 +816,7 @@ mod tests {
             format!(
                 "#!/bin/sh\n# rreview: codex with only the variables it inherits (spec §3).\n\
                  PATH=${{PATH#'{}/it{q}s bin':}}\n\
+                 cd '/' || exit 1\n\
                  exec '/opt/it{q}s/rreview' exec-reviewer --inherit PATH --inherit LC_ALL \
                  --set 'CODEX_HOME=/h $x' -- 'codex' \"$@\"\n",
                 root.display()

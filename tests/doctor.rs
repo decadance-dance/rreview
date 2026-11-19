@@ -1,4 +1,4 @@
-//! `rreview doctor` against fake `claude`, `codex` and `gh` (tests/fixtures/bin) on PATH.
+//! `rreview doctor` against fake `claude`, `codex`, `gh` and `orca` (tests/fixtures/bin) on PATH.
 
 use std::fs;
 use std::path::PathBuf;
@@ -15,9 +15,14 @@ struct Run {
     log: String,
 }
 
-/// Runs `rreview doctor` with only `fakes` (and the system dirs) on PATH, the given
-/// `FAKE_*` scenario vars, and a temp HOME, CODEX_HOME and TMPDIR.
 fn doctor(fakes: &[&str], scenario: &[(&str, &str)]) -> Run {
+    doctor_with(&[], fakes, scenario)
+}
+
+/// Runs `rreview doctor <args>` with only `fakes` (and the system dirs) on PATH, the given
+/// scenario vars, a temp HOME, CODEX_HOME and TMPDIR, and no ORCA_TERMINAL_HANDLE unless the
+/// scenario sets one.
+fn doctor_with(args: &[&str], fakes: &[&str], scenario: &[(&str, &str)]) -> Run {
     static N: AtomicU32 = AtomicU32::new(0);
     let root = std::env::temp_dir().join(format!(
         "rreview-it-{}-{}",
@@ -38,6 +43,8 @@ fn doctor(fakes: &[&str], scenario: &[(&str, &str)]) -> Run {
     fake_env::write(&bin, &[vec![("FAKE_LOG", log)], vars].concat());
     let out = Command::new(env!("CARGO_BIN_EXE_rreview"))
         .arg("doctor")
+        .args(args)
+        .env_remove("ORCA_TERMINAL_HANDLE")
         .env("PATH", format!("{}:/usr/bin:/bin", bin.display()))
         .env("HOME", &root)
         .env("CODEX_HOME", &codex_home)
@@ -295,5 +302,165 @@ fn fails_when_codex_rebuilds_the_result_line_from_the_probe_source() {
             .contains("FAIL  codex sandbox: write into the worktree: no evidence"),
         "{}",
         run.stdout
+    );
+}
+
+const WITH_ORCA: &[&str] = &["claude", "codex", "gh", "orca"];
+/// An Orca terminal whose fake agents play the probe prompts.
+const IN_ORCA: &[(&str, &str)] = &[("ORCA_TERMINAL_HANDLE", "term_test"), ("FAKE_ORCA", "play")];
+
+fn doctor_orca(scenario: &[(&str, &str)]) -> Run {
+    doctor_with(
+        &["--runner", "orca"],
+        WITH_ORCA,
+        &[IN_ORCA, scenario].concat(),
+    )
+}
+
+fn assert_lines(run: &Run, lines: &[&str]) {
+    for line in lines {
+        assert!(
+            run.stdout.contains(line),
+            "missing {line:?} in\n{}",
+            run.stdout
+        );
+    }
+}
+
+#[test]
+fn orca_runner_passes_through_the_orca_launch_builders() {
+    let run = doctor_orca(&[]);
+    assert!(run.passed, "{}", run.stdout);
+    assert_lines(
+        &run,
+        &[
+            "ok    orca: orca 9.9.9",
+            "ok    orca worktree: found",
+            "ok    claude sandbox: git diff: works",
+            "ok    orca claude: Write tool into the worktree: blocked",
+            "ok    orca claude: Edit tool in the worktree: blocked",
+            "ok    orca claude sandbox: write into the worktree: blocked",
+            "ok    orca claude sandbox: git commit: blocked",
+            "ok    orca claude sandbox: git branch: blocked",
+            "ok    orca claude sandbox: git diff: works",
+            "ok    orca claude --safe-mode: planted project hook: did not fire",
+            "ok    orca codex sandbox: write into the worktree: blocked",
+            "ok    orca codex sandbox: write into the git dir: blocked",
+            "ok    orca codex sandbox: write into HOME: blocked",
+            "ok    orca codex: user AGENTS.md: not loaded",
+        ],
+    );
+    for title in ["claude", "codex", "codex_control"] {
+        assert!(
+            run.log.contains(&format!(
+                "orca terminal create --worktree current --title rreview:{title} --command PATH="
+            )),
+            "{}",
+            run.log
+        );
+    }
+    assert!(
+        run.log
+            .contains("'--permission-mode' 'acceptEdits' '--add-dir' '/"),
+        "{}",
+        run.log
+    );
+    assert!(
+        run.log.contains("'-s' 'workspace-write' '-a' 'never'"),
+        "{}",
+        run.log
+    );
+}
+
+#[test]
+fn orca_runner_is_skipped_outside_an_orca_terminal() {
+    let run = doctor_with(&["--runner", "orca"], ALL, &[]);
+    assert!(run.passed, "{}", run.stdout);
+    assert_lines(
+        &run,
+        &[
+            "warn  orca: not found on PATH (optional)",
+            "skip  orca self-test: not in an Orca terminal (ORCA_TERMINAL_HANDLE is unset)",
+            "ok    claude sandbox: write into the worktree: blocked",
+        ],
+    );
+    assert!(!run.stdout.contains("orca claude"), "{}", run.stdout);
+}
+
+#[test]
+fn orca_runner_needs_orca_in_an_orca_terminal() {
+    let run = doctor_with(&["--runner", "orca"], ALL, IN_ORCA);
+    assert!(!run.passed, "{}", run.stdout);
+    assert_lines(&run, &["FAIL  orca: not found on PATH"]);
+}
+
+/// Each orca check has a broken-isolation scenario that fails it: none passes vacuously.
+#[test]
+fn orca_runner_fails_each_check_on_broken_isolation() {
+    for (scenario, lines) in [
+        (
+            ("FAKE_CLAUDE", "leak"),
+            &[
+                "FAIL  orca claude sandbox: write into the worktree: went through",
+                "FAIL  orca claude sandbox: git commit: went through",
+                "FAIL  orca claude sandbox: git branch: went through",
+            ][..],
+        ),
+        (
+            ("FAKE_CLAUDE", "tools"),
+            &[
+                "FAIL  orca claude: Write tool into the worktree: went through",
+                "FAIL  orca claude: Edit tool in the worktree: went through",
+            ],
+        ),
+        (
+            ("FAKE_CLAUDE", "lie"),
+            &["FAIL  orca claude sandbox: git diff: failed"],
+        ),
+        (
+            ("FAKE_CLAUDE", "hook"),
+            &["FAIL  orca claude --safe-mode: planted project hook: fired"],
+        ),
+        (
+            ("FAKE_CLAUDE", "dead-hook"),
+            &["FAIL  orca claude --safe-mode: planted project hook: control failed"],
+        ),
+        (
+            ("FAKE_CLAUDE", "ignore"),
+            &["FAIL  orca claude self-test: the probe did not run in Claude's sandbox"],
+        ),
+        (
+            ("FAKE_CODEX", "leak"),
+            &[
+                "FAIL  orca codex sandbox: write into the worktree: went through",
+                "FAIL  orca codex sandbox: write into the git dir: went through",
+                "FAIL  orca codex sandbox: write into HOME: went through",
+            ],
+        ),
+        (
+            ("FAKE_CODEX", "user-agents"),
+            &["FAIL  orca codex: user AGENTS.md: loaded"],
+        ),
+        (
+            ("FAKE_CODEX", "ignore"),
+            &[
+                "FAIL  orca codex sandbox: write into the worktree: the probe did not run",
+                "FAIL  orca codex: user AGENTS.md: control failed",
+            ],
+        ),
+    ] {
+        let run = doctor_orca(&[scenario]);
+        assert!(!run.passed, "{scenario:?}: {}", run.stdout);
+        assert_lines(&run, lines);
+    }
+}
+
+#[test]
+fn orca_codex_gets_one_reminder_to_run_the_probe() {
+    let run = doctor_orca(&[("FAKE_CODEX", "decline-once")]);
+    assert!(run.passed, "{}", run.stdout);
+    assert_lines(
+        &run,
+        &["ok    orca codex sandbox: write into the worktree: blocked"],
     );
 }

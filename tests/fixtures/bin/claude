@@ -10,6 +10,10 @@
 #   crash           writes the normal results, then exits 42
 #   hook            fires the project hooks even under --safe-mode
 #   dead-hook       never fires hooks, as if the planted hook were broken
+#   tools           the Write and Edit tools work in the worktree
+# A TUI launch (--permission-mode) with nothing on stdin is the orca runner's launch and exits;
+# with a prompt on stdin (FAKE_ORCA=play) it plays the probe as above and writes `{}` to the
+# reply file the prompt names.
 # Argv is appended to $FAKE_LOG.
 # With FAKE_REVIEW set it is a review pass instead. The pass's role comes from the prompt
 # (a panelist's task id, the coordinator's or the judge's heading) or, on --resume, from the
@@ -36,7 +40,8 @@ case "$1" in
 auth) echo '{"loggedIn": true, "authMethod": "fake"}'; exit 0 ;;
 esac
 [ -n "$FAKE_LOG" ] && { echo "== claude"; env; } >> "$FAKE_LOG.env"
-case " $* " in *" --permission-mode "*) exit 0 ;; esac  # the TUI under the fake orca
+tui=no; case " $* " in *" --permission-mode "*) tui=yes ;; esac
+if [ $tui = yes ]; then prompt=$(cat); [ -z "$prompt" ] && exit 0; fi
 if [ -n "$FAKE_REVIEW" ]; then
   prompt=$(cat)
   printf '%s\n' "$prompt" >> "$FAKE_LOG.prompt"
@@ -79,11 +84,17 @@ case " $* " in
   echo "control-env HOME=$HOME XDG_CONFIG_HOME=$XDG_CONFIG_HOME XDG_CACHE_HOME=$XDG_CACHE_HOME XDG_DATA_HOME=$XDG_DATA_HOME XDG_STATE_HOME=$XDG_STATE_HOME CLAUDE_CONFIG_DIR=$CLAUDE_CONFIG_DIR" >> "${FAKE_LOG:-/dev/null}"
   fire_hooks; echo '{"type": "result", "is_error": true, "result": "Not logged in"}'; exit 1 ;;
 esac
-# A reviewer pass: the prompt on stdin names the probe script, whose dir holds out/.
-probe=$(grep -o "/[^']*/probe\.sh")
-out=$(dirname "$probe")/out
+# A reviewer pass: the prompt on stdin names the probe script, in out/.
+[ $tui = yes ] || prompt=$(cat)
+probe=$(printf '%s\n' "$prompt" | grep -o "/[^']*/probe\.sh")
+out=$(dirname "$probe")
+reply() { [ $tui = no ] || echo '{}' > "$(printf '%s\n' "$prompt" | grep -o '/[^`'"'"' ]*/reply\.txt' | head -n 1)"; }
+if [ "$FAKE_CLAUDE" = tools ]; then
+  echo x > "$(printf '%s\n' "$prompt" | grep -o '/[^ ]*/rreview-probe-claude-tool\.txt')"
+  echo b >> f.txt
+fi
 case "$FAKE_CLAUDE" in
-ignore) echo '{"type": "result", "result": "no"}'; exit 0 ;;
+ignore) reply; echo '{"type": "result", "result": "no"}'; exit 0 ;;
 leak) sh "$probe" > /dev/null 2>&1 ;;
 lie) git diff > "$out/diff.txt"; echo "write=0 commit=0 branch=0 diff=99" > "$out/probe.txt" ;;
 *)
@@ -91,6 +102,7 @@ lie) git diff > "$out/diff.txt"; echo "write=0 commit=0 branch=0 diff=99" > "$ou
   git diff > "$out/diff.txt"
   echo "write=1 commit=128 branch=128 diff=0" > "$out/probe.txt" ;;
 esac
+reply
 echo '{"type": "result", "result": "done"}'
 [ "$FAKE_CLAUDE" = crash ] && exit 42
 exit 0

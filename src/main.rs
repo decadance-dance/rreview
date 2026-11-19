@@ -91,7 +91,11 @@ enum RunnerKind {
 #[derive(Subcommand)]
 enum Command {
     /// Check claude, codex, gh and orca, their logins, and the reviewer isolation self-test.
-    Doctor,
+    Doctor {
+        /// `orca` also runs the self-test through the orca runner (from an Orca terminal).
+        #[arg(long, value_enum, default_value_t = RunnerKind::Headless)]
+        runner: RunnerKind,
+    },
     /// Print the result of the latest finished review of a PR, or of a run dir.
     Show {
         /// A run dir, or a PR number or URL.
@@ -156,8 +160,8 @@ fn main() -> ExitCode {
     let cli = Cli::parse();
     // Spec §2: exit 2 when the review failed, whether in prepare or in a pass.
     let code = match cli.command {
-        Some(Command::Doctor) => {
-            return match doctor::run() {
+        Some(Command::Doctor { runner }) => {
+            return match doctor::run(matches!(runner, RunnerKind::Orca)) {
                 Ok(true) => ExitCode::SUCCESS,
                 Ok(false) => ExitCode::FAILURE,
                 Err(e) => {
