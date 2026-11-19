@@ -19,7 +19,7 @@
   <a href="#-key-features"><b>Key features</b></a> ·
   <a href="#-quick-start"><b>Quick start</b></a> ·
   <a href="#-how-it-works"><b>How it works</b></a> ·
-  <a href="orca-plugin/README.md"><b>Orca plugin</b></a> ·
+  <a href="orca-plugin/README.md"><b>Rreview Orca plugin</b></a> ·
   <a href="docs/VISION-AND-SPEC.md"><b>Spec</b></a> ·
   <a href="#-read-next"><b>Read next</b></a>
 </p>
@@ -34,11 +34,11 @@ config, and kept from changing your repo **by the OS sandbox**, not by the promp
 cleared the gate, so a script or an agent can act on it.
 
 <p align="center">
-  <img alt="The Orca plugin while a review runs: PR #1 with the orca runner, the three lenses started 9 seconds ago and the coordinator waiting" src="docs/screenshots/orca-plugin-running.png" width="32%">
+  <img alt="The Rreview Orca plugin while a review runs: PR #1 with the orca runner, the three lenses started 9 seconds ago and the coordinator waiting" src="docs/screenshots/orca-plugin-running.png" width="32%">
   &nbsp;
-  <img alt="The Orca plugin after the review: every pass with its status and time, the run marked degraded because the reliability lens failed and the coordinator covered it, and two P3 findings in docs/workflow/git-flow.md listed by file" src="docs/screenshots/orca-plugin-findings.png" width="32%">
+  <img alt="The Rreview Orca plugin after the review: every pass with its status and time, the run marked degraded because the reliability lens failed and the coordinator covered it, and two P3 findings in docs/workflow/git-flow.md listed by file" src="docs/screenshots/orca-plugin-findings.png" width="32%">
   <br>
-  <sub>The Orca plugin on a real review: each pass while it runs, then the findings by file.</sub>
+  <sub>The Rreview Orca plugin on a real review: each pass while it runs, then the findings by file.</sub>
 </p>
 
 ## 📣 Recent updates
@@ -105,7 +105,7 @@ cleared the gate, so a script or an agent can act on it.
 * **Headless by default**: reviewers run as child processes; `--json` prints `result.json`, and
   `rreview show <pr>` prints the latest result again.
 * **Orca runner**: `--runner orca` opens each pass in a visible [Orca](https://github.com/stablyai/orca)
-  terminal (the Orca app must be running, with this repo added to it, and the `orca` CLI on `PATH`), and the [Orca plugin](orca-plugin/README.md) runs a review from a sidebar panel.
+  terminal (the Orca app must be running, with this repo added to it, and the `orca` CLI on `PATH`), and the [Rreview Orca plugin](orca-plugin/README.md) runs a review from a sidebar panel.
 * **Stopping cleans up**: Ctrl-C, SIGTERM or the plugin's Cancel stops every reviewer, removes the
   review worktree (unless `--keep-worktree`) and, with the Orca runner, its branch and the
   reviewers' terminals, then exits 2. A cleanup step that fails is reported and can leave that
@@ -198,7 +198,7 @@ contract and the CLI in full.
 | If you want to… | Open |
 |---|---|
 | Know exactly what rreview does, its CLI, `result.json` and exit codes | [Vision and spec](docs/VISION-AND-SPEC.md) |
-| Run reviews from Orca's sidebar | [Orca plugin](orca-plugin/README.md) |
+| Run reviews from Orca's sidebar | [Rreview Orca plugin](orca-plugin/README.md) |
 | See how well it finds real defects, and why the gate is 0.5 | [Calibration](docs/calibration.md) |
 | Contribute: rules for people and coding agents | [`AGENTS.md`](AGENTS.md) |
 | Branch, open a PR, get the cross-model review | [Git flow](docs/workflow/git-flow.md) |
