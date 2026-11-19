@@ -1,5 +1,4 @@
 // The panel over a mock host whose requests stand in for src/worker.ts.
-import type { TreeItem } from 'orca'
 import { assert, mockHost, mount, test, type TestPanel } from 'orca/testing'
 import { cancelled, done, doneResult, failed, running, target } from './fixtures'
 import * as panel from './panel'
@@ -19,11 +18,9 @@ const passRows = (view: TestPanel) => view.findAll({ type: 'Row' }).filter((n) =
 const cells = (view: TestPanel) => passRows(view).map((n) => n.text)
 const roles = (view: TestPanel) => passRows(view).map((n) => String(n.key).slice('pass:'.length))
 
-/** The findings tree's leaves as label and icon. */
-const leaves = (view: TestPanel) => {
-  const walk = (items: readonly TreeItem[]): TreeItem[] => items.flatMap((i) => (i.children ? walk(i.children) : [i]))
-  return walk(view.find({ label: 'Findings by file' })?.props?.items as TreeItem[]).map((i) => [i.label, i.icon])
-}
+/** The findings list's items as title, the line under it, and icon. */
+const leaves = (view: TestPanel) => view.findAll({ type: 'ListItem' }).map((n) => [n.props?.title, n.props?.description, n.props?.icon])
+const current = (view: TestPanel) => view.findAll({ type: 'ListItem' }).find((n) => n.props?.current)?.props?.title
 
 function setup(run: Run | null = null) {
   const calls: { name: string; input: unknown }[] = []
@@ -66,33 +63,35 @@ test('shows the workspace PR and starts a review with the chosen runner', async 
   assert.ok(ticking.includes(running.events[1].ts))
   // Progress over the whole run and the time since it started.
   assert.equal(view.find({ type: 'Progress' })?.props?.value, 25)
-  assert.match(JSON.stringify(view.tree()), /1 of 4 passes done · elapsed /)
+  assert.match(JSON.stringify(view.tree()), /1 of 4 passes · /)
+  assert.ok(view.find({ type: 'Badge', text: 'running' }))
   assert.ok(ticking.includes(running.startedAt))
   assert.ok(!/No review yet/.test(view.summary().join('\n')))
   // The post that says done is small; the panel then asks for the result itself.
   await view.post('review.changed', done)
   assert.deepEqual(roles(view), ['intent_contracts', 'reliability', 'security', 'coordinator'])
   assert.equal(calls.at(-1)?.name, 'review.result')
-  assert.match(JSON.stringify(view.find({ label: 'Findings by file' })), /Terminal leaks when close fails/)
+  assert.equal(leaves(view)[0][0], 'Terminal leaks when close fails')
   assert.equal(view.find({ type: 'Progress' }), null)
-  assert.match(JSON.stringify(view.tree()), /4 of 4 passes finished in 2m 0s/)
+  // The verdict's one line of counts replaces the status heading.
+  assert.match(JSON.stringify(view.find({ type: 'Callout', text: /Patch is incorrect/ })), /2 gated · 1 below gate · 3\/4 passes · 2m 0s · .*degraded/)
+  assert.equal(view.find({ type: 'Heading', text: /PR #11/ }), null)
+  // Run again, for the PR it just reviewed.
+  assert.ok(view.find({ text: 'Run again' }))
   assert.deepEqual(view.errors, [])
   assert.deepEqual(view.refusals, [])
   await view.unmount()
 })
 
-test('a finished review lists findings by file and sends the picked ones', async () => {
+test('a finished review lists the findings and sends the picked ones', async () => {
   const { host, calls } = setup(done)
   const view = await mount(panel, { host })
-  const tree = JSON.stringify(view.find({ label: 'Findings by file' }))
-  assert.match(tree, /src/)
-  // Severity first, as text, and an icon per severity: never color alone.
+  // Full titles; severity as `P<n>` text and an icon per severity, never color alone.
   assert.deepEqual(leaves(view), [
-    ['P1 · L120-124 · Terminal leaks when close fails', 'error'],
-    ['P2 · L40-44 · Budget skips setup', 'warning']
+    ['Terminal leaks when close fails', 'P1 · orca.rs:120-124 · conf 0.9', 'error'],
+    ['Budget skips setup', 'P2 · review.rs:40-44 · conf 0.85', 'warning']
   ])
-  assert.ok(!/Unclear error text/.test(tree), 'below the gate stays hidden')
-  assert.ok(view.find({ type: 'Badge', text: 'degraded' }))
+  assert.ok(view.find({ type: 'Text', text: 'degraded' }))
   // The failed pass is named with its reason, rreview's own prefix cut.
   const failures = JSON.stringify(view.find({ type: 'Callout', text: /1 pass failed/ }))
   assert.match(failures, /security \(codex\)/)
@@ -102,22 +101,23 @@ test('a finished review lists findings by file and sends the picked ones', async
   assert.match(view.summary().join('\n'), /Callout warning "Patch is incorrect"/)
   assert.deepEqual(view.warnings, [])
 
-  // The most urgent finding opens with its detail: full title, priority as text, a copyable
-  // location and a link to its lines at the reviewed head.
-  assert.equal(view.find({ label: 'Findings by file' })?.props?.selected, 'src/orca.rs#120#Terminal leaks when close fails')
+  // The most urgent finding opens with its detail: its body, a copyable location and a link to
+  // its lines at the reviewed head.
+  assert.equal(current(view), 'Terminal leaks when close fails')
   assert.equal(view.valueOf({ label: 'File and line (select to copy)' }), 'src/orca.rs:120-124')
   assert.equal(view.find({ label: 'File and line (select to copy)' })?.props?.onChange, undefined)
   assert.equal(
-    view.find({ type: 'Link', text: 'Open on GitHub at the reviewed head' })?.props?.href,
+    view.find({ type: 'Link', text: 'Open on GitHub' })?.props?.href,
     `https://github.com/acme/repo/blob/${'a'.repeat(40)}/src/orca.rs#L120-L124`
   )
-  assert.match(JSON.stringify(view.find({ type: 'KeyValue' })), /P1 \(P0 most urgent\)/)
+  assert.match(JSON.stringify(view.find({ type: 'Card' })), /Terminal leaks when close fails\*\*: what fails/)
 
-  await view.toggle({ label: 'All 3, below the gate too' })
-  assert.deepEqual(leaves(view)[1], ['P3 · L300-304 · Unclear error text', 'info'])
+  await view.toggle({ label: 'Below the gate too' })
+  assert.deepEqual(leaves(view)[2], ['Unclear error text', 'P3 · orca.rs:300-304 · conf 0.6', 'info'])
 
   // Both gated findings start picked; unpick one through its detail.
-  await view.selectItem({ label: 'Findings by file' }, 'src/review.rs#40#Budget skips setup')
+  await view.press({ type: 'ListItem', text: /Budget skips setup/ })
+  assert.equal(current(view), 'Budget skips setup')
   assert.match(JSON.stringify(view.tree()), /Budget skips setup\*\*: what fails/)
   await view.toggle({ label: 'Send to the author' })
   // No recipient is chosen for the person: the agents are the reviewed run's (ws1), shells left out.
@@ -133,7 +133,7 @@ test('a finished review lists findings by file and sends the picked ones', async
     name: 'findings.send',
     input: { terminalId: 't1', sessionId: 's1', keys: ['src/orca.rs#120#Terminal leaks when close fails'] }
   })
-  // The confirmation joins the run status, names the agent and the file, and outlives the panel.
+  // The confirmation, under the Send row, names the agent and the file, and outlives the panel.
   assert.match(view.summary().join('\n'), /Callout success "Sent 1 finding to claude author \(waiting\)"/)
   assert.match(JSON.stringify(view.tree()), /author-1\.md/)
   const kept = view.persisted.plugin.sent
@@ -178,31 +178,33 @@ test('a failed review is shown as failed with its error', async () => {
   assert.match(s, /The review failed/)
   const callout = JSON.stringify(view.find({ type: 'Callout', text: /The review failed/ }))
   assert.match(callout, /the reply is not JSON/)
-  assert.match(callout, /Fix the cause, then press Run review again/)
+  assert.match(callout, /Fix the cause, then press Run again/)
   assert.match(callout, /11-abc/)
   // Both failed passes, each with its reason.
   const failures = JSON.stringify(view.find({ type: 'Callout', text: /2 passes failed/ }))
   assert.match(failures, /security \(codex\).*no reply/)
   assert.match(failures, /coordinator \(claude\).*the reply is not JSON/)
   assert.equal(cells(view).at(-1), 'coordinator claude ✗ failed · 30s')
-  assert.equal(view.find({ label: 'Findings by file' }), null)
+  assert.equal(view.find({ type: 'List' }), null)
+  // A failed pass opens the folded passes.
+  assert.equal(view.find({ type: 'Collapsible', text: /Passes · 2\/4 done, 2 failed/ })?.props?.defaultOpen, true)
   await view.unmount()
 })
 
 test('cancel stops the running review, which then shows as cancelled', async () => {
   const { host, calls } = setup(running)
   const view = await mount(panel, { host })
-  await view.press({ text: 'Cancel' })
+  await view.press({ label: 'Cancel' })
   // The run it shows, so a stale Cancel cannot stop a later one.
   assert.deepEqual(calls.at(-1), { name: 'review.cancel', input: { token: running.token } })
   assert.match(JSON.stringify(view.tree()), /Cancelling: rreview is stopping its reviewers/)
   await view.post('review.changed', cancelled)
   const s = view.summary().join('\n') + JSON.stringify(view.tree())
   assert.match(s, /The review was cancelled/)
-  assert.match(s, /Run review starts a new run/)
+  assert.match(s, /Run again starts a new run/)
   assert.match(s, /reliability \(claude\).*no reason recorded/)
   assert.ok(!/Cancelling/.test(s), 'the notice goes with the run')
-  assert.equal(view.find({ text: 'Cancel' }), null)
+  assert.equal(view.find({ label: 'Cancel' }), null)
   // The stop line is no pass.
   assert.deepEqual(roles(view), ['intent_contracts', 'reliability', 'security', 'coordinator'])
   assert.deepEqual(view.errors, [])
@@ -210,12 +212,13 @@ test('cancel stops the running review, which then shows as cancelled', async () 
 })
 
 test('no findings above the gate says how many are below it and how to see them', async () => {
-  const below = { ...doneResult, findings: [], ungated_findings: doneResult.ungated_findings.slice(2) }
+  const below = { ...doneResult, findings: [], ungated_findings: doneResult.ungated_findings.slice(2), passes: [] }
+  const events = done.events.map(({ error: _, ...e }) => (e.status === 'failed' ? { ...e, status: 'completed' } : e))
   const host = mockHost({
     results: { 'agents.list': { agents: [] } },
     requests: {
       'target.get': () => target,
-      'review.get': () => ({ ...done, summary: { gated: 0, all: 1, degraded: false } }),
+      'review.get': () => ({ ...done, events, summary: { gated: 0, all: 1, degraded: false } }),
       'review.result': () => below
     }
   })
@@ -223,8 +226,10 @@ test('no findings above the gate says how many are below it and how to see them'
   const s = view.summary().join('\n') + JSON.stringify(view.tree())
   assert.match(s, /EmptyState "No findings above the gate"/)
   assert.match(s, /1 below the gate: turn on the switch above to see them/)
-  assert.match(s, /no gated findings/)
-  await view.toggle({ label: 'All 1, below the gate too' })
+  assert.match(s, /0 gated · 1 below gate/)
+  // No pass failed: the passes stay folded.
+  assert.equal(view.find({ type: 'Collapsible', text: /Passes · / })?.props?.defaultOpen, false)
+  await view.toggle({ label: 'Below the gate too' })
   // The one below the gate opens at once.
   assert.equal(view.valueOf({ label: 'File and line (select to copy)' }), 'src/orca.rs:300-304')
   await view.unmount()
@@ -235,6 +240,9 @@ test('a run that failed before any pass says so without a time', async () => {
   const s = JSON.stringify(view.tree())
   assert.match(s, /cannot run rreview: ENOENT/)
   assert.ok(!/passes finished/.test(s))
+  // No pass failed: the passes stay folded until opened.
+  assert.equal(view.find({ type: 'Collapsible', text: /Passes · 0\/4 done/ })?.props?.defaultOpen, false)
+  await view.toggle({ label: /Passes/ })
   assert.equal(cells(view)[0], 'intent_contracts – not run')
   await view.unmount()
 })
@@ -247,7 +255,7 @@ test('a long failure reason shows its start and the rest behind Full reason', as
   const shown = view.findAll({ type: 'Text' }).find((n) => /^reliability \(claude\)/.test(n.text))?.text ?? ''
   assert.match(shown, /^reliability \(claude\) pass reliability timed out after 900s;.*…$/)
   assert.ok(shown.length < 200)
-  assert.match(JSON.stringify(view.find({ type: 'Collapsible' })), /Full reason.*the end/)
+  assert.match(JSON.stringify(view.find({ type: 'Collapsible', text: /Full reason/ })), /Full reason.*the end/)
   assert.ok(callout)
   await view.unmount()
 })
@@ -296,10 +304,10 @@ test('overall progress never reaches 100 % before the judge decision, and never 
   await view.post('review.changed', { ...running, events: coordinatorDone })
   // The judge may or may not run: the bar has no value rather than 100 %.
   assert.equal(progress(), undefined)
-  assert.match(JSON.stringify(view.tree()), /4 of 4 passes done · elapsed/)
+  assert.match(JSON.stringify(view.tree()), /4 of 4 passes · /)
   await view.post('review.changed', { ...running, events: [...coordinatorDone, ev('judge', 'started', 'codex', 0)] })
   assert.equal(progress(), undefined)
-  assert.match(JSON.stringify(view.tree()), /4 of 4 passes done, judge running · elapsed/)
+  assert.match(JSON.stringify(view.tree()), /4 of 4 passes, judge running · /)
   await view.unmount()
 })
 
@@ -331,9 +339,11 @@ test('the most urgent finding opens first, whatever order rreview listed them in
   await view.unmount()
   // A gate toggle that drops the open finding opens the most urgent one left.
   const below = await mountRun(done, res)
-  await below.toggle({ label: 'All 3, below the gate too' })
-  await below.selectItem({ label: 'Findings by file' }, 'src/orca.rs#300#Unclear error text')
-  await below.toggle({ label: 'All 3, below the gate too' })
+  await below.toggle({ label: 'Below the gate too' })
+  // The list is most urgent first too.
+  assert.deepEqual(leaves(below).map((l) => String(l[1]).slice(0, 2)), ['P1', 'P2', 'P3'])
+  await below.press({ type: 'ListItem', text: /Unclear error text/ })
+  await below.toggle({ label: 'Below the gate too' })
   assert.equal(below.valueOf({ label: 'File and line (select to copy)' }), 'src/orca.rs:120-124')
   await below.unmount()
 })
@@ -344,8 +354,10 @@ test('no PR and no workspace each say what to do next', async () => {
   })
   const callout = JSON.stringify(noPr.find({ type: 'Callout' }))
   assert.match(callout, /no pull requests found/)
-  assert.match(callout, /type a PR number or URL below, then press Refresh/)
+  assert.match(callout, /type a PR number or URL under Other PR, then press Refresh/)
   assert.equal(noPr.find({ text: 'Run review' })?.props?.disabled, true)
+  // Other PR… opens on its own only when the workspace has no PR.
+  assert.equal(noPr.find({ type: 'Collapsible', text: /Other PR/ })?.props?.open, true)
   await noPr.unmount()
   const none = await mount(panel, { host: mockHost({ requests: { 'target.get': () => null, 'review.get': () => null } }) })
   assert.match(JSON.stringify(none.tree()), /Focus a workspace in Orca, then press Refresh/)
@@ -356,14 +368,4 @@ test('no PR and no workspace each say what to do next', async () => {
 test('durations read as minutes and seconds', () => {
   assert.equal(panel.duration(9_400), '9s')
   assert.equal(panel.duration(901_917), '15m 2s')
-})
-
-test('the file tree folds single-child folders', () => {
-  const items = panel.fileTree([
-    { title: 'A', body: '', file: 'a/b/c/x.rs', start_line: 1, end_line: 1, priority: 0, confidence_score: 1, stage: 'judge' },
-    { title: 'B', body: '', file: 'top.rs', start_line: 2, end_line: 3, priority: 2, confidence_score: 0.8, stage: 'coordinator' }
-  ])
-  assert.deepEqual(items.map((i) => i.label), ['a/b/c', 'top.rs'])
-  assert.equal(items[0].children?.[0].children?.[0].label, 'P0 · L1 · A')
-  assert.equal(items[1].children?.[0].label, 'P2 · L2-3 · B')
 })
