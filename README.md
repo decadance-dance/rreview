@@ -34,9 +34,9 @@ config, and kept from changing your repo **by the OS sandbox**, not by the promp
 cleared the gate, so a script or an agent can act on it.
 
 <p align="center">
-  <img alt="The Rreview Orca plugin while a review runs: PR #1 with the orca runner, the three lenses started 9 seconds ago and the coordinator waiting" src="docs/screenshots/orca-plugin-running.png" width="32%">
+  <img alt="The Rreview Orca plugin while a review runs: PR #1 with the orca runner, a progress bar at 2 of 4 passes done after 1 minute, the two codex lenses done, the reliability lens running and the coordinator waiting" src="docs/screenshots/orca-plugin-running.png" width="32%">
   &nbsp;
-  <img alt="The Rreview Orca plugin after the review: every pass with its status and time, the run marked degraded because the reliability lens failed and the coordinator covered it, and two P3 findings in docs/workflow/git-flow.md listed by file" src="docs/screenshots/orca-plugin-findings.png" width="32%">
+  <img alt="The Rreview Orca plugin after the review: no gated findings and degraded, the verdict patch is correct, then two P3 findings in docs/workflow/git-flow.md by file with the first one open: priority, confidence, stage, its file and line to copy and a link to its lines on GitHub" src="docs/screenshots/orca-plugin-findings.png" width="32%">
   <br>
   <sub>The Rreview Orca plugin on a real review: each pass while it runs, then the findings by file.</sub>
 </p>

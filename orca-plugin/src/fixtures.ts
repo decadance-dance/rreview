@@ -14,8 +14,8 @@ const f = (file: string, line: number, title: string, priority: number, confiden
   priority, confidence_score, stage: 'coordinator'
 })
 
-const ev = (role: string, status: string, agent: string, duration_ms: number) => ({
-  ts: 1_700_000_000_000 + duration_ms, role, status, agent, model: 'default', duration_ms
+const ev = (role: string, status: string, agent: string, duration_ms: number, error?: string) => ({
+  ts: 1_700_000_000_000 + duration_ms, role, status, agent, model: 'default', duration_ms, ...(error ? { error } : {})
 })
 
 const base = { pr: target.pr!, workspaceId: 'ws1', runner: 'orca' as const, token: 'run-1', startedAt: 1_700_000_000_000, runDir: '/state/rreview/acme/repo/11-abc' }
@@ -51,7 +51,7 @@ export const done: Run = {
   events: [
     ...running.events,
     ev('reliability', 'completed', 'claude', 95_000),
-    ev('security', 'failed', 'codex', 40_000),
+    ev('security', 'failed', 'codex', 40_000, 'pass security (codex): no reply'),
     ev('coordinator', 'started', 'claude', 0),
     ev('coordinator', 'completed', 'claude', 120_000)
   ],
@@ -70,5 +70,5 @@ export const cancelled: Run = {
 export const failed: Run = {
   ...base, status: 'failed', exitCode: 2, summary: null,
   error: 'error: coordinator: the reply is not JSON',
-  events: [...done.events.slice(0, 7), ev('coordinator', 'failed', 'claude', 30_000)]
+  events: [...done.events.slice(0, 7), ev('coordinator', 'failed', 'claude', 30_000, 'pass coordinator (claude): the reply is not JSON')]
 }
