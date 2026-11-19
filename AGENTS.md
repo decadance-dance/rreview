@@ -1,10 +1,10 @@
 # rreview: project instructions
 
-These rules hold for every contributor and every coding agent. They need git, the `gh` CLI and a stable Rust toolchain; `claude`, `codex` and `orca` only for live tests and the Orca runner.
+These rules hold for every contributor and every coding agent. They need git, the `gh` CLI, a stable Rust toolchain, zsh and the Orca CLI (`bin/check` runs the plugin's checks with `orca`); running rreview or its live tests needs the [prerequisites](README.md#prerequisites) too, logged-in `claude` and `codex` among them.
 
 Write documentation, code comments, commits, issues and PRs in English.
 
-rreview is a Rust CLI that runs an isolated, cross-model panel review of a GitHub pull request (`docs/VISION-AND-SPEC.md` is the product and the plan; its section numbers are cited as `spec §N`). Later an Orca plugin (TypeScript) wraps the CLI.
+rreview is a Rust CLI that runs an isolated, cross-model panel review of a GitHub pull request (`docs/VISION-AND-SPEC.md` is the product and the plan; its section numbers are cited as `spec §N`). An Orca plugin (TypeScript, `orca-plugin/`) wraps the CLI.
 
 ## Read before
 - The first commit or PR: [git-flow.md](docs/workflow/git-flow.md). Branches, PRs into `develop` with a merge commit, cross-model review, what agents may push.
@@ -28,12 +28,12 @@ rreview is a Rust CLI that runs an isolated, cross-model panel review of a GitHu
 ## Tests
 - Cheap checks first: the narrow test, then the crate, then the suite. `cargo test <name>` before `cargo test`.
 - Agents are faked: tests put fake `claude`, `codex`, `gh` and `orca` executables (small scripts under `tests/fixtures/bin/`) first on `PATH`. A fake reads its scenario from an env var (canned JSON, a delay, a crash, malformed output) and records its argv and env to a file the test asserts on. That is how isolation flags, settings contents, timeouts, wrap-up and retry are tested without a model.
-- Live tests (a real `claude` or `codex` login) are `#[ignore]` and run only with `RREVIEW_LIVE=1 cargo test -- --ignored`; one per agent. Never in CI.
+- Live tests (a real `claude` or `codex` login) are `#[ignore]` and run only with `RREVIEW_LIVE=1 cargo test -- --ignored`; two for Claude, one for Codex. Never in CI.
 - Fixture repos are built by the test in a temp dir (`git init`, commits), not checked in as nested repos.
 - New logic gets a test that fails when the logic breaks.
 
 ## Checks
-- `bin/check`: `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`, `cargo test`; every step runs even when an earlier one fails. CI runs the same script as the `ci-ok` check, the merge gate.
+- `bin/check`: `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`, `cargo test`, `orca plugin check` and `orca plugin test`; every step runs even when an earlier one fails. CI runs the same script as the `ci-ok` check, the merge gate.
 - Run it before you say a change is done.
 
 ## Issues

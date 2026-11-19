@@ -31,7 +31,8 @@ focused workspace's pull request, shows each pass while it runs, and lists the f
 
 ## Install for development
 
-Needs Orca 1.4.248 or later, `gh`, and an `rreview` binary (`cargo build --release` in this repo).
+Needs Orca 1.4.248 or later and an `rreview` binary (`cargo build --release` in this repo), with
+rreview's [prerequisites](../README.md#prerequisites).
 
 ```sh
 orca plugin dev load orca-plugin     # prints the access it asks for; approve with --approve <fingerprint>
@@ -50,9 +51,11 @@ Settings (Settings > Plugins > rreview):
 
 ## Limits
 
-- The worker runs with Orca's environment, not a terminal's: `CLAUDE_CONFIG_DIR` and `CODEX_HOME`
-  are unset, so the headless runner uses `~/.claude` and `~/.codex`, not an Orca per-account home.
-  The orca runner's reviewers run in Orca terminals with Orca's own environment.
+- Reviewers use the Claude config and Codex login of the rreview process, which is the worker's,
+  with either runner: `$CLAUDE_CONFIG_DIR` and `$CODEX_HOME` when set, else `~/.claude` and
+  `~/.codex`. The worker runs with Orca's environment, not a terminal's, where those two are
+  normally unset, so a login made only in an Orca per-account terminal home does not reach the
+  reviewers, even when the orca runner opens their terminals.
 - A worker restart (Orca stops an idle worker; a save in dev mode) loses the child it was watching:
   that run shows as failed, with its run dir. `rreview show <run dir>` prints its result once it
   finishes.
