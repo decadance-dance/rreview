@@ -84,7 +84,7 @@ struct Cli {
 #[derive(Clone, Copy, ValueEnum)]
 enum RunnerKind {
     Headless,
-    /// Each pass in a visible Orca terminal (run from an Orca terminal).
+    /// Each pass in a visible Orca terminal (needs the Orca app running, with the repo added).
     Orca,
 }
 

@@ -158,7 +158,7 @@ The gate is recomputed at each threshold from the kept and restored findings (`o
   - Under 0.5, it gated 3 real findings and that restoration.
 - **Why `--all` stays off by default:**
   - It would make 4 of 5 runs exit 1, mostly on P3 test gaps and edge cases.
-  - #16 makes those findings visible in the summary without gating on them.
+  - #16 (open) is to make those findings visible in the summary without gating on them; today the summary prints the gated findings and the counts only.
 - **Provisional:** five selected PRs with one clean run each cannot show that 0.5 is an optimum. The two setups also matched different defects (below), so a single run is noisy. Recalibrate once #14 makes confidence mean "this defect exists".
 
 ## Run-to-run variance

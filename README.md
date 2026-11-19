@@ -105,7 +105,7 @@ cleared the gate, so a script or an agent can act on it.
 * **Headless by default**: reviewers run as child processes; `--json` prints `result.json`, and
   `rreview show <pr>` prints the latest result again.
 * **Orca runner**: `--runner orca` opens each pass in a visible [Orca](https://github.com/stablyai/orca)
-  terminal (the Orca app must be running, with this repo added to it), and the [Orca plugin](orca-plugin/README.md) runs a review from a sidebar panel.
+  terminal (the Orca app must be running, with this repo added to it, and the `orca` CLI on `PATH`), and the [Orca plugin](orca-plugin/README.md) runs a review from a sidebar panel.
 * **Stopping cleans up**: Ctrl-C, SIGTERM or the plugin's Cancel stops every reviewer, removes the
   review worktree (unless `--keep-worktree`) and, with the Orca runner, its branch and the
   reviewers' terminals, then exits 2. A cleanup step that fails is reported and can leave that
@@ -117,7 +117,11 @@ You need macOS (the tested platform; Linux is untested, and Claude's sandbox the
 and socat), [rustup](https://rustup.rs/) with a stable toolchain, `zsh`, and the
 [`gh`](https://cli.github.com/), [`claude`](https://docs.anthropic.com/en/docs/claude-code) and
 [`codex`](https://github.com/openai/codex) CLIs, each logged in. No API keys: reviewers run on
-your Claude and ChatGPT subscriptions.
+your Claude and ChatGPT subscriptions. Reviewers use the Claude config and the Codex login of the
+process that runs rreview: `$CLAUDE_CONFIG_DIR`, else `~/.claude`, and the `auth.json` in
+`$CODEX_HOME`, else `~/.codex`; each Codex pass gets a fresh Codex home holding only that login,
+so your Codex config does not apply. Without zsh rreview refuses to start a Claude reviewer, and
+without a working sandbox Claude exits at startup.
 
 ```bash
 # 1. Install the latest release
