@@ -2259,7 +2259,7 @@ fn orca_pass_end_to_end() {
             )
         } else {
             format!(
-                "'-C' '{}' '-s' 'workspace-write' '-a' 'never' '-c' 'sandbox_workspace_write.exclude_slash_tmp=true' '-c' 'sandbox_workspace_write.exclude_tmpdir_env_var=true' '-c' 'check_for_update_on_startup=false'",
+                "'-C' '{}' '-s' 'workspace-write' '-a' 'never' '-c' 'sandbox_workspace_write.exclude_slash_tmp=true' '-c' 'sandbox_workspace_write.exclude_tmpdir_env_var=true' '-c' 'check_for_update_on_startup=false' '-c' 'shell_environment_policy.include_only=[\"PATH\",\"HOME\",\"USER\",\"LOGNAME\",\"SHELL\",\"TMPDIR\",\"LANG\",\"LC_ALL\",\"LC_CTYPE\",\"LC_COLLATE\",\"LC_MESSAGES\",\"LC_MONETARY\",\"LC_NUMERIC\",\"LC_TIME\",\"TZ\",\"TERM\",\"COLORTERM\",\"HTTPS_PROXY\",\"https_proxy\",\"NO_PROXY\",\"no_proxy\",\"NODE_EXTRA_CA_CERTS\",\"SSL_CERT_FILE\"]'",
                 out.display()
             )
         };
