@@ -37,6 +37,8 @@ const SETTLE: Duration = Duration::from_secs(30);
 /// answer: Claude also shows some and clears them itself seconds later (*verified*, #28).
 const WAIT_SLICE: Duration = Duration::from_secs(10);
 const DIALOG: Duration = Duration::from_secs(30);
+/// How long past a turn's deadline an Orca wait may still answer before it is killed.
+const BACKSTOP: Duration = Duration::from_secs(5);
 
 /// The runner drives Orca through its CLI, which needs the app running with its runtime
 /// reachable and this repository registered (spec §4); `orca status` and `orca repo show` prove
@@ -636,12 +638,8 @@ enum Wait {
 /// for input. Between slices, a dialog left open counts as blocked.
 fn wait(handle: &str, deadline: Option<Instant>) -> Result<Wait> {
     loop {
-        let slice = Instant::now().checked_add(WAIT_SLICE);
-        let slice = match (slice, deadline) {
-            (Some(s), Some(d)) => Some(s.min(d)),
-            (s, d) => s.or(d),
-        };
-        match wait_slice(handle, slice)? {
+        let slice = left(deadline).min(WAIT_SLICE);
+        match wait_slice(handle, slice, deadline)? {
             Wait::TimedOut if !left(deadline).is_zero() => {}
             w => return Ok(w),
         }
@@ -651,14 +649,16 @@ fn wait(handle: &str, deadline: Option<Instant>) -> Result<Wait> {
     }
 }
 
-fn wait_slice(handle: &str, deadline: Option<Instant>) -> Result<Wait> {
+/// One `tui-idle` wait of Orca's `slice`. Only the turn's `deadline` bounds the call itself: a
+/// slow CLI that answers after its slice still answers within the turn.
+fn wait_slice(handle: &str, slice: Duration, deadline: Option<Instant>) -> Result<Wait> {
     // limit: Node timers overflow above 2^31-1 ms (~24 days); a longer wait ends there as a timeout.
-    let ms = left(deadline).as_millis().min(i32::MAX as u128);
+    let ms = slice.as_millis().min(i32::MAX as u128);
     if ms == 0 {
         return Ok(Wait::TimedOut);
     }
     // Orca's own timeout answers first; the kill is the backstop for an orca that hangs.
-    let backstop = deadline.and_then(|d| d.checked_add(Duration::from_secs(5)));
+    let backstop = deadline.and_then(|d| d.checked_add(BACKSTOP));
     let (out, success) = run_orca(
         &[
             "terminal",
@@ -710,12 +710,13 @@ fn dialog(handle: &str, deadline: Option<Instant>) -> Result<Option<String>> {
         let open = first
             .elapsed()
             .max(Duration::from_millis(since.unwrap_or(0)));
+        let what = w["reason"].as_str().unwrap_or("an interactive prompt");
+        let d = format!(
+            "a dialog ({what}, open {}s; Orca's agentWait {w})",
+            open.as_secs()
+        );
         if open >= DIALOG || left(deadline) < Duration::from_secs(1) {
-            let what = w["reason"].as_str().unwrap_or("an interactive prompt");
-            return Ok(Some(format!(
-                "a dialog ({what}, open {}s; Orca's agentWait {w})",
-                open.as_secs()
-            )));
+            return Ok(Some(d));
         }
         std::thread::sleep(Duration::from_secs(1));
     }

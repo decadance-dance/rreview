@@ -2530,6 +2530,26 @@ fn orca_fails_a_pass_stuck_on_a_dialog_and_types_nothing_into_it() {
 }
 
 #[test]
+fn orca_a_slow_wait_ends_the_pass_only_at_its_deadline() {
+    // Every wait after the prompt answers after 16 s: past its 10 s slice and the 5 s backstop,
+    // well inside the pass's 40 s.
+    let env = envelope("src/lib.rs");
+    let fx = fixture();
+    let run = orca_run_with(
+        &fx,
+        &["--timeout", "40"],
+        "ok",
+        &[
+            ("FAKE_REPLY", env.to_string()),
+            ("FAKE_ORCA_WAIT_DELAY", "16".into()),
+        ],
+    );
+    assert_eq!(run.code, Some(0), "{run:?}");
+    assert_eq!(fx.statuses(), ["started", "completed"], "{run:?}");
+    assert!(!run.prompt.contains("Time is up."), "{}", run.prompt);
+}
+
+#[test]
 fn orca_waits_out_a_dialog_the_agent_clears_itself() {
     let env = envelope("src/lib.rs");
     let fx = fixture();
