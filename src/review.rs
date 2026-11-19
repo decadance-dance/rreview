@@ -206,8 +206,24 @@ pub fn run(args: &Args) -> Result<u8> {
     fs::DirBuilder::new()
         .mode(0o700)
         .create(&runroot)
-        .and_then(|()| fs::create_dir(runroot.join("out")))
         .with_context(|| format!("{}", runroot.display()))?;
+    // macOS ACLs are not masked by the mode: drop those inherited from the state dir while the
+    // run dir is still empty, so nothing made in it inherits them. A Linux default ACL is
+    // masked by the 0700 mode.
+    if cfg!(target_os = "macos") {
+        let status = Command::new("/bin/chmod")
+            .arg("-N")
+            .arg(&runroot)
+            .status()
+            .with_context(|| format!("chmod -N {}", runroot.display()))?;
+        if !status.success() {
+            bail!(
+                "cannot drop the inherited ACL of {} (chmod -N {status})",
+                runroot.display()
+            );
+        }
+    }
+    fs::create_dir(runroot.join("out")).with_context(|| format!("{}", runroot.display()))?;
     let runroot = fs::canonicalize(&runroot)?;
     // The run's own id, also in meta.json: a later run that replaces this dir may get the same
     // path and inode, so the Orca plugin compares this id before it trusts the dir's files.

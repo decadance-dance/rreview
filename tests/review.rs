@@ -806,6 +806,45 @@ fn a_fresh_run_dir_is_private() {
     assert_eq!(mode, 0o700, "{run:?}");
 }
 
+/// macOS ACLs are not masked by the mode: an inheritable grant on the state dir would reach
+/// every file of a 0700 run dir.
+#[cfg(target_os = "macos")]
+#[test]
+fn a_fresh_run_dir_drops_inherited_acls() {
+    let fx = fixture();
+    let parent = fx.runroot().parent().unwrap().to_path_buf();
+    fs::create_dir_all(&parent).unwrap();
+    let grant = "everyone allow list,search,read,file_inherit,directory_inherit";
+    let set = Command::new("/bin/chmod")
+        .args(["+a", grant])
+        .arg(&parent)
+        .status()
+        .unwrap();
+    if !set.success() {
+        eprintln!("skipped: this filesystem takes no ACL");
+        return;
+    }
+    let run = fx.run(&[], &claude_says("Done."));
+    let acl = |path: &Path| {
+        let out = Command::new("/bin/ls")
+            .arg("-lde")
+            .arg(path)
+            .output()
+            .unwrap();
+        String::from_utf8_lossy(&out.stdout).into_owned()
+    };
+    assert!(acl(&parent).contains("everyone"), "{}", acl(&parent));
+    let runroot = fx.runroot();
+    for path in [
+        runroot.clone(),
+        runroot.join("meta.json"),
+        runroot.join("logs/reliability.stdout"),
+    ] {
+        assert!(path.exists(), "{run:?}");
+        assert_eq!(acl(&path).lines().count(), 1, "{}", acl(&path));
+    }
+}
+
 #[test]
 fn a_leftover_worktree_stops_the_run() {
     let fx = fixture();
