@@ -2825,7 +2825,7 @@ fn orca_worktree_create_stays_within_the_budget() {
         ],
     );
     assert_eq!(run.code, Some(2), "{run:?}");
-    // Killed at the budget, before its 6 s delay ended: an unanswered create, so the cleanup
+    // Killed at the budget, before its 6 s delay ended: an unconfirmed create, so the cleanup
     // waited for a worktree the app might still make (it made none).
     assert!(
         run.stderr.contains(
@@ -2834,6 +2834,45 @@ fn orca_worktree_create_stays_within_the_budget() {
         "{run:?}"
     );
     assert!(!run.log.contains("orca terminal create"), "{run:?}");
+    // Round 2, finding 4: what the cleanup could not reconcile is named.
+    let branch = format!("rreview/{}", fx.orca_name());
+    assert!(
+        run.stderr.contains(&format!(
+            "warning: a failed `orca worktree create` may still make the worktree on branch {branch}: none appeared within 30s"
+        )),
+        "{run:?}"
+    );
+    fx.assert_orca_worktree_removed();
+}
+
+/// Review of PR #34, round 2, finding 4: the wait for what a failed `terminal create` may still
+/// open stays within its 30 s, however slow each `terminal list` is, and the terminal it could not
+/// close is named.
+#[test]
+fn orca_the_wait_for_a_failed_terminal_create_stays_within_its_time() {
+    let fx = fixture();
+    let started = Instant::now();
+    let run = orca_run_with(
+        &fx,
+        &[],
+        "no-ok",
+        &[
+            ("FAKE_REPLY", envelope("src/lib.rs").to_string()),
+            ("FAKE_ORCA_LIST_DELAY", "25".into()),
+        ],
+    );
+    // Without a cap the second list call ran its whole 25 s: past 50 s.
+    assert!(
+        started.elapsed() < Duration::from_secs(42),
+        "took {:?}",
+        started.elapsed()
+    );
+    assert_eq!(run.code, Some(2), "{run:?}");
+    assert!(
+        run.stderr
+            .contains("warning: a failed create may still open the Orca terminal rreview:"),
+        "{run:?}"
+    );
     fx.assert_orca_worktree_removed();
 }
 

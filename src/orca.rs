@@ -201,6 +201,12 @@ pub fn remove_worktree(name: &str, unconfirmed: bool) -> Result<()> {
         }
         std::thread::sleep(Duration::from_millis(250));
     };
+    if path.is_none() && unconfirmed {
+        eprintln!(
+            "warning: a failed `orca worktree create` may still make the worktree on branch {branch}: none appeared within {}s; if it appears, remove it with `orca worktree rm` and `git branch -D {branch}`",
+            SETTLE.as_secs()
+        );
+    }
     if let Some(path) = &path {
         let removed = orca_to_end(
             &[
@@ -315,12 +321,12 @@ impl Orca {
     }
 
     /// Closes the terminals titled `title` in the terminals' worktree: a create that failed may
-    /// still have opened one, so it waits up to `SETTLE` for one to appear. Best effort; a
-    /// failure is a warning.
+    /// still have opened one, so it waits up to `SETTLE` for one to appear. Best effort; what it
+    /// could not close is named in a warning.
     // limit: a terminal the app opens more than `SETTLE` after its create failed stays open.
     fn close_titled(&self, title: &str) {
         let settle = Instant::now() + SETTLE;
-        loop {
+        let missed = loop {
             let listed = orca_to_end(
                 &[
                     "terminal",
@@ -329,24 +335,31 @@ impl Orca {
                     &self.terminal_worktree,
                     "--include-visual-layouts",
                 ],
-                Instant::now().checked_add(CLOSE),
+                // Each call gets only what is left of the wait, so the wait stays within it.
+                Some(settle),
             );
-            let v = match listed {
-                Ok(v) => v,
-                Err(e) => {
-                    eprintln!("warning: cannot list Orca terminals to close {title}: {e:#}");
-                    return;
+            match listed {
+                Ok(v) => {
+                    let handles = titled(&v, title);
+                    for handle in &handles {
+                        let _ = close(handle);
+                    }
+                    if !handles.is_empty() {
+                        return;
+                    }
                 }
-            };
-            let handles = titled(&v, title);
-            for handle in &handles {
-                let _ = close(handle);
+                Err(e) if !e.is::<TimedOut>() => break format!("{e:#}"),
+                Err(_) => {}
             }
-            if !handles.is_empty() || Instant::now() >= settle {
-                return;
+            if Instant::now() >= settle {
+                break format!("none appeared within {}s", SETTLE.as_secs());
             }
             std::thread::sleep(Duration::from_millis(250));
-        }
+        };
+        eprintln!(
+            "warning: a failed create may still open the Orca terminal {title} in {}: {missed}; close it if it appears",
+            self.terminal_worktree
+        );
     }
 
     /// Sets `name=value` for every launch, over an inherited value.

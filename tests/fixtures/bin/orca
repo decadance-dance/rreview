@@ -39,7 +39,8 @@
 #                   with the prompt on stdin (through rreview's shim), and the fake agent writes
 #                   its own reply (`rreview doctor --runner orca`)
 # FAKE_ORCA_SEND_DELAY: seconds every prompt send takes; FAKE_ORCA_CREATE_DELAY: seconds before
-# `worktree create` starts; FAKE_ORCA_WAIT_DELAY: seconds every `terminal wait` after a prompt
+# `worktree create` starts; FAKE_ORCA_LIST_DELAY: seconds every `terminal list` takes;
+# FAKE_ORCA_WAIT_DELAY: seconds every `terminal wait` after a prompt
 # takes before it answers. FAKE_ORCA_CLOSE=fail-once: the first `terminal close` fails with
 # runtime_unavailable. FAKE_ORCA_HANDLES=numbered: each create of a title gets its own handle,
 # `term_<role>~<n>`, logged as `created <handle>`; every successful close is logged as
@@ -143,6 +144,7 @@ case "$1 $2" in
   echo "created $handle" >> "${FAKE_LOG:-/dev/null}"
   ok "{\"terminal\":{\"handle\":\"$handle\"}}" ;;
 "terminal list")
+  [ -n "$FAKE_ORCA_LIST_DELAY" ] && sleep "$FAKE_ORCA_LIST_DELAY"
   # As Orca's: a row's title is the one the running program set; the title `create --title` gave
   # is the tab's, in the visual layout.
   rows= tabs=
