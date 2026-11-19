@@ -101,7 +101,9 @@ fn passes_with_working_isolation_and_launches_through_the_builders() {
         "ok    claude sandbox: git branch: blocked",
         "ok    claude sandbox: git diff: works",
         "ok    claude --safe-mode: planted project hook: did not fire",
+        "ok    claude: shell startup files: not read",
         "ok    codex sandbox: write into the worktree: blocked",
+        "ok    codex: shell startup files: not read",
         "ok    codex: user AGENTS.md: not loaded",
     ] {
         assert!(
@@ -180,6 +182,27 @@ fn fails_when_a_codex_write_goes_through() {
         "{}",
         run.stdout
     );
+}
+
+/// A canary exported by the stand-in HOME's shell startup files must not reach a reviewer's
+/// command, and the control must see it.
+#[test]
+fn fails_when_the_shell_startup_files_reach_a_reviewer() {
+    let run = doctor(
+        ALL,
+        &[("FAKE_CLAUDE", "startup"), ("FAKE_CODEX", "startup")],
+    );
+    assert!(!run.passed);
+    assert_lines(
+        &run,
+        &[
+            "FAIL  claude: shell startup files: read: RREVIEW_STARTUP_CANARY",
+            "FAIL  codex: shell startup files: read: RREVIEW_STARTUP_CANARY",
+        ],
+    );
+    let run = doctor(ALL, &[("FAKE_CLAUDE", "no-control")]);
+    assert!(!run.passed);
+    assert_lines(&run, &["FAIL  claude: shell startup files: control failed"]);
 }
 
 #[test]
@@ -372,6 +395,8 @@ fn orca_runner_passes_through_the_orca_launch_builders() {
             "ok    orca codex sandbox: write into the git dir: blocked",
             "ok    orca codex sandbox: write into HOME: blocked",
             "ok    orca codex: user AGENTS.md: not loaded",
+            "ok    orca claude: shell startup files: not read",
+            "ok    orca codex: shell startup files: not read",
         ],
     );
     for title in ["claude", "codex", "codex_control"] {
@@ -466,9 +491,18 @@ fn orca_runner_fails_each_check_on_broken_isolation() {
             &["FAIL  orca codex: user AGENTS.md: loaded"],
         ),
         (
+            ("FAKE_CLAUDE", "startup"),
+            &["FAIL  orca claude: shell startup files: read"],
+        ),
+        (
+            ("FAKE_CODEX", "startup"),
+            &["FAIL  orca codex: shell startup files: read"],
+        ),
+        (
             ("FAKE_CODEX", "ignore"),
             &[
                 "FAIL  orca codex sandbox: write into the worktree: the probe did not run",
+                "FAIL  orca codex: shell startup files: the probe did not run",
                 "FAIL  orca codex: user AGENTS.md: control failed",
             ],
         ),

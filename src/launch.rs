@@ -508,7 +508,10 @@ fn codex_home(runroot: &Path, user_auth: &Path) -> Result<(PathBuf, Vec<(String,
             .with_context(|| format!("{}", link.display()))?,
         Err(e) => return Err(e).with_context(|| format!("{} is not a symlink", link.display())),
     }
-    let env = vec![("CODEX_HOME".into(), utf8(&home)?.into()), zdotdir(&runroot)?];
+    let env = vec![
+        ("CODEX_HOME".into(), utf8(&home)?.into()),
+        zdotdir(&runroot)?,
+    ];
     Ok((runroot, env))
 }
 
@@ -700,8 +703,12 @@ mod tests {
         ];
         for (i, mut launch) in launches.into_iter().enumerate() {
             launch.program = zsh.into();
-            launch.args = ["-lic", "echo \"<$RREVIEW_STARTUP>\""].map(String::from).into();
-            launch.env.push(("HOME".into(), home.to_str().unwrap().into()));
+            launch.args = ["-lic", "echo \"<$RREVIEW_STARTUP>\""]
+                .map(String::from)
+                .into();
+            launch
+                .env
+                .push(("HOME".into(), home.to_str().unwrap().into()));
             let seen = |launch: &Launch, log: &str| {
                 let log = root.join(log);
                 launch.run("", &log, Duration::from_secs(20)).unwrap();

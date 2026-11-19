@@ -6,7 +6,9 @@
 #   no-safe-mode    --help does not offer --safe-mode
 #   leak            runs the probe unsandboxed, as if the sandbox let everything through
 #   ignore          does not run the probe
-#   lie             skips the probe and reports "write=0 commit=0 branch=0 diff=99"
+#   lie             skips the probe and reports "write=0 commit=0 branch=0 diff=99 startup=0 control=1"
+#   startup         reports that the startup canary reached the probe (startup=1)
+#   no-control      reports that even the control did not see the startup canary (control=0)
 #   crash           writes the normal results, then exits 42
 #   hook            fires the project hooks even under --safe-mode
 #   dead-hook       never fires hooks, as if the planted hook were broken
@@ -145,11 +147,14 @@ fi
 case "$FAKE_CLAUDE" in
 ignore) reply; echo '{"type": "result", "result": "no"}'; exit 0 ;;
 leak) sh "$probe" > /dev/null 2>&1 ;;
-lie) git diff > "$out/diff.txt"; echo "write=0 commit=0 branch=0 diff=99" > "$out/probe.txt" ;;
+lie) git diff > "$out/diff.txt"; echo "write=0 commit=0 branch=0 diff=99 startup=0 control=1" > "$out/probe.txt" ;;
 *)
   # What a working sandbox lets through: git diff and writes into out/.
   git diff > "$out/diff.txt"
-  echo "write=1 commit=128 branch=128 diff=0" > "$out/probe.txt" ;;
+  s=0 k=1
+  [ "$FAKE_CLAUDE" = startup ] && s=1
+  [ "$FAKE_CLAUDE" = no-control ] && k=0
+  echo "write=1 commit=128 branch=128 diff=0 startup=$s control=$k" > "$out/probe.txt" ;;
 esac
 reply
 echo '{"type": "result", "result": "done"}'
