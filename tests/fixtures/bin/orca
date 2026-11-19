@@ -29,6 +29,7 @@
 #   refused         `terminal send` of a prompt answers "accepted": false
 #   blocked         after the prompt the agent waits on a permission dialog
 #   lost-create     `terminal create` opens the terminal, then fails without JSON
+#   no-handle       `terminal create` opens the terminal, then answers ok without a handle
 #   play            the agent plays each prompt itself: the terminal's launch line runs again
 #                   with the prompt on stdin (through rreview's shim), and the fake agent writes
 #                   its own reply (`rreview doctor --runner orca`)
@@ -108,6 +109,7 @@ case "$1 $2" in
     echo launched >> "$FAKE_LOG.orca-$role"
   fi
   [ "$scenario" = lost-create ] && { echo "transport closed" >&2; exit 1; }
+  [ "$scenario" = no-handle ] && ok '{"terminal":{}}'
   ok "{\"terminal\":{\"handle\":\"term_$role\"}}" ;;
 "terminal list")
   rows=

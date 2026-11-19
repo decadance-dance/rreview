@@ -440,7 +440,7 @@ impl Runner for Orca {
             &exe,
         )?;
         let title = self.title(pass.role);
-        let v = orca(
+        let handle = orca(
             &[
                 "terminal",
                 "create",
@@ -453,11 +453,13 @@ impl Runner for Orca {
             ],
             deadline,
         )
+        .and_then(|v| {
+            v["terminal"]["handle"]
+                .as_str()
+                .map(String::from)
+                .context("orca terminal create: no handle")
+        })
         .inspect_err(|_| self.close_titled(&title))?;
-        let handle = v["terminal"]["handle"]
-            .as_str()
-            .context("orca terminal create: no handle")?
-            .to_string();
         // Registered before anything else can fail, so `Drop` closes it at the latest.
         self.set(
             pass.role,

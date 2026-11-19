@@ -547,6 +547,17 @@ fn orca_terminals_with_a_lost_create_reply_are_closed() {
     );
 }
 
+/// A `create` that opens its terminal but answers without a handle is found by title too.
+#[test]
+fn orca_terminals_created_without_a_handle_are_closed() {
+    let run = doctor_orca(&[("FAKE_ORCA", "no-handle")]);
+    assert!(!run.passed, "{}", run.stdout);
+    let count = |what: &str| run.log.lines().filter(|l| l.starts_with(what)).count();
+    let created = count("orca terminal create");
+    assert!(created >= 2, "{}", run.log);
+    assert_eq!(created, count("orca terminal close"), "{}", run.log);
+}
+
 /// A Codex that refuses in chat, writing no reply file, still gets the script reminder, and one
 /// that never runs the probe reads as "the probe did not run", not as a failed self-test.
 #[test]
