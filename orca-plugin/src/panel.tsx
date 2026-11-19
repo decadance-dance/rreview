@@ -237,7 +237,7 @@ function passes(r: Run): { role: string; e?: PassEvent }[] {
 
 const finished = (e?: PassEvent) => e?.status === 'completed' || e?.status === 'failed'
 /** A glyph and a word: the status reads without color. */
-const STATUS: Record<string, string> = { completed: '✓ completed', failed: '✗ failed', started: '● running', wrapup: '● wrapping up' }
+const STATUS: Record<string, string> = { completed: '✓ done', failed: '✗ failed', started: '● running', wrapup: '● wrapping up' }
 /** Why a pass failed, without rreview's `pass <role> (<agent>): ` prefix the callout already shows. */
 const reason = (e?: PassEvent) => (e?.error ?? 'no reason recorded').replace(/^pass \S+ \(\S+\): /, '').slice(0, TEXT_CAP)
 
@@ -254,14 +254,17 @@ function PassRows({ r }: { r: Run }) {
             <Text size="sm">
               {role} <Text size="sm" muted>{e?.agent ?? ''}</Text>
             </Text>
-            {e ? (
-              <Text size="sm" tone={STATUS_TONE[e.status]}>
-                {`${STATUS[e.status] ?? e.status} · `}
-                {finished(e) ? duration(e.duration_ms) : <RelativeTime at={e.ts - e.duration_ms} format="duration" />}
-              </Text>
-            ) : (
-              <Text size="sm" muted>{r.status === 'running' ? '○ waiting' : '– not run'}</Text>
-            )}
+            {/* Grows to the line's end, so a status wrapped under a narrow panel stays right-aligned. */}
+            <Box grow direction="row" justify="end">
+              {e ? (
+                <Text size="sm" tone={STATUS_TONE[e.status]}>
+                  {`${STATUS[e.status] ?? e.status} · `}
+                  {finished(e) ? duration(e.duration_ms) : <RelativeTime at={e.ts - e.duration_ms} format="duration" />}
+                </Text>
+              ) : (
+                <Text size="sm" muted>{r.status === 'running' ? '○ waiting' : '– not run'}</Text>
+              )}
+            </Box>
           </Row>
         ))}
       </Stack>
@@ -359,7 +362,6 @@ function Status({ r }: { r: Run }) {
   const res = read(result)
   const list = passes(r)
   const done = list.filter(({ e }) => finished(e)).length
-  const failures = list.filter(({ e }) => e?.status === 'failed')
   const running = r.status === 'running'
   const last = Math.max(r.startedAt, ...r.events.map((e) => e.ts))
   return (
@@ -378,15 +380,6 @@ function Status({ r }: { r: Run }) {
         </Text>
       ) : r.events.length ? (
         <Text size="sm" muted>{`${done} of ${list.length} passes finished in ${duration(last - r.startedAt)}`}</Text>
-      ) : null}
-      <PassRows r={r} />
-      {failures.length ? (
-        <Callout tone="warning" title={`${failures.length} pass${failures.length === 1 ? '' : 'es'} failed`}>
-          {failures.map(({ role, e }) => (
-            <Failure key={`failure:${role}`} role={role} e={e} />
-          ))}
-          {res?.degraded ? <Text size="sm">The coordinator covered the failed lens, so the findings still stand.</Text> : null}
-        </Callout>
       ) : null}
       {r.status === 'failed' ? (
         <Callout tone="danger" title="The review failed">
@@ -418,7 +411,42 @@ function Status({ r }: { r: Run }) {
           <Text size="sm">{res.overall_explanation}</Text>
         </Callout>
       ) : null}
+      {read(sent)?.token === r.token ? <Sent /> : null}
     </Stack>
+  )
+}
+
+/** Each pass and why any failed: under the findings once there are any, the run's detail. */
+function Passes({ r }: { r: Run }) {
+  const res = read(result)
+  const failures = passes(r).filter(({ e }) => e?.status === 'failed')
+  return (
+    <Stack gap="sm">
+      <Separator />
+      <Heading level={3}>Passes</Heading>
+      <PassRows r={r} />
+      {failures.length ? (
+        <Callout tone="warning" title={`${failures.length} pass${failures.length === 1 ? '' : 'es'} failed`}>
+          {failures.map(({ role, e }) => (
+            <Failure key={`failure:${role}`} role={role} e={e} />
+          ))}
+          {res?.degraded ? <Text size="sm">The coordinator covered the failed lens, so the findings still stand.</Text> : null}
+        </Callout>
+      ) : null}
+    </Stack>
+  )
+}
+
+/** This run's last "Send to author", kept across panel reloads. */
+function Sent() {
+  const s = read(sent)
+  if (!s) return null
+  return (
+    <Callout tone="success" icon="check" title={`Sent ${s.sent} finding${s.sent === 1 ? '' : 's'} to ${s.to}`}>
+      <Text size="xs" muted>
+        The agent was asked to read <Code>{s.file}</Code>
+      </Text>
+    </Callout>
   )
 }
 
@@ -472,7 +500,6 @@ function Findings({ r }: { r: Run }) {
   const sel = list.find((f) => findingKey(f) === read(selected))
   const keys = read(picked)
   const below = res.ungated_findings.length - res.findings.length
-  const s = read(sent)
   const toggle = (v: boolean) => {
     set(showAll, v)
     const next = v ? res.ungated_findings : res.findings
@@ -521,13 +548,6 @@ function Findings({ r }: { r: Run }) {
           {`Send ${keys.length} to author`}
         </Button>
       </Row>
-      {s?.token === r.token ? (
-        <Callout tone="success" icon="check" title={`Sent ${s.sent} finding${s.sent === 1 ? '' : 's'} to ${s.to}`}>
-          <Text size="xs" muted>
-            The agent was asked to read <Code>{s.file}</Code>
-          </Text>
-        </Callout>
-      ) : null}
     </Stack>
   )
 }
@@ -550,6 +570,7 @@ export default function Panel() {
         />
       ) : null}
       {r ? <Findings r={r} /> : null}
+      {r ? <Passes r={r} /> : null}
     </Stack>
   )
 }

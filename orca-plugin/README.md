@@ -13,8 +13,9 @@ focused workspace's pull request, shows each pass while it runs, and lists the f
   time, and only while the dir's `meta.json` names this run's id (another rreview run for the same
   PR head replaces the dir, possibly with the same path and inode).
   The panel shows how many passes are done with a progress bar and the time since the run
-  started, each pass with its agent, a status that reads without color (`✓ completed`,
-  `✗ failed`, `● running`, `○ waiting`) and its time, and each failed pass with its reason.
+  started, each pass with its agent, a status that reads without color (`✓ done`, `✗ failed`,
+  `● running`, `○ waiting`) and its time, and each failed pass with its reason (a long one
+  folded). Once the review is done, the passes move below the findings.
 - **Cancel** (while a run is running) sends rreview SIGTERM; see Limits.
 - **Result**: from rreview's exit code and its JSON on stdout (`result.json`). Exit 2, a crash or
   output that is not a valid result shows as a failed review with rreview's `error:` lines and the
@@ -34,8 +35,8 @@ focused workspace's pull request, shows each pass while it runs, and lists the f
   same agent session in that workspace, and types one fixed line naming that file through
   `terminal.sendText` (capability `terminal:send`). Reviewer text is never typed, so it cannot reach
   a shell even if the agent has just exited; the line holds only characters a shell reads as plain
-  words. The panel confirms the send next to the button, naming the agent and the file, and keeps
-  that confirmation for the run across panel reloads.
+  words. The run's status then says what was sent to which agent, and keeps saying it for that
+  run across panel reloads.
 
 ## Install for development
 

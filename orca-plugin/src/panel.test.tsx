@@ -58,7 +58,7 @@ test('shows the workspace PR and starts a review with the chosen runner', async 
   assert.deepEqual(roles(view), ['intent_contracts', 'reliability', 'security', 'coordinator'])
   // Each pass with its agent, a status that reads without color, and its own running time.
   const lines = cells(view)
-  assert.equal(lines[0], 'intent_contracts codex ✓ completed · 1m 1s')
+  assert.equal(lines[0], 'intent_contracts codex ✓ done · 1m 1s')
   assert.match(lines[1], /^reliability claude ● running · \S+$/)
   assert.equal(lines[3], 'coordinator ○ waiting')
   // A running pass's time ticks from its start.
@@ -133,7 +133,7 @@ test('a finished review lists findings by file and sends the picked ones', async
     name: 'findings.send',
     input: { terminalId: 't1', sessionId: 's1', keys: ['src/orca.rs#120#Terminal leaks when close fails'] }
   })
-  // The confirmation sits by the button, names the agent and the file, and outlives the panel.
+  // The confirmation joins the run status, names the agent and the file, and outlives the panel.
   assert.match(view.summary().join('\n'), /Callout success "Sent 1 finding to claude author \(waiting\)"/)
   assert.match(JSON.stringify(view.tree()), /author-1\.md/)
   const kept = view.persisted.plugin.sent
