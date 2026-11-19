@@ -561,6 +561,14 @@ fn assert_inherited_only_what_the_cli_needs(fx: &Fixture) {
         codex.iter().any(|l| l.starts_with("CODEX_HOME=")),
         "{codex:?}"
     );
+    // The user's zsh startup files stay out of the reviewer's commands (spec §3).
+    for env in [&claude, &codex] {
+        assert!(
+            env.iter()
+                .any(|l| l.starts_with("ZDOTDIR=/") && l.ends_with("/zdotdir")),
+            "{env:?}"
+        );
+    }
 }
 
 #[test]
@@ -2261,7 +2269,7 @@ fn orca_pass_end_to_end() {
             )
         } else {
             format!(
-                "'-C' '{}' '-s' 'workspace-write' '-a' 'never' '-c' 'sandbox_workspace_write.exclude_slash_tmp=true' '-c' 'sandbox_workspace_write.exclude_tmpdir_env_var=true' '-c' 'check_for_update_on_startup=false' '-c' 'shell_environment_policy.include_only=[\"PATH\",\"HOME\",\"USER\",\"LOGNAME\",\"SHELL\",\"TMPDIR\",\"LANG\",\"LC_ALL\",\"LC_CTYPE\",\"LC_COLLATE\",\"LC_MESSAGES\",\"LC_MONETARY\",\"LC_NUMERIC\",\"LC_TIME\",\"TZ\",\"TERM\",\"COLORTERM\",\"HTTPS_PROXY\",\"https_proxy\",\"NO_PROXY\",\"no_proxy\",\"NODE_EXTRA_CA_CERTS\",\"SSL_CERT_FILE\"]'",
+                "'-C' '{}' '-s' 'workspace-write' '-a' 'never' '-c' 'sandbox_workspace_write.exclude_slash_tmp=true' '-c' 'sandbox_workspace_write.exclude_tmpdir_env_var=true' '-c' 'check_for_update_on_startup=false' '-c' 'shell_environment_policy.include_only=[\"PATH\",\"HOME\",\"USER\",\"LOGNAME\",\"SHELL\",\"TMPDIR\",\"LANG\",\"LC_ALL\",\"LC_CTYPE\",\"LC_COLLATE\",\"LC_MESSAGES\",\"LC_MONETARY\",\"LC_NUMERIC\",\"LC_TIME\",\"TZ\",\"TERM\",\"COLORTERM\",\"HTTPS_PROXY\",\"https_proxy\",\"NO_PROXY\",\"no_proxy\",\"NODE_EXTRA_CA_CERTS\",\"SSL_CERT_FILE\",\"ZDOTDIR\"]'",
                 out.display()
             )
         };
@@ -2290,6 +2298,13 @@ fn orca_pass_end_to_end() {
             agent == "codex",
             "{shim}"
         );
+        // An empty ZDOTDIR keeps the user's zsh startup files out of the reviewer's commands.
+        let zdotdir = runroot.join("scratch/reliability/zdotdir");
+        assert!(
+            shim.contains(&format!("'ZDOTDIR={}'", zdotdir.display())),
+            "{shim}"
+        );
+        assert_eq!(fs::read_dir(&zdotdir).unwrap().count(), 0);
         // Each wait is a slice of at most 10 s, between which rreview looks for a dialog.
         let ms: Vec<u64> = run
             .log

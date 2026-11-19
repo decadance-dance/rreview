@@ -327,7 +327,7 @@ pub fn claude(worktree: &Path, git_common_dir: &Path, runroot: &Path) -> Result<
         .map(String::from)
         .into(),
         inherit: [INHERIT, CLAUDE_INHERIT].concat(),
-        env: vec![],
+        env: vec![zdotdir(runroot)?],
         cwd,
     })
 }
@@ -355,7 +355,7 @@ pub fn claude_tui(worktree: &Path, git_common_dir: &Path, runroot: &Path) -> Res
         .map(String::from)
         .into(),
         inherit: [INHERIT, CLAUDE_INHERIT].concat(),
-        env: vec![],
+        env: vec![zdotdir(runroot)?],
         cwd,
     })
 }
@@ -435,10 +435,15 @@ pub fn codex(worktree: &Path, runroot: &Path, out_name: &str, user_auth: &Path) 
 /// `-a never` returns a refused command to the model instead of asking the user.
 /// Orca's `codex` shell function prepends `-c shell_environment_policy.set.ORCA_*=...` (its
 /// terminal and workspace ids, its data dir); Codex applies `include_only` after `set`, so the
-/// reviewer's commands get only the allowlist, whichever `-c` comes first (spec §3).
+/// reviewer's commands get only the allowlist and the run's `ZDOTDIR` ([`zdotdir`]), whichever
+/// `-c` comes first (spec §3).
 pub fn codex_tui(worktree: &Path, runroot: &Path, user_auth: &Path) -> Result<Launch> {
     let worktree = absolute(worktree)?;
-    let names: Vec<_> = INHERIT.iter().map(|n| format!("\"{n}\"")).collect();
+    let names: Vec<_> = INHERIT
+        .iter()
+        .chain(&["ZDOTDIR"])
+        .map(|n| format!("\"{n}\""))
+        .collect();
     let include_only = format!(
         "shell_environment_policy.include_only=[{}]",
         names.join(",")
@@ -471,8 +476,18 @@ pub fn codex_tui(worktree: &Path, runroot: &Path, user_auth: &Path) -> Result<La
     })
 }
 
+/// `ZDOTDIR=<runroot>/zdotdir`, an empty dir no pass can write: zsh reads its startup files
+/// (`.zshenv`, and `.zprofile` and `.zshrc` for Codex's login shell and shell snapshot) from
+/// there instead of `$HOME`, so nothing the user's own ones export reaches a reviewer's commands
+/// (spec §3, *verified* for Claude's Bash and Codex's shell tool).
+fn zdotdir(runroot: &Path) -> Result<(String, String)> {
+    let dir = runroot.join("zdotdir");
+    fs::create_dir_all(&dir).with_context(|| format!("{}", dir.display()))?;
+    Ok(("ZDOTDIR".into(), utf8(&absolute(&dir)?)?.into()))
+}
+
 /// Creates `<runroot>/codex-home` with only the auth symlink; returns the resolved run root and
-/// the `CODEX_HOME` env.
+/// the `CODEX_HOME` and [`zdotdir`] env.
 fn codex_home(runroot: &Path, user_auth: &Path) -> Result<(PathBuf, Vec<(String, String)>)> {
     let user_auth = absolute(user_auth).context("Codex login (auth.json) not found")?;
     fs::create_dir_all(runroot).with_context(|| format!("{}", runroot.display()))?;
@@ -493,7 +508,8 @@ fn codex_home(runroot: &Path, user_auth: &Path) -> Result<(PathBuf, Vec<(String,
             .with_context(|| format!("{}", link.display()))?,
         Err(e) => return Err(e).with_context(|| format!("{} is not a symlink", link.display())),
     }
-    Ok((runroot, vec![("CODEX_HOME".into(), utf8(&home)?.into())]))
+    let env = vec![("CODEX_HOME".into(), utf8(&home)?.into()), zdotdir(&runroot)?];
+    Ok((runroot, env))
 }
 
 /// The user's Codex login: `$CODEX_HOME/auth.json`, else `~/.codex/auth.json`.
@@ -545,7 +561,14 @@ mod tests {
                 "json"
             ]
         );
-        assert!(launch.env.is_empty());
+        assert_eq!(
+            launch.env,
+            [(
+                "ZDOTDIR".to_string(),
+                root.join("run/zdotdir").to_str().unwrap().to_string()
+            )]
+        );
+        assert_eq!(fs::read_dir(root.join("run/zdotdir")).unwrap().count(), 0);
         assert_eq!(launch.cwd, wt);
         let s: Value = serde_json::from_str(&fs::read_to_string(&settings_path).unwrap()).unwrap();
         assert_eq!(
@@ -627,7 +650,13 @@ mod tests {
         );
         assert_eq!(
             launch.env,
-            [("CODEX_HOME".to_string(), home.to_str().unwrap().to_string())]
+            [
+                ("CODEX_HOME".to_string(), home.to_str().unwrap().to_string()),
+                (
+                    "ZDOTDIR".to_string(),
+                    root.join("run/zdotdir").to_str().unwrap().to_string()
+                )
+            ]
         );
         let entries: Vec<_> = fs::read_dir(&home)
             .unwrap()
@@ -641,6 +670,47 @@ mod tests {
                 .is_symlink()
         );
         assert_eq!(fs::read_link(home.join("auth.json")).unwrap(), auth);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    /// A `.zshenv` in `HOME` exports a canary; zsh run with a reviewer's env must not see it,
+    /// while the same env without `ZDOTDIR` does, or the check proves nothing.
+    #[test]
+    fn a_reviewer_shell_skips_the_user_zsh_startup_files() {
+        let Some(zsh) = ["/bin/zsh", "/usr/bin/zsh"]
+            .into_iter()
+            .find(|p| Path::new(p).exists())
+        else {
+            eprintln!("skipped: no zsh");
+            return;
+        };
+        let root = fresh_temp_dir("rreview-test").unwrap();
+        let (wt, home, auth) = (root.join("wt"), root.join("home"), root.join("auth.json"));
+        fs::create_dir_all(&wt).unwrap();
+        fs::create_dir_all(&home).unwrap();
+        fs::write(&auth, "{}").unwrap();
+        for f in [".zshenv", ".zprofile", ".zshrc"] {
+            fs::write(home.join(f), format!("export RREVIEW_STARTUP={f}\n")).unwrap();
+        }
+        let launches = [
+            claude(&wt, &wt, &root.join("c")).unwrap(),
+            claude_tui(&wt, &wt, &root.join("ct")).unwrap(),
+            codex(&wt, &root.join("x"), "r.json", &auth).unwrap(),
+            codex_tui(&wt, &root.join("xt"), &auth).unwrap(),
+        ];
+        for (i, mut launch) in launches.into_iter().enumerate() {
+            launch.program = zsh.into();
+            launch.args = ["-lic", "echo \"<$RREVIEW_STARTUP>\""].map(String::from).into();
+            launch.env.push(("HOME".into(), home.to_str().unwrap().into()));
+            let seen = |launch: &Launch, log: &str| {
+                let log = root.join(log);
+                launch.run("", &log, Duration::from_secs(20)).unwrap();
+                fs::read_to_string(log.with_extension("stdout")).unwrap()
+            };
+            assert_eq!(seen(&launch, &format!("l{i}")), "<>\n", "{launch:?}");
+            launch.env.retain(|(k, _)| k != "ZDOTDIR");
+            assert_eq!(seen(&launch, &format!("c{i}")), "<.zshrc>\n", "control");
+        }
         fs::remove_dir_all(root).unwrap();
     }
 
