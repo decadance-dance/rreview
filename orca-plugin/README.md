@@ -18,7 +18,7 @@ rows at the top.
   each pass with its agent, a status that reads without color (`✓ done`, `✗ failed`,
   `● running`, `○ waiting`) and its time, and each failed pass with its reason (a long one
   folded). Once the run ends they fold into **Passes** at the bottom, open when a pass failed.
-- **Cancel** (the stop button beside Running…) sends rreview SIGTERM; see Limits.
+- **Cancel** (the stop button beside the running badge) sends rreview SIGTERM; see Limits.
 - **Result**: from rreview's exit code and its JSON on stdout (`result.json`). Exit 2, a crash or
   output that is not a valid result shows as a failed review with rreview's `error:` lines and the
   run dir; a review where a panelist or the judge failed shows as degraded.

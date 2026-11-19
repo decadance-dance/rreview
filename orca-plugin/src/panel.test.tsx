@@ -47,6 +47,8 @@ test('shows the workspace PR and starts a review with the chosen runner', async 
   assert.match(view.summary().join('\n') + JSON.stringify(view.tree()), /Orca runner/)
   // Ready: what a run does, before the first one.
   assert.match(view.summary().join('\n'), /No review yet/)
+  // The workspace has a PR: Other PR… stays folded, so the header keeps its two rows.
+  assert.equal(view.find({ type: 'Collapsible', text: /Other PR/ })?.props?.open, false)
   await view.select({ label: 'Runner' }, 'orca')
   await view.press({ text: 'Run review' })
   assert.deepEqual(calls.at(-1), { name: 'review.start', input: { workspaceId: 'ws1', pr: '', runner: 'orca' } })
