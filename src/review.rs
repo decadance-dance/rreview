@@ -4,12 +4,11 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, OpenOptions};
-use std::io::{Read, Write};
+use std::io::Write;
 use std::os::unix::fs::DirBuilderExt;
 use std::os::unix::process::CommandExt;
 use std::path::{Component, Path, PathBuf};
 use std::process::{Command, Output, Stdio};
-use std::thread::JoinHandle;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -244,6 +243,8 @@ pub fn run(args: &Args) -> Result<u8> {
     );
     // Printed now, not only at the end: the Orca plugin tails progress.jsonl here during the run.
     eprintln!("run id: {run_id}\nrun dir: {}", runroot.display());
+    // Before the worktree guard, so it records a stop once the cleanup is done.
+    let mut stop = StopRecord(Some(Progress(runroot.join("progress.jsonl"))));
     // The guard exists before the checkout: a failed one (a post-checkout hook) can leave a
     // registered, half-made worktree behind.
     let ran = |r: &str| panel.iter().any(|p| p.id == r) || args.only.is_none();
@@ -430,6 +431,7 @@ pub fn run(args: &Args) -> Result<u8> {
         drop(wt);
         // A signal during the cleanup still fails the run.
         launch::interrupted()?;
+        stop.0 = None;
         eprintln!("run dir: {}", runroot.display());
         return Ok(if degraded { 2 } else { 0 });
     }
@@ -484,6 +486,7 @@ pub fn run(args: &Args) -> Result<u8> {
     drop(wt);
     // A signal during the passes or the cleanup fails the run: no result.json.
     launch::interrupted()?;
+    stop.0 = None;
 
     let ungated = result::dedupe(findings, args.gate);
     let result = ReviewResult {
@@ -739,8 +742,7 @@ impl<R: Runner> Ctx<'_, R> {
 
 /// The review worktree; removed when dropped (also on an error path or an interrupt) unless
 /// kept.
-// limit: a killed rreview (SIGKILL, a second Ctrl-C) leaves it; the next run for the same head
-// says so.
+// limit: a killed rreview (SIGKILL) leaves it; the next run for the same head says so.
 struct Worktree {
     path: PathBuf,
     keep: bool,
@@ -783,18 +785,39 @@ impl Progress {
         started: Instant,
         error: Option<&str>,
     ) -> Result<()> {
-        let ts = SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis();
         let mut event = json!({
-            "ts": ts as u64, "role": pass.role, "status": status, "agent": pass.agent.to_string(),
+            "role": pass.role, "status": status, "agent": pass.agent.to_string(),
             "model": pass.model.unwrap_or("default"), "duration_ms": started.elapsed().as_millis() as u64,
         });
         if let Some(error) = error {
             event["error"] = error.into();
         }
-        // One write per line: passes run in parallel threads and append to the same file.
+        self.append(event)
+    }
+
+    /// Appends `event` with its `ts`, in one write: passes run in parallel threads and append to
+    /// the same file.
+    fn append(&self, mut event: serde_json::Value) -> Result<()> {
+        event["ts"] = (SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis() as u64).into();
         let mut file = OpenOptions::new().create(true).append(true).open(&self.0)?;
         file.write_all(format!("{event}\n").as_bytes())
             .with_context(|| format!("{}", self.0.display()))
+    }
+}
+
+/// While armed, records a signal that stopped the run as the last line of progress.jsonl,
+/// `{ts, role: "run", status: "interrupted", error}` (spec §5); dropped after the worktree, so
+/// once the cleanup is done. A run that got past its last check disarms it.
+struct StopRecord(Option<Progress>);
+
+impl Drop for StopRecord {
+    fn drop(&mut self) {
+        if let (Some(progress), Err(e)) = (&self.0, launch::interrupted()) {
+            let event = json!({ "role": "run", "status": "interrupted", "error": e.to_string() });
+            if let Err(e) = progress.append(event) {
+                eprintln!("warning: {e:#}");
+            }
+        }
     }
 }
 
@@ -806,7 +829,7 @@ fn view_pr(pr: &str, repo: Option<&str>, deadline: Option<Instant>) -> Result<Pr
     if let Some(repo) = repo {
         cmd.args(["--repo", repo]);
     }
-    let out = output(&mut cmd, deadline).context("cannot run gh")?;
+    let out = output(&mut cmd, deadline)?;
     if !out.status.success() {
         bail!(
             "gh pr view {pr}: {}",
@@ -829,8 +852,7 @@ fn pr_commit<'a>(
     let out = output(
         Command::new("gh").args(["api", "--paginate", "--jq", ".[].sha", &path]),
         deadline,
-    )
-    .context("cannot run gh")?;
+    )?;
     if !out.status.success() {
         bail!(
             "gh api {path}: {}",
@@ -938,7 +960,7 @@ fn git(args: &[&str], deadline: Option<Instant>) -> Result<String> {
 
 /// Git's stdout as it is.
 fn git_raw(args: &[&str], deadline: Option<Instant>) -> Result<Vec<u8>> {
-    let out = output(Command::new("git").args(args), deadline).context("cannot run git")?;
+    let out = output(Command::new("git").args(args), deadline)?;
     if !out.status.success() {
         bail!(
             "git {}: {}",
@@ -970,56 +992,21 @@ fn cleanup_git(args: &[&str]) -> Result<()> {
     Ok(())
 }
 
-/// Runs `cmd` to its end with no stdin, in its own process group (when rreview catches
+/// Runs `cmd` to its end (see [`launch::output`]) in its own process group (when rreview catches
 /// interrupts; else in rreview's, as `rreview show` does), which is killed at the deadline (the
 /// review's budget; None: none) or on an interrupt; past either it does not start.
 fn output(cmd: &mut Command, deadline: Option<Instant>) -> Result<Output> {
-    cmd.stdin(Stdio::null());
     let program = cmd.get_program().to_string_lossy().into_owned();
-    let spent = || anyhow!("the review's budget ran out while preparing ({program})");
-    let past = || deadline.is_some_and(|d| Instant::now() >= d);
-    launch::interrupted()?;
-    if past() {
-        return Err(spent());
-    }
     if launch::catching() {
         cmd.process_group(0);
     }
-    let mut child = cmd.stdout(Stdio::piped()).stderr(Stdio::piped()).spawn()?;
-    // Reader threads, so a full pipe cannot stall the child while we wait on it.
-    fn read(pipe: Option<impl Read + Send + 'static>) -> JoinHandle<Vec<u8>> {
-        std::thread::spawn(move || {
-            let mut buf = vec![];
-            if let Some(mut pipe) = pipe {
-                let _ = pipe.read_to_end(&mut buf);
-            }
-            buf
-        })
-    }
-    let (stdout, stderr) = (read(child.stdout.take()), read(child.stderr.take()));
-    loop {
-        // A descendant can hold the pipes after the leader exits, so the drain is under the
-        // deadline too: done only when the leader has exited and both pipes reached EOF.
-        if let Some(status) = child.try_wait()?
-            && stdout.is_finished()
-            && stderr.is_finished()
-        {
-            return Ok(Output {
-                status,
-                stdout: stdout.join().unwrap_or_default(),
-                stderr: stderr.join().unwrap_or_default(),
-            });
+    launch::output(cmd, deadline, true).map_err(|e| {
+        if e.is::<launch::TimedOut>() {
+            anyhow!("the review's budget ran out while preparing ({program})")
+        } else {
+            e
         }
-        if let Err(e) = launch::interrupted() {
-            launch::kill_group(&mut child);
-            return Err(e);
-        }
-        if past() {
-            launch::kill_group(&mut child);
-            return Err(spent());
-        }
-        std::thread::sleep(Duration::from_millis(20));
-    }
+    })
 }
 
 #[cfg(test)]

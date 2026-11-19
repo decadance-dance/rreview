@@ -9,9 +9,10 @@ use std::collections::HashMap;
 use std::fs::{self, File};
 use std::io::{ErrorKind, Read, Write};
 use std::os::unix::fs::OpenOptionsExt;
+use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::{Mutex, mpsc};
+use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
@@ -121,7 +122,9 @@ pub fn check_branch_free(name: &str) -> Result<()> {
 /// `check_branch_free`), in the repository of `git_common_dir`, so Orca tracks the reviewers'
 /// terminals in it (spec §4). Repo setup hooks are skipped: they would run the reviewed PR's
 /// code. Returns the worktree path.
-/// `deadline` is the review's budget; it is capped at `SETUP`.
+/// `deadline` is the review's budget; it is capped at `SETUP`. It does not start after an
+/// interrupt, but once started runs to its end: the app may finish a create whose CLI was killed,
+/// after the cleanup looked for its worktree.
 pub fn create_worktree(
     git_common_dir: &Path,
     name: &str,
@@ -130,7 +133,8 @@ pub fn create_worktree(
 ) -> Result<PathBuf> {
     let branch = branch_for(name);
     let repo = main_checkout(git_common_dir);
-    let v = orca(
+    launch::interrupted()?;
+    let v = orca_to_end(
         &[
             "worktree",
             "create",
@@ -163,7 +167,8 @@ pub fn create_worktree(
 }
 
 /// Removes the worktree on `branch_for(name)` and that branch, found through git rather than
-/// Orca's reply, so a create whose reply was lost is cleaned up as well.
+/// Orca's reply, so a create whose reply was lost is cleaned up as well. A cleanup step: every
+/// call runs to its end in its own process group, whatever the interrupt flag says.
 pub fn remove_worktree(name: &str) -> Result<()> {
     let branch = branch_for(name);
     let list = git(&["worktree", "list", "--porcelain"])?;
@@ -175,7 +180,7 @@ pub fn remove_worktree(name: &str) -> Result<()> {
             .then_some(path)
     });
     if let Some(path) = path {
-        let removed = orca(
+        let removed = orca_to_end(
             &[
                 "worktree",
                 "rm",
@@ -204,11 +209,14 @@ pub fn remove_worktree(name: &str) -> Result<()> {
     Ok(())
 }
 
-/// Git in the current repository; its stdout.
+/// Git in the current repository; its stdout. In its own process group, so the terminal's Ctrl-C
+/// does not cut a cleanup step short, and run to its end.
+// limit: no deadline, as the headless runner's cleanup git.
 fn git(args: &[&str]) -> Result<String> {
     let out = Command::new("git")
         .args(args)
         .stdin(Stdio::null())
+        .process_group(0)
         .output()
         .context("cannot run git")?;
     if !out.status.success() {
@@ -288,7 +296,7 @@ impl Orca {
     /// lost may still have opened one. Best effort; a failure is a warning.
     // limit: a create that opens its terminal only after this listing still leaves it open.
     fn close_titled(&self, title: &str) {
-        let listed = orca(
+        let listed = orca_to_end(
             &["terminal", "list", "--worktree", &self.terminal_worktree],
             Instant::now().checked_add(CLOSE),
         );
@@ -452,7 +460,10 @@ impl Runner for Orca {
             &exe,
         )?;
         let title = self.title(pass.role);
-        let handle = orca(
+        // No terminal opens after an interrupt; one being created is waited for, as Orca may
+        // open it after its CLI was killed.
+        launch::interrupted()?;
+        let handle = orca_to_end(
             &[
                 "terminal",
                 "create",
@@ -590,6 +601,7 @@ fn wait(handle: &str, deadline: Option<Instant>) -> Result<Wait> {
             &ms.to_string(),
         ],
         backstop,
+        true,
     )?;
     // An answer that arrives past the deadline (inside the backstop) is not accepted.
     if left(deadline).is_zero() {
@@ -666,7 +678,7 @@ fn send_keys(handle: &str, keys: &str, deadline: Option<Instant>) -> Result<()> 
 }
 
 fn close(handle: &str) -> Result<()> {
-    orca(
+    orca_to_end(
         &["terminal", "close", "--terminal", handle],
         Instant::now().checked_add(CLOSE),
     )
@@ -784,9 +796,20 @@ fn read_reply(path: &Path) -> Result<Option<String>> {
     }
 }
 
-/// `orca <args> --json` within `deadline`; the `result` of a successful call.
+/// `orca <args> --json` within `deadline`, stopped by an interrupt; the `result` of a successful
+/// call.
 fn orca(args: &[&str], deadline: Option<Instant>) -> Result<Value> {
-    let (mut out, success) = run_orca(args, deadline)?;
+    call(args, deadline, true)
+}
+
+/// As [`orca`], but run to its end whatever the interrupt flag says: a cleanup step, or a create
+/// whose effect the app may finish without its CLI.
+fn orca_to_end(args: &[&str], deadline: Option<Instant>) -> Result<Value> {
+    call(args, deadline, false)
+}
+
+fn call(args: &[&str], deadline: Option<Instant>, interruptible: bool) -> Result<Value> {
+    let (mut out, success) = run_orca(args, deadline, interruptible)?;
     if out["ok"] != true || !success {
         bail!(
             "orca {}: {}",
@@ -798,41 +821,33 @@ fn orca(args: &[&str], deadline: Option<Instant>) -> Result<Value> {
 }
 
 /// `orca <args> --json`: its JSON whether the call succeeded or not, and whether it exited 0.
-/// (`terminal wait` exits 1 with `"ok": true` when the agent is blocked on a dialog.) A call
-/// still running at `deadline` is killed with its process group and returns `TimedOut`.
-fn run_orca(args: &[&str], deadline: Option<Instant>) -> Result<(Value, bool)> {
-    use std::os::unix::process::CommandExt;
-    let child = Command::new("orca")
-        .args(args)
-        .arg("--json")
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .process_group(0)
-        .spawn()
-        .context("cannot run orca")?;
-    let pid = child.id();
-    let (tx, rx) = mpsc::channel();
-    // The output is read on a thread, so a full pipe cannot stall the deadline below.
-    std::thread::spawn(move || tx.send(child.wait_with_output()));
-    let out = match rx.recv_timeout(left(deadline)) {
-        Ok(out) => out.context("cannot run orca")?,
-        Err(_) => {
-            let _ = Command::new("kill")
-                .args(["-KILL", "--", &format!("-{pid}")])
-                .stderr(Stdio::null())
-                .status();
-            return Err(TimedOut(format!(
-                "orca {} did not answer in time",
-                args[..args.len().min(2)].join(" ")
-            ))
-            .into());
+/// (`terminal wait` exits 1 with `"ok": true` when the agent is blocked on a dialog.) The call
+/// runs in its own process group, which is killed at `deadline` (the call returns `TimedOut`)
+/// and, when `interruptible`, on an interrupt (see [`launch::output`]).
+fn run_orca(
+    args: &[&str],
+    deadline: Option<Instant>,
+    interruptible: bool,
+) -> Result<(Value, bool)> {
+    let name = args[..args.len().min(2)].join(" ");
+    let out = launch::output(
+        Command::new("orca")
+            .args(args)
+            .arg("--json")
+            .process_group(0),
+        deadline,
+        interruptible,
+    )
+    .map_err(|e| {
+        if e.is::<TimedOut>() {
+            TimedOut(format!("orca {name} did not answer in time")).into()
+        } else {
+            e
         }
-    };
+    })?;
     let v = serde_json::from_slice(&out.stdout).with_context(|| {
         format!(
-            "orca {}: no JSON reply ({}): {}",
-            args[..args.len().min(2)].join(" "),
+            "orca {name}: no JSON reply ({}): {}",
             out.status,
             String::from_utf8_lossy(&out.stderr).trim()
         )

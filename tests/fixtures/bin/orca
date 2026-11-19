@@ -5,8 +5,8 @@
 # handle `term_<role>` and plays the agent: a prompt (`terminal send --enter`) names the reply
 # file, and the next `terminal wait` that finds the agent idle writes the reply there: the first
 # turn $FAKE_OUT_<role> (default $FAKE_REPLY), later turns $FAKE_RESUME_<role> (default the same).
-# A wait that times out first sleeps its --timeout-ms. Per-terminal state is in
-# $FAKE_LOG.orca-<role>: `open`, `sent`, `closed`, ...
+# A wait that times out first records its pid in $FAKE_LOG.orcawait, then sleeps its --timeout-ms.
+# Per-terminal state is in $FAKE_LOG.orca-<role>: `open`, `sent`, `closed`, ...
 # FAKE_ORCA:
 #   ok (default)    replies to every turn
 #   trust           the agent waits on its trust dialog until it gets Enter, then as ok
@@ -50,6 +50,7 @@ arg() { # the value of option $1 in the remaining args
 ok() { printf '{"ok":true,"result":%s}\n' "$1"; exit 0; }
 blocked() { printf '{"ok":true,"result":{"wait":{"satisfied":false,"status":"running","blockedReason":"%s"}}}\n' "$1"; exit 1; }
 timeout() {
+  [ -n "$FAKE_LOG" ] && echo $$ >> "$FAKE_LOG.orcawait"
   sleep "$(awk "BEGIN { print $(arg --timeout-ms "$@") / 1000 }")"
   echo '{"ok":false,"error":{"code":"timeout","message":"timeout"}}'; exit 1
 }

@@ -35,7 +35,7 @@ impl Drop for Fixture {
         // single processes.
         if std::thread::panicking() {
             let read = |name: &str| fs::read_to_string(self.root.join(name)).unwrap_or_default();
-            for name in ["log.rreview", "log.reviewer", "log.cleanup"] {
+            for name in ["log.rreview", "log.reviewer", "log.cleanup", "log.orcawait"] {
                 for pid in read(name).split_whitespace() {
                     kill("-KILL", &format!("-{pid}"));
                 }
@@ -192,9 +192,9 @@ impl Fixture {
             for fake in ["gh", "claude", "codex", "orca"] {
                 std::os::unix::fs::symlink(fixtures.join(fake), bin.join(fake)).unwrap();
             }
-            // The real git, but a `git worktree remove` (rreview's cleanup, in its own group)
-            // records its pid in $FAKE_LOG.cleanup and first stalls $FAKE_GIT_STALL seconds,
-            // a window to signal rreview during its cleanup.
+            // The real git, but a `git worktree remove` or `git branch -D` (rreview's cleanup,
+            // in its own group) records its pid in $FAKE_LOG.cleanup and first stalls
+            // $FAKE_GIT_STALL seconds, a window to signal rreview during its cleanup.
             let out = Command::new("sh")
                 .args(["-c", "command -v git"])
                 .output()
@@ -203,7 +203,7 @@ impl Fixture {
             script(
                 &bin.join("git"),
                 &format!(
-                    "case \"$*\" in *\"worktree remove\"*) echo $$ >> \"$FAKE_LOG.cleanup\"; sleep \"${{FAKE_GIT_STALL:-0}}\";; esac\nexec '{real}' \"$@\""
+                    "case \"$*\" in *\"worktree remove\"*|*\"branch -D\"*) echo $$ >> \"$FAKE_LOG.cleanup\"; sleep \"${{FAKE_GIT_STALL:-0}}\";; esac\nexec '{real}' \"$@\""
                 ),
             );
         }
@@ -914,7 +914,22 @@ fn an_interrupt_kills_every_reviewer_and_removes_the_worktree() {
             3,
         );
         fx.assert_worktree_removed();
+        assert_stop_recorded(&fx, &name);
     }
+}
+
+/// The last line of progress.jsonl records the signal that stopped the run (issue #27).
+fn assert_stop_recorded(fx: &Fixture, signal: &str) {
+    let last = fx.progress().pop().unwrap();
+    assert_eq!(
+        (&last["role"], &last["status"], &last["error"]),
+        (
+            &json!("run"),
+            &json!("interrupted"),
+            &json!(format!("interrupted by {signal}"))
+        ),
+        "{last}"
+    );
 }
 
 /// A checkout cut short leaves its worktree registration locked; the cleanup still removes it.
@@ -3080,4 +3095,86 @@ fn orca_runner_reviews_the_head_given() {
         (Some(fx.head.as_str()), Some("orca"))
     );
     fx.assert_orca_worktree_removed();
+}
+
+/// Issue #27: a signal while the orca runner prepares, waits on a pass or waits on its wrap-up
+/// kills the Orca call it waits on, closes every terminal the run opened and removes its worktree
+/// and branch. The terminal's Ctrl-C during that cleanup cuts neither `orca worktree rm` nor
+/// `git branch -D` short. The run fails, and progress.jsonl ends with the stop.
+#[test]
+fn orca_an_interrupt_closes_every_terminal_and_removes_the_worktree() {
+    let reply = envelope("src/lib.rs").to_string();
+    for (phase, signal) in [
+        ("preparation", "-TERM"),
+        ("pass", "-INT"),
+        ("wrap-up", "-TERM"),
+    ] {
+        let fx = fixture();
+        // The waits that hang until rreview kills them (or, before a wrap-up, the timeout ends).
+        let (scenario, timeout, waits) = match phase {
+            "preparation" => ("ok", "900", 0),
+            "pass" => ("hang", "900", 3),
+            _ => ("hang", "5", 6),
+        };
+        let delay = if phase == "preparation" { "2" } else { "" };
+        let child = fx.spawn(
+            &["7", "--runner", "orca", "--timeout", timeout],
+            &[
+                ("FAKE_ORCA", scenario.into()),
+                ("FAKE_REPLY", reply.clone()),
+                ("FAKE_ORCA_CREATE_DELAY", delay.into()),
+                ("FAKE_GIT_STALL", "2".into()),
+            ],
+        );
+        let pid = child.id().to_string();
+        if phase == "preparation" {
+            wait_for("the worktree create", || {
+                fs::read_to_string(fx.root.join("log"))
+                    .unwrap_or_default()
+                    .contains("orca worktree create")
+            });
+        } else {
+            wait_for("the agents' waits", || fx.lines("log.orcawait") == waits);
+        }
+        assert!(kill(signal, &pid));
+        // The terminal's Ctrl-C reaches rreview's whole group: during `orca worktree rm`, then
+        // during `git branch -D`.
+        for n in [1, 2] {
+            wait_for("the cleanup", || fx.lines("log.cleanup") == n);
+            assert!(
+                kill("-INT", &format!("-{pid}")),
+                "rreview ended before its cleanup did"
+            );
+        }
+        let run = fx.finish(child);
+        assert_eq!(run.code, Some(2), "{phase}: {run:?}");
+        let name = signal.replace('-', "SIG");
+        assert!(
+            run.stderr.contains(&format!("interrupted by {name}")),
+            "{phase}: {run:?}"
+        );
+        assert_eq!(fx.result(), None);
+        let panel = ["intent_contracts", "reliability", "security"];
+        let opened = if phase == "preparation" { 0 } else { 3 };
+        assert_eq!(
+            run.log.matches("orca terminal create").count(),
+            opened,
+            "{phase}: {run:?}"
+        );
+        for role in &panel[..opened] {
+            fx.assert_terminal_closed(role);
+        }
+        if phase == "wrap-up" {
+            assert_eq!(
+                fx.statuses_of("reliability"),
+                ["started", "wrapup", "failed"]
+            );
+        }
+        assert_all_dead(
+            &fs::read_to_string(fx.root.join("log.orcawait")).unwrap_or_default(),
+            waits,
+        );
+        fx.assert_orca_worktree_removed();
+        assert_stop_recorded(&fx, &name);
+    }
 }
