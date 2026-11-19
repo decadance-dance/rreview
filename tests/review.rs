@@ -2228,6 +2228,8 @@ fn orca_pass_end_to_end() {
                 "terminal create",
                 "terminal show",
                 "terminal wait",
+                // No dialog open: nothing is typed into one.
+                "terminal show",
                 "terminal send",
                 "terminal wait",
                 "terminal close",
@@ -2288,7 +2290,7 @@ fn orca_pass_end_to_end() {
             agent == "codex",
             "{shim}"
         );
-        // Each wait gets what is left of the pass's 900 s.
+        // Each wait is a slice of at most 5 s, between which rreview looks for a dialog.
         let ms: Vec<u64> = run
             .log
             .split("--for tui-idle --timeout-ms ")
@@ -2296,7 +2298,7 @@ fn orca_pass_end_to_end() {
             .map(|r| r.split(' ').next().unwrap().parse().unwrap())
             .collect();
         assert_eq!(ms.len(), 2, "{run:?}");
-        assert!(ms.iter().all(|&m| m <= 900_000 && m > 890_000), "{ms:?}");
+        assert!(ms.iter().all(|&m| m <= 5_000 && m > 4_000), "{ms:?}");
         assert!(
             run.log
                 .contains("orca terminal close --terminal term_reliability --json"),
@@ -2494,6 +2496,47 @@ fn orca_types_the_wrap_up_at_the_timeout_and_closes_the_terminal_after_it() {
     );
     assert_eq!(fx.out(), None);
     fx.assert_orca_worktree_removed();
+}
+
+#[test]
+fn orca_fails_a_pass_stuck_on_a_dialog_and_types_nothing_into_it() {
+    let env = envelope("src/lib.rs");
+    // `tui-idle` only times out while the dialog shows; Orca's `agentWait` names it.
+    let fx = fixture();
+    let start = Instant::now();
+    let run = orca_run(&fx, &["--timeout", "30"], "dialog", &env);
+    assert_eq!(run.code, Some(2), "{run:?}");
+    assert!(start.elapsed() < Duration::from_secs(20), "{run:?}");
+    assert_eq!(fx.statuses(), ["started", "failed"]);
+    assert!(
+        run.stderr
+            .contains("error: pass reliability (claude): the agent stopped: waiting on a dialog"),
+        "{run:?}"
+    );
+    assert_eq!(run.prompt.matches("\n---\n").count(), 1, "{}", run.prompt);
+    assert_eq!(run.log.matches("orca terminal close").count(), 1, "{run:?}");
+    fx.assert_orca_worktree_removed();
+
+    // A dialog still open at the pass timeout gets no wrap-up typed into it.
+    let fx = fixture();
+    let run = orca_run(&fx, &["--timeout", "1"], "dialog", &env);
+    assert_eq!(run.code, Some(2), "{run:?}");
+    assert_eq!(fx.statuses(), ["started", "wrapup", "failed"]);
+    assert!(run.stderr.contains("nothing was typed into it"), "{run:?}");
+    assert!(!run.prompt.contains("Time is up."), "{}", run.prompt);
+    assert_eq!(run.prompt.matches("\n---\n").count(), 1, "{}", run.prompt);
+    assert_eq!(run.log.matches("orca terminal close").count(), 1, "{run:?}");
+    fx.assert_orca_worktree_removed();
+}
+
+#[test]
+fn orca_waits_out_a_dialog_the_agent_clears_itself() {
+    let env = envelope("src/lib.rs");
+    let fx = fixture();
+    let run = orca_run(&fx, &[], "dialog-brief", &env);
+    assert_eq!(run.code, Some(0), "{run:?}");
+    assert_eq!(fx.out(), Some(env));
+    assert_eq!(run.prompt.matches("\n---\n").count(), 1, "{}", run.prompt);
 }
 
 #[test]

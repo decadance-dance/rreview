@@ -28,6 +28,11 @@
 #   no-ok           `terminal create` exits 0 with "ok": false
 #   refused         `terminal send` of a prompt answers "accepted": false
 #   blocked         after the prompt the agent waits on a permission dialog
+#   dialog          after the prompt the agent waits on a dialog that `tui-idle` does not report
+#                   (every wait times out), as Claude's permission dialog: only `terminal show`
+#                   names it, as an `agentWait` open for a minute
+#   dialog-brief    after the prompt one `terminal show` reports a dialog that opened just now
+#                   and the waits time out until then; the agent clears it itself, then as ok
 #   lost-create     `terminal create` opens the terminal, then fails without JSON
 #   late-worktree   `worktree create` never answers; 1 s after rreview killed it, the app makes
 #                   the worktree anyway and writes $FAKE_LOG.late
@@ -171,7 +176,15 @@ case "$1 $2" in
   slow-agent) [ "$(grep -c '^show' "$state")" -lt 3 ] && agent= ;;
   esac
   if [ -n "$agent" ]; then echo agent-up >> "$state"; id="\"$agent\""; else id=null; fi
-  ok "{\"terminal\":{\"agentIdentity\":$id}}" ;;
+  dialog=null now=$(($(date +%s) * 1000))
+  case "$scenario" in
+  dialog) [ "$(sent)" -gt 0 ] && dialog="{\"source\":\"hook\",\"since\":$((now - 60000))}" ;;
+  dialog-brief)
+    if [ "$(sent)" -gt 0 ] && ! grep -q '^brief' "$state"; then
+      echo brief >> "$state"; dialog="{\"source\":\"hook\",\"since\":$now}"
+    fi ;;
+  esac
+  ok "{\"terminal\":{\"agentIdentity\":$id,\"agentWait\":$dialog}}" ;;
 "terminal close")
   if [ "$FAKE_ORCA_CLOSE" = fail-once ] && ! grep -q close-failed "$state" 2> /dev/null; then
     echo close-failed >> "$state"
@@ -199,7 +212,7 @@ case "$1 $2" in
   fi
   write=no
   case "$scenario" in
-  ok | trust | foreign-branch | slow-agent) write=yes ;;
+  ok | trust | foreign-branch | slow-agent | dialog-brief) write=yes ;;
   nudge) [ "$n" -ge 2 ] && write=yes ;;
   hang-once) case "$text" in *"Time is up"*) write=yes; echo wrapped >> "$state" ;; esac ;;
   esac
@@ -222,6 +235,8 @@ case "$1 $2" in
   trust) grep -q trusted "$state" 2> /dev/null || blocked agent-trust-workspace ;;
   hang) [ "$(sent)" -gt 0 ] && timeout "$@" ;;
   blocked) [ "$(sent)" -gt 0 ] && blocked agent-permission ;;
+  dialog) [ "$(sent)" -gt 0 ] && timeout "$@" ;;
+  dialog-brief) [ "$(sent)" -gt 0 ] && ! grep -q '^brief' "$state" && timeout "$@" ;;
   hang-once) [ "$(sent)" -gt 0 ] && ! grep -q wrapped "$state" && timeout "$@" ;;
   esac
   if [ -f "$state.pending" ]; then
