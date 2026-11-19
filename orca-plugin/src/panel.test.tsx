@@ -233,6 +233,15 @@ test('no findings above the gate says how many are below it and how to see them'
   await view.unmount()
 })
 
+test('a run that failed before any pass says so without a time', async () => {
+  const view = await mount(panel, { host: setup({ ...failed, events: [], runDir: null, error: 'cannot run rreview: ENOENT' }).host })
+  const s = JSON.stringify(view.tree())
+  assert.match(s, /cannot run rreview: ENOENT/)
+  assert.ok(!/passes finished/.test(s))
+  assert.deepEqual(cells(view)[0], ['intent_contracts', '– not run', ''])
+  await view.unmount()
+})
+
 test('no PR and no workspace each say what to do next', async () => {
   const noPr = await mount(panel, {
     host: mockHost({ requests: { 'target.get': () => ({ ...target, pr: null, error: 'no pull requests found' }), 'review.get': () => null } })

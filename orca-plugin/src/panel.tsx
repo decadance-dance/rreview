@@ -341,9 +341,9 @@ function Status({ r }: { r: Run }) {
           {`${done} of ${list.length} passes done · elapsed `}
           <RelativeTime at={r.startedAt} format="duration" />
         </Text>
-      ) : (
+      ) : r.events.length ? (
         <Text size="sm" muted>{`${done} of ${list.length} passes finished in ${duration(last - r.startedAt)}`}</Text>
-      )}
+      ) : null}
       <Table
         label="Passes"
         columns={[
