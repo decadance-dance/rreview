@@ -365,6 +365,18 @@ test('no PR and no workspace each say what to do next', async () => {
   await none.unmount()
 })
 
+test('a run of another PR than the one shown says which PR it reviewed', async () => {
+  const other = { ...target, pr: { ...target.pr!, number: 12, title: 'Other', url: 'https://github.com/acme/repo/pull/12' } }
+  const view = await mount(panel, { host: mockHost({ results: { 'agents.list': { agents: [] } }, requests: { 'target.get': () => other, 'review.get': () => done, 'review.result': () => doneResult } }) })
+  assert.equal(view.findAll({ type: 'Link' }).map((l) => l.props?.href).find((h) => String(h).endsWith('/pull/11')), 'https://github.com/acme/repo/pull/11')
+  assert.match(JSON.stringify(view.tree()), /Review of /)
+  assert.ok(view.find({ text: 'Run review' }), 'not Run again: the button reviews #12')
+  await view.unmount()
+  const same = await mountRun(done, doneResult)
+  assert.ok(!/Review of /.test(JSON.stringify(same.tree())))
+  await same.unmount()
+})
+
 test('durations read as minutes and seconds', () => {
   assert.equal(panel.duration(9_400), '9s')
   assert.equal(panel.duration(901_917), '15m 2s')

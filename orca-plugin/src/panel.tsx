@@ -572,6 +572,12 @@ export default function Panel() {
       <Header />
       {n ? <Callout tone={n.tone}>{n.text}</Callout> : null}
       {r || read(target)?.pr ? <Separator /> : null}
+      {/* The run shown is another PR's (the workspace changed, or another PR was typed). */}
+      {r && r.pr.url !== read(target)?.pr?.url ? (
+        <Text size="sm" muted>
+          Review of <Link href={r.pr.url}>#{r.pr.number}</Link> {r.pr.title}
+        </Text>
+      ) : null}
       {r ? (
         <Status r={r} />
       ) : read(target)?.pr ? (
