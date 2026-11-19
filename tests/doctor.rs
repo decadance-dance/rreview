@@ -45,6 +45,7 @@ fn doctor_with(args: &[&str], fakes: &[&str], scenario: &[(&str, &str)]) -> Run 
         .arg("doctor")
         .args(args)
         .env_remove("ORCA_TERMINAL_HANDLE")
+        .env_remove("CLAUDE_CONFIG_DIR")
         .env("PATH", format!("{}:/usr/bin:/bin", bin.display()))
         .env("HOME", &root)
         .env("CODEX_HOME", &codex_home)
@@ -463,4 +464,26 @@ fn orca_codex_gets_one_reminder_to_run_the_probe() {
         &run,
         &["ok    orca codex sandbox: write into the worktree: blocked"],
     );
+}
+
+/// Unchanged files alone do not prove Write and Edit blocked: Claude may never have tried them.
+#[test]
+fn write_and_edit_need_evidence_that_claude_could_not_use_them() {
+    for (scenario, ok) in [
+        ("offered", false),
+        ("no-transcript", false),
+        ("refused", true),
+    ] {
+        let run = doctor_orca(&[("FAKE_CLAUDE", scenario)]);
+        for a in ["claude", "orca claude"] {
+            for tool in ["Write tool into the worktree", "Edit tool in the worktree"] {
+                let line = format!("{} {a}: {tool}:", if ok { "ok   " } else { "FAIL " });
+                assert!(
+                    run.stdout.contains(&line),
+                    "{scenario}: missing {line:?} in\n{}",
+                    run.stdout
+                );
+            }
+        }
+    }
 }

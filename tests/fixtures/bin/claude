@@ -10,7 +10,13 @@
 #   crash           writes the normal results, then exits 42
 #   hook            fires the project hooks even under --safe-mode
 #   dead-hook       never fires hooks, as if the planted hook were broken
-#   tools           the Write and Edit tools work in the worktree
+#   tools           the Write and Edit tools are offered and work in the worktree
+#   offered         the Write and Edit tools are offered but never tried
+#   refused         the Write and Edit tools are offered, tried and refused
+#   no-transcript   leaves no session transcript
+# A probe pass leaves a session transcript as Claude Code does, under
+# ${CLAUDE_CONFIG_DIR:-$HOME/.claude}/projects/<cwd with every non-alphanumeric as ->/: the tools
+# offered to the model (api-request-shape) and any Write or Edit call with its result.
 # A TUI launch (--permission-mode) with nothing on stdin is the orca runner's launch and exits;
 # with a prompt on stdin (FAKE_ORCA=play) it plays the probe as above and writes `{}` to the
 # reply file the prompt names.
@@ -89,6 +95,21 @@ esac
 probe=$(printf '%s\n' "$prompt" | grep -o "/[^']*/probe\.sh")
 out=$(dirname "$probe")
 reply() { [ $tui = no ] || echo '{}' > "$(printf '%s\n' "$prompt" | grep -o '/[^`'"'"' ]*/reply\.txt' | head -n 1)"; }
+transcript() {
+  [ "$FAKE_CLAUDE" = no-transcript ] && return
+  dir=${CLAUDE_CONFIG_DIR:-$HOME/.claude}/projects/$(printf '%s' "$PWD" | sed 's/[^A-Za-z0-9]/-/g')
+  mkdir -p "$dir"
+  case "$FAKE_CLAUDE" in tools | offered | refused) tools='"Bash","Read","Write","Edit"' ;; *) tools='"Bash","Read"' ;; esac
+  echo '{"type":"api-request-shape","shape":{"tools":['"$(echo "$tools" | sed 's/"\([A-Za-z]*\)"/{"name":"\1"}/g')"']}}' > "$dir/fake.jsonl"
+  case "$FAKE_CLAUDE" in tools | refused)
+    [ "$FAKE_CLAUDE" = refused ] && err=true || err=false
+    for t in Write Edit; do
+      echo '{"type":"assistant","message":{"content":[{"type":"tool_use","id":"t'$t'","name":"'$t'","input":{}}]}}'
+      echo '{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"t'$t'","is_error":'$err',"content":"x"}]}}'
+    done >> "$dir/fake.jsonl" ;;
+  esac
+}
+transcript
 if [ "$FAKE_CLAUDE" = tools ]; then
   echo x > "$(printf '%s\n' "$prompt" | grep -o '/[^ ]*/rreview-probe-claude-tool\.txt')"
   echo b >> f.txt
