@@ -502,6 +502,20 @@ fn reviewers_inherit_only_what_the_cli_needs() {
         .concat(),
     );
     assert_eq!(claude.code, Some(0), "{claude:?}");
+    // Claude's shell snapshot of the user's `.zshrc` sits in its config dir; no command reads it.
+    let settings = fs::read_to_string(
+        fx.runroot()
+            .join("scratch/reliability/claude-settings.json"),
+    )
+    .unwrap();
+    assert!(
+        settings.contains(
+            r#""denyRead": [
+        "/claude-config/shell-snapshots"
+      ]"#
+        ),
+        "{settings}"
+    );
     let codex = fx.run(
         &["--role-agent", "reliability=codex"],
         &[
@@ -593,7 +607,7 @@ fn codex_pass_with_repo_and_kept_worktree() {
     let runroot = fx.runroot();
     assert!(
         run.log.contains(&format!(
-            "codex exec --json -s read-only -C {} -o {} - CODEX_HOME={}",
+            "codex exec --json -s read-only -C {} -o {} -c allow_login_shell=false -c features.shell_snapshot=false - CODEX_HOME={}",
             runroot.join("wt").display(),
             runroot
                 .join("scratch/reliability/replies/reply.txt")
@@ -1143,7 +1157,7 @@ fn a_timed_out_pass_is_resumed_for_its_wrap_up() {
             )
         } else {
             format!(
-                "codex exec --json -s read-only -C {} -o {} resume fake-thread - CODEX_HOME={}\n",
+                "codex exec --json -s read-only -C {} -o {} -c allow_login_shell=false -c features.shell_snapshot=false resume fake-thread - CODEX_HOME={}\n",
                 fx.runroot().join("wt").display(),
                 fx.runroot()
                     .join("scratch/reliability/replies/reply.txt")
@@ -1913,7 +1927,7 @@ fn passes_get_their_own_scratch_and_cannot_reach_published_replies() {
         let dir = runroot.join("scratch").join(role);
         assert!(
             run.log.contains(&format!(
-                "-o {} - CODEX_HOME={}",
+                "-o {} -c allow_login_shell=false -c features.shell_snapshot=false - CODEX_HOME={}",
                 dir.join("replies/reply.txt").display(),
                 dir.join("codex-home").display()
             )),
@@ -2269,7 +2283,7 @@ fn orca_pass_end_to_end() {
             )
         } else {
             format!(
-                "'-C' '{}' '-s' 'workspace-write' '-a' 'never' '-c' 'sandbox_workspace_write.exclude_slash_tmp=true' '-c' 'sandbox_workspace_write.exclude_tmpdir_env_var=true' '-c' 'check_for_update_on_startup=false' '-c' 'shell_environment_policy.include_only=[\"PATH\",\"HOME\",\"USER\",\"LOGNAME\",\"SHELL\",\"TMPDIR\",\"LANG\",\"LC_ALL\",\"LC_CTYPE\",\"LC_COLLATE\",\"LC_MESSAGES\",\"LC_MONETARY\",\"LC_NUMERIC\",\"LC_TIME\",\"TZ\",\"TERM\",\"COLORTERM\",\"HTTPS_PROXY\",\"https_proxy\",\"NO_PROXY\",\"no_proxy\",\"NODE_EXTRA_CA_CERTS\",\"SSL_CERT_FILE\",\"ZDOTDIR\"]'",
+                "'-C' '{}' '-s' 'workspace-write' '-a' 'never' '-c' 'sandbox_workspace_write.exclude_slash_tmp=true' '-c' 'sandbox_workspace_write.exclude_tmpdir_env_var=true' '-c' 'check_for_update_on_startup=false' '-c' 'shell_environment_policy.include_only=[\"PATH\",\"HOME\",\"USER\",\"LOGNAME\",\"SHELL\",\"TMPDIR\",\"LANG\",\"LC_ALL\",\"LC_CTYPE\",\"LC_COLLATE\",\"LC_MESSAGES\",\"LC_MONETARY\",\"LC_NUMERIC\",\"LC_TIME\",\"TZ\",\"TERM\",\"COLORTERM\",\"HTTPS_PROXY\",\"https_proxy\",\"NO_PROXY\",\"no_proxy\",\"NODE_EXTRA_CA_CERTS\",\"SSL_CERT_FILE\",\"ZDOTDIR\"]' '-c' 'allow_login_shell=false' '-c' 'features.shell_snapshot=false'",
                 out.display()
             )
         };

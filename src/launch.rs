@@ -371,6 +371,7 @@ fn claude_settings(
     fs::create_dir_all(runroot.join("out")).with_context(|| format!("{}", runroot.display()))?;
     let runroot = absolute(runroot)?;
     let out = runroot.join("out");
+    let snapshots = user_claude_config_dir()?.join("shell-snapshots");
     let settings_path = runroot.join("claude-settings.json");
     let settings = json!({
         "permissions": { "deny": [
@@ -386,7 +387,11 @@ fn claude_settings(
             "allowUnsandboxedCommands": false,
             "filesystem": {
                 "denyWrite": [utf8(&worktree)?, utf8(&git_common_dir)?],
-                "allowWrite": [utf8(&out)?]
+                "allowWrite": [utf8(&out)?],
+                // Claude Code builds a snapshot of the shell setup from the real home's
+                // `.zshrc` or `.bashrc` (functions, aliases, options, PATH) and sources it before
+                // each Bash command; unreadable, it is skipped (spec §3).
+                "denyRead": [utf8(&snapshots)?]
             }
         },
         "disableBundledSkills": true
@@ -408,21 +413,12 @@ pub fn codex(worktree: &Path, runroot: &Path, out_name: &str, user_auth: &Path) 
     fs::create_dir_all(runroot.join("replies"))
         .with_context(|| format!("{}", runroot.display()))?;
     let (runroot, env) = codex_home(runroot, user_auth)?;
+    let reply = runroot.join("replies").join(out_name);
+    let args = ["exec", "--json", "-s", "read-only", "-C", utf8(&worktree)?];
+    let args = [&args[..], &["-o", utf8(&reply)?], &CODEX_NO_STARTUP, &["-"]].concat();
     Ok(Launch {
         program: "codex".into(),
-        args: [
-            "exec",
-            "--json",
-            "-s",
-            "read-only",
-            "-C",
-            utf8(&worktree)?,
-            "-o",
-            utf8(&runroot.join("replies").join(out_name))?,
-            "-",
-        ]
-        .map(String::from)
-        .into(),
+        args: args.into_iter().map(String::from).collect(),
         inherit: INHERIT.into(),
         env,
         cwd: worktree,
@@ -468,8 +464,10 @@ pub fn codex_tui(worktree: &Path, runroot: &Path, user_auth: &Path) -> Result<La
             "-c",
             &include_only,
         ]
+        .into_iter()
+        .chain(CODEX_NO_STARTUP)
         .map(String::from)
-        .into(),
+        .collect(),
         inherit: INHERIT.into(),
         env,
         cwd: worktree,
@@ -485,6 +483,16 @@ fn zdotdir(runroot: &Path) -> Result<(String, String)> {
     fs::create_dir_all(&dir).with_context(|| format!("{}", dir.display()))?;
     Ok(("ZDOTDIR".into(), utf8(&absolute(&dir)?)?.into()))
 }
+
+/// Codex runs commands through the account's login shell (from the passwd entry, not
+/// `$SHELL`) and its own shell snapshot of `.zshrc` or `.bashrc`; without both, `bash -c`
+/// reads no startup file and `zsh -c` only `$ZDOTDIR/.zshenv` (spec §3).
+const CODEX_NO_STARTUP: [&str; 4] = [
+    "-c",
+    "allow_login_shell=false",
+    "-c",
+    "features.shell_snapshot=false",
+];
 
 /// Creates `<runroot>/codex-home` with only the auth symlink; returns the resolved run root and
 /// the `CODEX_HOME` and [`zdotdir`] env.
@@ -513,6 +521,16 @@ fn codex_home(runroot: &Path, user_auth: &Path) -> Result<(PathBuf, Vec<(String,
         zdotdir(&runroot)?,
     ];
     Ok((runroot, env))
+}
+
+/// The user's Claude Code config dir, as Claude finds it: `$CLAUDE_CONFIG_DIR`, else
+/// `~/.claude`; absolute, symlink-free when it exists.
+pub fn user_claude_config_dir() -> Result<PathBuf> {
+    let dir = match std::env::var_os("CLAUDE_CONFIG_DIR").filter(|v| !v.is_empty()) {
+        Some(dir) => PathBuf::from(dir),
+        None => PathBuf::from(std::env::var_os("HOME").context("HOME is not set")?).join(".claude"),
+    };
+    Ok(fs::canonicalize(&dir).or_else(|_| std::path::absolute(&dir))?)
 }
 
 /// The user's Codex login: `$CODEX_HOME/auth.json`, else `~/.codex/auth.json`.
@@ -598,6 +616,11 @@ mod tests {
             sandbox["filesystem"]["allowWrite"],
             json!([root.join("run/out")])
         );
+        // Claude's shell snapshot, built from the user's `.zshrc`, never reaches a command.
+        assert_eq!(
+            sandbox["filesystem"]["denyRead"],
+            json!([user_claude_config_dir().unwrap().join("shell-snapshots")])
+        );
         assert_eq!(s["disableBundledSkills"], true);
         assert!(root.join("run/out").is_dir());
         fs::remove_dir_all(root).unwrap();
@@ -648,6 +671,10 @@ mod tests {
                 wt.to_str().unwrap(),
                 "-o",
                 root.join("run/replies/security.json").to_str().unwrap(),
+                "-c",
+                "allow_login_shell=false",
+                "-c",
+                "features.shell_snapshot=false",
                 "-"
             ]
         );
