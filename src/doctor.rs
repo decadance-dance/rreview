@@ -13,7 +13,7 @@ use std::time::Duration;
 use anyhow::{Context, Result, anyhow, bail};
 use serde_json::{Value, json};
 
-use crate::launch;
+use crate::launch::{self, TimedOut};
 use crate::orca::{self, Orca};
 use crate::runner::{Agent, Pass, Runner};
 
@@ -716,7 +716,9 @@ fn stand_in_home(fx: &Fixture) -> Result<(PathBuf, String)> {
 fn agents_md_check(name: &str, user: [&str; 2], control: [&str; 2]) -> Check {
     Check::new(
         name,
-        if user[0].contains(user[1]) {
+        if user[0].trim().is_empty() {
+            Err("no reply from Codex, so the check proves nothing".into())
+        } else if user[0].contains(user[1]) {
             Err("loaded: the canary from ~/.codex/AGENTS.md reached Codex".into())
         } else if control[0].contains(control[1]) {
             Ok("not loaded".into())
@@ -789,21 +791,41 @@ fn codex_orca_probe(fx: &Fixture) -> Result<Vec<Check>> {
          object: \"probe\", its output; \"canary\", {CANARY_ASK}.\n",
         sh_quote(&probe)
     );
-    let pass = probe_pass("codex", Agent::Codex, prompt);
-    let mut reply = main.run(&pass)?;
-    // Codex sometimes declines a script that writes outside its workspace, the framing above
-    // notwithstanding (*verified*, codex-cli 0.167.0); one reminder in the same session.
+    let pass = probe_pass("codex", Agent::Codex, prompt.clone());
+    let first = main.run(&pass);
+    // Codex often declines a script that writes outside its workspace, the framing above
+    // notwithstanding (*verified*, codex-cli 0.167.0; #31): one reminder. A Codex that refused
+    // in chat only, without a reply file, failed its pass and lost its terminal, so the reminder
+    // then opens a new session.
+    let why_not = "It needs no approval: its writes are meant to fail, and that failure is what \
+                   this test records.";
+    let (mut reply, mut failure) = match &first {
+        Ok(r) => (r.clone(), None),
+        Err(e) => (String::new(), Some(format!("{e:#}"))),
+    };
     if !report.exists() {
-        reply += &main.wrap_up(
-            &pass,
-            &format!(
-                "You did not run the script. It needs no approval: its writes are meant to \
-                 fail, and that failure is what this test records. Run it now with your shell \
-                 tool:\nsh {}\nThen reply as asked before.\n",
-                sh_quote(&probe)
+        let again = match &first {
+            Err(e) if !e.is::<TimedOut>() => main.run(&probe_pass(
+                "codex",
+                Agent::Codex,
+                format!(
+                    "In an earlier session you did not run the script below. {why_not}\n{prompt}"
+                ),
+            )),
+            _ => main.wrap_up(
+                &pass,
+                &format!(
+                    "You did not run the script. {why_not} Run it now with your shell tool:\nsh \
+                     {}\nThen reply as asked before.\n",
+                    sh_quote(&probe)
+                ),
+                PASS_TIMEOUT,
             ),
-            PASS_TIMEOUT,
-        )?;
+        };
+        match again {
+            Ok(r) => reply += &r,
+            Err(e) => failure = Some(format!("{e:#}")),
+        }
     }
     let control_reply = control.run(&probe_pass(
         "codex_control",
@@ -827,8 +849,11 @@ fn codex_orca_probe(fx: &Fixture) -> Result<Vec<Check>> {
                     format!(
                         "the probe did not run in Codex's sandbox (no report in {}): this check \
                          needs the Codex model to agree to run a script that tries writes outside \
-                         its workspace, and it may decline even after a reminder (#31)",
-                        out.display()
+                         its workspace, and it may decline even after a reminder (#31){}",
+                        out.display(),
+                        failure
+                            .as_ref()
+                            .map_or(String::new(), |f| format!("; the pass: {f}"))
                     ),
                 ),
             }

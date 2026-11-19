@@ -11,7 +11,9 @@
 # A TUI launch (-C first) with nothing on stdin is the orca runner's launch and exits; with a
 # prompt on stdin (FAKE_ORCA=play) it plays the turn: ok writes a report of blocked writes into
 # out/probe.txt, leak runs the probe unsandboxed, ignore runs nothing and names no canary,
-# decline-once writes the report only when reminded that it did not run the script; the
+# decline-once writes the report only when reminded that it did not run the script,
+# chat-refuse writes neither report nor reply file on its probe pass until that reminder, mute
+# never writes either on its probe pass (it refuses in chat only); the
 # reply file the prompt names gets the canary from $CODEX_HOME/AGENTS.md ($HOME/.codex/AGENTS.md
 # with user-agents).
 # Argv and CODEX_HOME are appended to $FAKE_LOG.
@@ -37,6 +39,13 @@ if [ "$1" = -C ]; then
   [ -z "$prompt" ] && exit 0
   reply=$(printf '%s\n' "$prompt" | grep -o '/[^`'"'"' ]*/reply\.txt' | head -n 1)
   probe=$(printf '%s\n' "$prompt" | grep -o "/[^']*/probe\.sh")
+  if [ "$(basename "$(dirname "$(dirname "$reply")")")" = codex ]; then
+    case "$FAKE_CODEX:$prompt" in
+    mute:*) exit 0 ;;
+    chat-refuse:*"did not run the script"*) ;;
+    chat-refuse:*) exit 0 ;;
+    esac
+  fi
   agents=$CODEX_HOME/AGENTS.md
   [ "$FAKE_CODEX" = user-agents ] && agents=$HOME/.codex/AGENTS.md
   canary=$(grep -o 'RREVIEW-CANARY-[0-9a-f]*' "$agents" 2> /dev/null || echo NO-CANARY)
@@ -44,7 +53,7 @@ if [ "$1" = -C ]; then
   if [ -n "$probe" ]; then
     case "$FAKE_CODEX" in
     ignore) ;;
-    decline-once)
+    decline-once | chat-refuse)
       case "$prompt" in *"did not run the script"*) echo "worktree=1 gitdir=1 home=1" > "$(dirname "$reply")/probe.txt" ;; esac ;;
     leak) sh "$probe" > /dev/null 2>&1 ;;
     *) echo "worktree=1 gitdir=1 home=1" > "$(dirname "$reply")/probe.txt" ;;

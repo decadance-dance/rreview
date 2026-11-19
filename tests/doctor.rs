@@ -534,3 +534,25 @@ fn orca_terminals_with_a_lost_create_reply_are_closed() {
         run.log
     );
 }
+
+/// A Codex that refuses in chat, writing no reply file, still gets the script reminder, and one
+/// that never runs the probe reads as "the probe did not run", not as a failed self-test.
+#[test]
+fn orca_codex_refusing_in_chat_gets_the_reminder_and_a_probe_diagnostic() {
+    let run = doctor_orca(&[("FAKE_CODEX", "chat-refuse")]);
+    assert!(run.passed, "{}", run.stdout);
+    let run = doctor_orca(&[("FAKE_CODEX", "mute")]);
+    assert!(!run.passed, "{}", run.stdout);
+    assert_lines(
+        &run,
+        &[
+            "FAIL  orca codex sandbox: write into the worktree: the probe did not run",
+            "FAIL  orca codex: user AGENTS.md: no reply",
+        ],
+    );
+    assert!(
+        !run.stdout.contains("orca codex self-test"),
+        "{}",
+        run.stdout
+    );
+}
