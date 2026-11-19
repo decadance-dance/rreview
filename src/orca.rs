@@ -29,13 +29,39 @@ const MAX_REPLY: u64 = 4 << 20;
 const SETUP: Duration = Duration::from_secs(300);
 const CLOSE: Duration = Duration::from_secs(30);
 
-/// Orca commands only work from an Orca terminal (spec §4).
-pub fn check_env() -> Result<()> {
-    match std::env::var_os("ORCA_TERMINAL_HANDLE") {
-        Some(h) if !h.is_empty() => Ok(()),
-        _ => bail!(
-            "--runner orca must run from an Orca terminal (ORCA_TERMINAL_HANDLE is not set); use the default headless runner elsewhere"
-        ),
+/// The runner drives Orca through its CLI, which needs the app running with its runtime
+/// reachable and this repository registered (spec §4); `orca status` and `orca repo show` prove
+/// that before any work, from an Orca terminal or not.
+pub fn check_env(git_common_dir: &Path, deadline: Option<Instant>) -> Result<()> {
+    let bound = Instant::now()
+        .checked_add(CLOSE)
+        .into_iter()
+        .chain(deadline)
+        .min();
+    let v = orca(&["status"], bound).context(
+        "--runner orca needs a running Orca app; use the default headless runner elsewhere",
+    )?;
+    if v["app"]["running"] != true || v["runtime"]["reachable"] != true {
+        bail!(
+            "--runner orca needs a running Orca app, and `orca status` reports it is not reachable; use the default headless runner elsewhere"
+        );
+    }
+    let repo = main_checkout(git_common_dir);
+    let selector = format!("path:{}", launch::utf8(repo)?);
+    orca(&["repo", "show", "--repo", &selector], bound).with_context(|| {
+        format!(
+            "--runner orca needs this repository in Orca, and Orca does not show {}; add it in Orca first",
+            repo.display()
+        )
+    })?;
+    Ok(())
+}
+
+/// Orca registers a repository by its main checkout, the parent of a non-bare common dir.
+fn main_checkout(git_common_dir: &Path) -> &Path {
+    match git_common_dir.file_name() {
+        Some(n) if n == ".git" => git_common_dir.parent().unwrap_or(git_common_dir),
+        _ => git_common_dir,
     }
 }
 
@@ -94,11 +120,7 @@ pub fn create_worktree(
     deadline: Option<Instant>,
 ) -> Result<PathBuf> {
     let branch = branch_for(name);
-    // Orca registers a repository by its main checkout, the parent of a non-bare common dir.
-    let repo = match git_common_dir.file_name() {
-        Some(n) if n == ".git" => git_common_dir.parent().unwrap_or(git_common_dir),
-        _ => git_common_dir,
-    };
+    let repo = main_checkout(git_common_dir);
     let v = orca(
         &[
             "worktree",
@@ -664,7 +686,11 @@ fn read_reply(path: &Path) -> Result<Option<String>> {
 fn orca(args: &[&str], deadline: Option<Instant>) -> Result<Value> {
     let (mut out, success) = run_orca(args, deadline)?;
     if out["ok"] != true || !success {
-        bail!("orca {}: {}", args[..2].join(" "), error(&out));
+        bail!(
+            "orca {}: {}",
+            args[..args.len().min(2)].join(" "),
+            error(&out)
+        );
     }
     Ok(out["result"].take())
 }
@@ -696,7 +722,7 @@ fn run_orca(args: &[&str], deadline: Option<Instant>) -> Result<(Value, bool)> {
                 .status();
             return Err(TimedOut(format!(
                 "orca {} did not answer in time",
-                args[..2].join(" ")
+                args[..args.len().min(2)].join(" ")
             ))
             .into());
         }
@@ -704,7 +730,7 @@ fn run_orca(args: &[&str], deadline: Option<Instant>) -> Result<(Value, bool)> {
     let v = serde_json::from_slice(&out.stdout).with_context(|| {
         format!(
             "orca {}: no JSON reply ({}): {}",
-            args[..2].join(" "),
+            args[..args.len().min(2)].join(" "),
             out.status,
             String::from_utf8_lossy(&out.stderr).trim()
         )

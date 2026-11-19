@@ -140,9 +140,6 @@ impl Settings {
 
 /// Runs the review; returns the exit code: 0 no gated findings, 1 gated findings, 2 failed.
 pub fn run(args: &Args) -> Result<u8> {
-    if args.orca {
-        orca::check_env()?;
-    }
     let settings = Settings::new(args)?;
     let panel: Vec<&Role> = match &args.only {
         Some(id) => vec![panelist::role(id)?],
@@ -155,6 +152,14 @@ pub fn run(args: &Args) -> Result<u8> {
     };
     // None: a budget too large for the clock is no limit.
     let deadline = Instant::now().checked_add(args.budget);
+    let git_common_dir: PathBuf = git(
+        &["rev-parse", "--path-format=absolute", "--git-common-dir"],
+        deadline,
+    )?
+    .into();
+    if args.orca {
+        orca::check_env(&git_common_dir, deadline)?;
+    }
 
     // The budget covers preparation too: gh, a fetch or a checkout hook can stall.
     let pr = view_pr(&args.pr, args.repo.as_deref(), deadline)?;
@@ -183,6 +188,8 @@ pub fn run(args: &Args) -> Result<u8> {
         .join(owner)
         .join(name)
         .join(format!("{}-{head}", pr.number));
+    // Held until this function returns, past the last write into the run dir.
+    let _lock = lock_head(&runroot)?;
     let wt_path = runroot.join("wt");
     if wt_path.exists() {
         bail!(
@@ -190,12 +197,23 @@ pub fn run(args: &Args) -> Result<u8> {
             wt_path.display()
         );
     }
-    // limit: two runs for the same PR head at once share this dir; the later one wipes it.
     if runroot.exists() {
         fs::remove_dir_all(&runroot).with_context(|| format!("{}", runroot.display()))?;
     }
     fs::create_dir_all(runroot.join("out")).with_context(|| format!("{}", runroot.display()))?;
     let runroot = fs::canonicalize(&runroot)?;
+    // The run's own id, also in meta.json: a later run that replaces this dir may get the same
+    // path and inode, so the Orca plugin compares this id before it trusts the dir's files.
+    let run_id = format!(
+        "{}-{}",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos()
+    );
+    // Printed now, not only at the end: the Orca plugin tails progress.jsonl here during the run.
+    eprintln!("run id: {run_id}\nrun dir: {}", runroot.display());
     // The guard exists before the checkout: a failed one (a post-checkout hook) can leave a
     // registered, half-made worktree behind.
     let ran = |r: &str| panel.iter().any(|p| p.id == r) || args.only.is_none();
@@ -212,11 +230,6 @@ pub fn run(args: &Args) -> Result<u8> {
         keep: false,
         orca_name: None,
     };
-    let git_common_dir: PathBuf = git(
-        &["rev-parse", "--path-format=absolute", "--git-common-dir"],
-        deadline,
-    )?
-    .into();
     if args.orca {
         // The pid and start time make the name the run's own: a concurrent run for the same
         // PR head gets another one, so neither run's cleanup can reach the other's worktree.
@@ -268,6 +281,7 @@ pub fn run(args: &Args) -> Result<u8> {
         .map(|(r, a)| (*r, a.to_string()))
         .collect();
     let meta = json!({
+        "run_id": run_id,
         "pr": { "number": pr.number, "title": pr.title, "url": pr.url, "repo": format!("{owner}/{name}"),
                 "head_ref": pr.head_ref_name, "base_ref": pr.base_ref_name },
         "base": base, "head": head, "runner": if args.orca { "orca" } else { "headless" }, "roles": roles,
@@ -458,6 +472,34 @@ pub fn run(args: &Args) -> Result<u8> {
     )?;
     eprintln!("run dir: {}", runroot.display());
     print_result(&result, args.json)
+}
+
+/// Locks `<runroot>.lock`, beside the run dir, which a rerun removes and recreates: two runs of
+/// one PR head would share the dir and mix their progress and results. The OS drops the lock
+/// when the process ends, a crash too.
+fn lock_head(runroot: &Path) -> Result<fs::File> {
+    let mut path = runroot.as_os_str().to_owned();
+    path.push(".lock");
+    let path = PathBuf::from(path);
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).with_context(|| format!("{}", parent.display()))?;
+    }
+    let file = OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(&path)
+        .with_context(|| format!("{}", path.display()))?;
+    match file.try_lock() {
+        Ok(()) => Ok(file),
+        Err(fs::TryLockError::WouldBlock) => bail!(
+            "another review of this PR head is running (it holds {}); wait for it to end",
+            path.display()
+        ),
+        Err(fs::TryLockError::Error(e)) => {
+            Err(e).with_context(|| format!("cannot lock {}", path.display()))
+        }
+    }
 }
 
 /// `rreview show`: the result in a run dir, or of the latest finished review of a PR.

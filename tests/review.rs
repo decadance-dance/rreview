@@ -288,6 +288,9 @@ fn claude_pass_end_to_end() {
     );
     let meta: Value =
         serde_json::from_str(&fs::read_to_string(runroot.join("meta.json")).unwrap()).unwrap();
+    let id = run.stderr.lines().find_map(|l| l.strip_prefix("run id: "));
+    assert_eq!(meta["run_id"].as_str(), id, "{run:?}");
+    assert!(id.is_some_and(|i| i.len() > 10), "{run:?}");
     assert_eq!(meta["pr"]["number"], 7);
     assert_eq!(meta["pr"]["repo"], "acme/widget");
     assert_eq!(
@@ -1738,17 +1741,14 @@ fn role_models_and_efforts_reach_the_cli() {
     }
 }
 
-/// `--runner orca` from an Orca terminal, with the fake `orca` in scenario `orca`.
+/// `--runner orca` with the fake `orca` in scenario `orca`.
 fn orca_run(fx: &Fixture, args: &[&str], orca: &str, reply: &Value) -> Run {
     orca_run_with(fx, args, orca, &[("FAKE_REPLY", reply.to_string())])
 }
 
 fn orca_run_with(fx: &Fixture, args: &[&str], orca: &str, extra: &[(&str, String)]) -> Run {
     let args = [&["--runner", "orca"], args].concat();
-    let mut scenario = vec![
-        ("ORCA_TERMINAL_HANDLE", "term_caller".to_string()),
-        ("FAKE_ORCA", orca.into()),
-    ];
+    let mut scenario = vec![("FAKE_ORCA", orca.into())];
     scenario.extend(extra.iter().cloned());
     fx.run(&args, &scenario)
 }
@@ -1813,6 +1813,8 @@ fn orca_pass_end_to_end() {
         assert_eq!(
             orca_calls(&run),
             [
+                "status --json",
+                "repo show",
                 "worktree create",
                 "terminal create",
                 "terminal show",
@@ -2002,7 +2004,7 @@ fn orca_answers_the_claude_trust_dialog_once() {
     assert_eq!(run.code, Some(0), "{run:?}");
     assert_eq!(fx.out(), Some(env));
     assert_eq!(
-        orca_calls(&run)[1..7],
+        orca_calls(&run)[3..9],
         [
             "terminal create",
             "terminal show",
@@ -2145,20 +2147,82 @@ fn orca_failures_before_the_agent_are_reported_and_cleaned_up() {
 }
 
 #[test]
-fn orca_runner_needs_an_orca_terminal() {
+fn orca_runner_needs_a_running_orca() {
     let fx = fixture();
     let run = fx.run(
         &["--runner", "orca"],
-        &[("ORCA_TERMINAL_HANDLE", String::new())],
+        &[("FAKE_ORCA_STATUS", "down".into())],
     );
     assert_eq!(run.code, Some(2), "{run:?}");
     assert!(
         run.stderr.contains(
-            "--runner orca must run from an Orca terminal (ORCA_TERMINAL_HANDLE is not set)"
+            "--runner orca needs a running Orca app, and `orca status` reports it is not reachable"
         ),
         "{run:?}"
     );
-    assert_eq!(run.log, "", "nothing may run before the check");
+    assert_eq!(
+        run.log, "orca status --json\n",
+        "nothing may run before the check"
+    );
+
+    // A reachable Orca that does not have this repository stops the run before any work.
+    let fx = fixture();
+    let run = fx.run(
+        &["--runner", "orca"],
+        &[("FAKE_ORCA_REPO", "missing".into())],
+    );
+    assert_eq!(run.code, Some(2), "{run:?}");
+    let main = fs::canonicalize(&fx.clone).unwrap();
+    assert!(
+        run.stderr.contains(&format!(
+            "--runner orca needs this repository in Orca, and Orca does not show {}",
+            main.display()
+        )),
+        "{run:?}"
+    );
+    assert!(run.stderr.contains("repo_not_found"), "{run:?}");
+    assert_eq!(
+        orca_calls(&run),
+        ["status --json", "repo show"],
+        "nothing else may run"
+    );
+    assert!(!run.log.contains("gh "), "{run:?}");
+
+    // A status call that never answers is killed at the budget.
+    let fx = fixture();
+    let start = Instant::now();
+    let run = fx.run(
+        &["--runner", "orca", "--budget", "2"],
+        &[("FAKE_ORCA_STATUS", "hang".into())],
+    );
+    assert_eq!(run.code, Some(2), "{run:?}");
+    assert!(
+        run.stderr.contains("orca status did not answer in time"),
+        "{run:?}"
+    );
+    assert!(
+        start.elapsed() < Duration::from_secs(20),
+        "{:?}",
+        start.elapsed()
+    );
+}
+
+#[test]
+fn orca_runner_needs_no_terminal_handle() {
+    // The Orca plugin starts rreview from its worker, outside any Orca terminal.
+    let fx = fixture();
+    let run = fx.run(
+        &["--runner", "orca"],
+        &[
+            ("ORCA_TERMINAL_HANDLE", String::new()),
+            ("FAKE_REPLY", envelope("src/lib.rs").to_string()),
+        ],
+    );
+    assert_eq!(run.code, Some(0), "{run:?}");
+    assert_eq!(
+        orca_calls(&run)[..3],
+        ["status --json", "repo show", "worktree create"]
+    );
 }
 
 impl Fixture {
@@ -2181,11 +2245,7 @@ fn orca_refuses_a_codex_run_dir_inside_a_git_checkout() {
     let fx = fixture();
     let run = fx.run(
         &["--runner", "orca", "--role-agent", "reliability=codex"],
-        &[
-            ("ORCA_TERMINAL_HANDLE", "term_caller".into()),
-            ("FAKE_REPLY", env.to_string()),
-            state(&fx),
-        ],
+        &[("FAKE_REPLY", env.to_string()), state(&fx)],
     );
     assert_eq!(run.code, Some(2), "{run:?}");
     assert!(
@@ -2195,17 +2255,16 @@ fn orca_refuses_a_codex_run_dir_inside_a_git_checkout() {
         )),
         "{run:?}"
     );
-    assert!(!run.log.contains("orca "), "{run:?}");
+    assert!(!run.log.contains("orca worktree"), "{run:?}");
+    // The run dir is named as soon as it exists, before any pass, also when the run then fails.
+    let dir = run.stderr.lines().find_map(|l| l.strip_prefix("run dir: "));
+    assert!(dir.is_some_and(|d| Path::new(d).is_dir()), "{run:?}");
 
     // Claude passes are not affected.
     let fx = fixture();
     let run = fx.run(
         &["--runner", "orca"],
-        &[
-            ("ORCA_TERMINAL_HANDLE", "term_caller".into()),
-            ("FAKE_REPLY", env.to_string()),
-            state(&fx),
-        ],
+        &[("FAKE_REPLY", env.to_string()), state(&fx)],
     );
     assert_eq!(run.code, Some(0), "{run:?}");
 }
@@ -2233,6 +2292,62 @@ fn orca_cleans_up_a_worktree_whose_create_reply_was_lost() {
     );
     git(&fx.clone, &["rev-parse", "--verify", "refs/heads/victim"]);
     fx.assert_orca_worktree_removed();
+}
+
+/// A second run of a head that is still under review, with the same state home (PR #23 round 2,
+/// finding 1). The Orca runner's worktree lives outside the run dir, so nothing else stops it:
+/// it stops before it touches the run dir, the first run's progress, meta.json and result stay
+/// its own, and once the first ends a new run goes ahead.
+#[test]
+fn a_second_run_of_a_head_under_review_stops() {
+    let fx = fixture();
+    fx.install_fakes();
+    let reply = ("FAKE_REPLY", envelope("src/lib.rs").to_string());
+    // Each run plays its own fake terminals.
+    let log = |id: &str| ("FAKE_LOG", fx.root.join(id).display().to_string());
+    std::thread::scope(|s| {
+        let first = s.spawn(|| {
+            orca_run_with(
+                &fx,
+                &[],
+                "ok",
+                &[
+                    reply.clone(),
+                    log("a"),
+                    ("FAKE_ORCA_WAIT_DELAY", "3".into()),
+                ],
+            )
+        });
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while !fx.runroot().join("progress.jsonl").exists() {
+            assert!(
+                Instant::now() < deadline,
+                "the first run never started its pass"
+            );
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        let second = orca_run_with(&fx, &[], "ok", &[reply.clone(), log("b")]);
+        assert_eq!(second.code, Some(2), "{second:?}");
+        assert!(
+            second
+                .stderr
+                .contains("another review of this PR head is running"),
+            "{second:?}"
+        );
+        let first = first.join().unwrap();
+        assert_eq!(first.code, Some(0), "{first:?}");
+        let id = first
+            .stderr
+            .lines()
+            .find_map(|l| l.strip_prefix("run id: "));
+        let meta: Value =
+            serde_json::from_str(&fs::read_to_string(fx.runroot().join("meta.json")).unwrap())
+                .unwrap();
+        assert_eq!(meta["run_id"].as_str(), id);
+        assert_eq!(fx.statuses(), ["started", "completed"]);
+    });
+    let third = orca_run_with(&fx, &[], "ok", &[reply.clone(), log("c")]);
+    assert_eq!(third.code, Some(0), "{third:?}");
 }
 
 /// Two runs for one PR head in one repo at once (round 2, finding 1): each creates and removes
@@ -2349,7 +2464,6 @@ fn orca_send_and_wait_share_the_pass_deadline() {
     let run = fx.run(
         &["--runner", "orca", "--timeout", "1"],
         &[
-            ("ORCA_TERMINAL_HANDLE", "term_caller".into()),
             ("FAKE_REPLY", env.to_string()),
             ("FAKE_ORCA_SEND_DELAY", "3".into()),
         ],
@@ -2376,7 +2490,6 @@ fn orca_retries_a_close_that_failed() {
         let run = fx.run(
             &["--runner", "orca", "--keep-worktree"],
             &[
-                ("ORCA_TERMINAL_HANDLE", "term_caller".into()),
                 ("FAKE_ORCA", orca.into()),
                 ("FAKE_REPLY", env.to_string()),
                 ("FAKE_ORCA_CLOSE", "fail-once".into()),
@@ -2435,7 +2548,6 @@ fn orca_runs_the_full_pipeline_in_one_terminal_per_pass() {
     let run = fx.full(
         &["--runner", "orca"],
         &[
-            ("ORCA_TERMINAL_HANDLE", "term_caller".into()),
             (
                 "FAKE_OUT_intent_contracts",
                 panel_envelope("Intent & Contracts", "Overflow").to_string(),
