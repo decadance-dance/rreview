@@ -15,6 +15,8 @@ struct Run {
     log: String,
     /// Every prompt the fake orca typed into a terminal titled `rreview:claude...`.
     claude_prompts: String,
+    /// The self-test dirs doctor left in its TMPDIR.
+    kept: usize,
 }
 
 fn doctor(fakes: &[&str], scenario: &[(&str, &str)]) -> Run {
@@ -70,6 +72,16 @@ fn doctor_with(args: &[&str], fakes: &[&str], scenario: &[(&str, &str)]) -> Run 
             })
             .map(|p| fs::read_to_string(p).unwrap())
             .collect(),
+        kept: fs::read_dir(&root)
+            .unwrap()
+            .filter(|e| {
+                e.as_ref()
+                    .unwrap()
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with("rreview-doctor-")
+            })
+            .count(),
     };
     fs::remove_dir_all(&root).unwrap();
     run
@@ -555,4 +567,22 @@ fn orca_codex_refusing_in_chat_gets_the_reminder_and_a_probe_diagnostic() {
         "{}",
         run.stdout
     );
+}
+
+/// Only the fixture whose checks failed stays, with how to remove it; a passing one goes.
+#[test]
+fn only_a_failed_fixture_is_kept() {
+    let run = doctor_orca(&[("FAKE_CODEX", "mute")]);
+    assert!(!run.passed, "{}", run.stdout);
+    assert_eq!(run.kept, 1, "{}", run.stdout);
+    assert_eq!(
+        run.stdout.matches("self-test files kept in").count(),
+        1,
+        "{}",
+        run.stdout
+    );
+    assert_lines(&run, &["remove it with: rm -rf "]);
+    let run = doctor_orca(&[]);
+    assert!(run.passed, "{}", run.stdout);
+    assert_eq!(run.kept, 0, "{}", run.stdout);
 }

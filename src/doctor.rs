@@ -75,48 +75,61 @@ pub fn run(with_orca: bool) -> Result<bool> {
         .then(Fixture::new)
         .transpose()
         .context("cannot build the orca self-test repo")?;
-    let before = r.failed;
-    let checks = std::thread::scope(|s| {
+    // Each job runs on fixture 0 (headless) or 1 (orca).
+    let results = std::thread::scope(|s| {
         let (fx, ofx) = (&fx, ofx.as_ref());
         let mut jobs = vec![];
         if claude {
             jobs.push((
+                0,
                 "claude self-test",
                 s.spawn(move || claude_self_test(fx, Via::Headless)),
             ));
         }
         if codex {
-            jobs.push(("codex self-test", s.spawn(move || codex_self_test(fx))));
+            jobs.push((0, "codex self-test", s.spawn(move || codex_self_test(fx))));
         }
         if let Some(ofx) = ofx {
             if claude {
                 jobs.push((
+                    1,
                     "orca claude self-test",
                     s.spawn(move || claude_self_test(ofx, Via::Orca)),
                 ));
             }
             if codex {
                 jobs.push((
+                    1,
                     "orca codex self-test",
                     s.spawn(move || codex_orca_self_test(ofx)),
                 ));
             }
         }
         jobs.into_iter()
-            .flat_map(|(name, job)| {
-                job.join()
-                    .unwrap_or_else(|_| vec![Check::fail(name, "panicked")])
+            .map(|(i, name, job)| {
+                let checks = job
+                    .join()
+                    .unwrap_or_else(|_| vec![Check::fail(name, "panicked")]);
+                (i, checks)
             })
             .collect::<Vec<_>>()
     });
-    for c in checks {
-        r.check(&c.name, c.outcome);
+    let mut failed = [false; 2];
+    for (i, checks) in results {
+        for c in checks {
+            failed[i] |= !r.check(&c.name, c.outcome);
+        }
     }
-    for fx in [Some(&fx), ofx.as_ref()].into_iter().flatten() {
-        if r.failed == before {
-            let _ = fs::remove_dir_all(&fx.root);
+    // A failed fixture stays as evidence (leaked files, logs); a passing one goes.
+    for (fx, failed) in [Some(&fx), ofx.as_ref()].into_iter().zip(failed) {
+        let Some(fx) = fx else { continue };
+        if failed {
+            println!(
+                "      self-test files kept in {0}; remove it with: rm -rf '{0}'",
+                fx.root.display()
+            );
         } else {
-            println!("      self-test files kept in {}", fx.root.display());
+            let _ = fs::remove_dir_all(&fx.root);
         }
     }
     Ok(r.failed == 0)
