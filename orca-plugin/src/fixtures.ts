@@ -18,7 +18,7 @@ const ev = (role: string, status: string, agent: string, duration_ms: number) =>
   ts: 1_700_000_000_000 + duration_ms, role, status, agent, model: 'default', duration_ms
 })
 
-const base = { pr: target.pr!, workspaceId: 'ws1', runner: 'orca' as const, startedAt: 1_700_000_000_000, runDir: '/state/rreview/acme/repo/11-abc' }
+const base = { pr: target.pr!, workspaceId: 'ws1', runner: 'orca' as const, token: 'run-1', startedAt: 1_700_000_000_000, runDir: '/state/rreview/acme/repo/11-abc' }
 
 export const running: Run = {
   ...base, status: 'running', summary: null, exitCode: null, error: null,

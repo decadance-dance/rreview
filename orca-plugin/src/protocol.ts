@@ -63,6 +63,9 @@ export type Run = {
   pr: Pr
   workspaceId: string
   runner: Runner
+  /** Unique to the run, assigned before rreview starts: what `review.cancel` names. */
+  token: string
+  /** For display only; a clock set back can repeat it. */
   startedAt: number
   runDir: string | null
   /** The id rreview printed and wrote into the run dir's meta.json: a later run for the same PR
@@ -86,8 +89,8 @@ declare module 'orca' {
     'review.get': { output: Run | null }
     /** Sends the running rreview SIGTERM: it stops its reviewers, removes its worktree (and the
      * orca runner's terminals and branch) and exits 2, and the run shows as cancelled once rreview
-     * reports the stop. Refused unless the run that `startedAt` names is running. */
-    'review.cancel': { input: { startedAt: number }; output: Run }
+     * reports the stop. Refused unless the run that `token` names is running. */
+    'review.cancel': { input: { token: string }; output: Run }
     /** The finished run's result, bodies and length cut to Orca's limits (the full text stays in
      * result.json); null when no finished run or its run dir is gone or replaced. */
     'review.result': { output: Result | null }

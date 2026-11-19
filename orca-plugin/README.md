@@ -59,8 +59,8 @@ Settings (Settings > Plugins > rreview):
 - Closing the panel does not stop a run; **Cancel** does. It sends rreview SIGTERM, on which rreview
   stops its reviewers, removes its review worktree (with the orca runner also its branch and the
   reviewers' terminals) and exits 2; the run shows as cancelled once rreview reports that stop (a
-  run that failed on its own meanwhile shows its error). Cancel names the run the panel shows, so
-  a late one never stops a later run. The worker sends the same SIGTERM to a run still going 70
+  run that failed on its own meanwhile shows its error). Cancel names the run the panel shows by a
+  token unique to it, so a late one never stops a later run. The worker sends the same SIGTERM to a run still going 70
   minutes after it started (rreview's default budget is 60), which then shows as failed, unless a
   Cancel came first. An rreview still running 10 minutes after a SIGTERM is killed, and that
   kill skips what is left of its cleanup.

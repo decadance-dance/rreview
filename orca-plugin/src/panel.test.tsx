@@ -121,7 +121,7 @@ test('cancel stops the running review, which then shows as cancelled', async () 
   const view = await mount(panel, { host })
   await view.press({ text: 'Cancel' })
   // The run it shows, so a stale Cancel cannot stop a later one.
-  assert.deepEqual(calls.at(-1), { name: 'review.cancel', input: { startedAt: running.startedAt } })
+  assert.deepEqual(calls.at(-1), { name: 'review.cancel', input: { token: running.token } })
   assert.match(JSON.stringify(view.tree()), /Cancelling: rreview is stopping its reviewers/)
   await view.post('review.changed', cancelled)
   const s = view.summary().join('\n') + JSON.stringify(view.tree())

@@ -86,7 +86,7 @@ async function showRun(r: Run | null): Promise<void> {
   const was = read(run)
   set(run, r)
   if (was?.status === 'running' && r?.status !== 'running') set(notice, null)
-  const fresh = !was || !r || was.startedAt !== r.startedAt
+  const fresh = !was || !r || was.token !== r.token
   if (fresh) {
     set(result, null)
     set(author, null)
@@ -95,7 +95,7 @@ async function showRun(r: Run | null): Promise<void> {
   // A newly finished review: fetch its result, with its gated findings picked.
   if (r?.status === 'done' && (fresh || was?.status !== 'done')) {
     const res = await plugin.request('review.result')
-    if (read(run)?.startedAt !== r.startedAt) return
+    if (read(run)?.token !== r.token) return
     set(result, res)
     set(picked, res ? res.findings.map(findingKey) : [])
     set(selected, null)
@@ -117,7 +117,7 @@ async function cancelReview(): Promise<void> {
   const r = read(run)
   if (!r) return
   try {
-    await plugin.request('review.cancel', { startedAt: r.startedAt })
+    await plugin.request('review.cancel', { token: r.token })
     set(notice, { tone: 'neutral', text: 'Cancelling: rreview is stopping its reviewers and cleaning up.' })
   } catch (e) {
     set(notice, { tone: 'danger', text: errorText(e) })

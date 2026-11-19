@@ -3,6 +3,7 @@
 // exit code and its JSON on stdout, never from its human-readable text.
 import type { OrcaWorkerApi } from 'orca/worker'
 import { execFile, spawn } from 'node:child_process'
+import { randomUUID } from 'node:crypto'
 import { open, writeFile } from 'node:fs/promises'
 import { isAbsolute, join } from 'node:path'
 import { findingKey, TEXT_CAP, type Finding, type PassEvent, type Pr, type Result, type Run, type Runner, type Target } from './protocol'
@@ -255,11 +256,11 @@ export default function activate(orca: OrcaWorkerApi): void {
     return r && boundResult(r)
   })
 
-  orca.panels.handle('review.cancel', async ({ startedAt }) => {
+  orca.panels.handle('review.cancel', async ({ token }) => {
     await loaded
     if (!run || run.status !== 'running' || !cancel) throw fail('not_running', 'no review is running')
     // A Cancel meant for an earlier run must not stop this one.
-    if (run.startedAt !== startedAt) throw fail('not_running', 'that review is no longer running')
+    if (run.token !== token) throw fail('not_running', 'that review is no longer running')
     cancel()
     return run
   })
@@ -286,7 +287,7 @@ export default function activate(orca: OrcaWorkerApi): void {
     const bin = String((await orca.settings.get('rreviewPath')) || 'rreview')
     const env = await childEnv()
     const current: Run = {
-      status: 'running', pr: t.pr, workspaceId, runner, startedAt: Date.now(),
+      status: 'running', pr: t.pr, workspaceId, runner, token: randomUUID(), startedAt: Date.now(),
       runDir: null, events: [], summary: null, exitCode: null, error: null
     }
     run = current
