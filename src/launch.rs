@@ -94,6 +94,10 @@ impl Launch {
         let started = Instant::now();
         loop {
             if let Some(status) = child.try_wait()? {
+                // What the reviewer left running in its group goes with it.
+                // limit: the leader is reaped first; a group already empty frees its id, which
+                // an unrelated new group would have to claim within this instant to be hit.
+                kill_group(&mut child);
                 return Ok(status);
             }
             if let Err(e) = interrupted() {
@@ -161,28 +165,24 @@ impl std::error::Error for TimedOut {}
 static SIGNAL: AtomicI32 = AtomicI32::new(0);
 const SIGINT: i32 = 2;
 const SIGTERM: i32 = 15;
-const SIG_DFL: usize = 0;
 
 unsafe extern "C" {
     /// libc's; std exposes no signal API and a few lines do not earn a crate.
     fn signal(signum: i32, handler: usize) -> usize;
 }
 
+/// Only stores the signal, so a second one cannot cut the cleanup short; SIGKILL still can.
 extern "C" fn on_signal(signum: i32) {
     SIGNAL.store(signum, Ordering::SeqCst);
-    // A second signal ends rreview at once, as if none were caught. `signal` is async-signal-safe.
-    for s in [SIGINT, SIGTERM] {
-        unsafe { signal(s, SIG_DFL) };
-    }
 }
 
 /// SIGINT and SIGTERM only set a flag: the waits that poll it ([`Launch::run`], the review's
 /// prepare steps) kill their process group and return [`Interrupted`], which unwinds through
-/// the run's cleanup guards (spec §4). Every reviewer leads its own process group, so the
-/// terminal's Ctrl-C reaches rreview alone.
+/// the run's cleanup guards (spec §4). Every reviewer and every cleanup step leads its own
+/// process group, so the terminal's Ctrl-C reaches rreview alone.
 pub fn catch_interrupts() {
     for s in [SIGINT, SIGTERM] {
-        // SAFETY: the handler only stores an atomic and calls `signal`, both async-signal-safe.
+        // SAFETY: the handler only stores an atomic, which is async-signal-safe.
         unsafe { signal(s, on_signal as extern "C" fn(i32) as usize) };
     }
 }

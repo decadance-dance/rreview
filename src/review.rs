@@ -421,6 +421,8 @@ pub fn run(args: &Args) -> Result<u8> {
         drop(ctx);
         drop(runner);
         drop(wt);
+        // A signal during the cleanup still fails the run.
+        launch::interrupted()?;
         eprintln!("run dir: {}", runroot.display());
         return Ok(if degraded { 2 } else { 0 });
     }
@@ -469,11 +471,12 @@ pub fn run(args: &Args) -> Result<u8> {
             }
         }
     }
-    launch::interrupted()?;
     // Terminals close before their worktree goes.
     drop(ctx);
     drop(runner);
     drop(wt);
+    // A signal during the passes or the cleanup fails the run: no result.json.
+    launch::interrupted()?;
 
     let ungated = result::dedupe(findings, args.gate);
     let result = ReviewResult {
@@ -720,8 +723,9 @@ impl Drop for Worktree {
             }
             return;
         }
-        let removed =
-            launch::utf8(&self.path).and_then(|p| git(&["worktree", "remove", "--force", p], None));
+        // Twice forced: a checkout cut short leaves its registration locked ("initializing").
+        let removed = launch::utf8(&self.path)
+            .and_then(|p| cleanup_git(&["worktree", "remove", "--force", "--force", p]));
         // Not registered (a checkout that failed early): only a directory may be left.
         if let Err(e) = removed
             && self.path.exists()
@@ -908,17 +912,34 @@ fn git_raw(args: &[&str], deadline: Option<Instant>) -> Result<Vec<u8>> {
     Ok(out.stdout)
 }
 
-/// Runs `cmd` to its end with no stdin. With a deadline (the review's budget), it runs in its
-/// own process group, which is killed at the deadline; past the deadline it does not start.
+/// Git for a cleanup step: in its own process group, so the terminal's Ctrl-C does not cut it
+/// short, and run to its end whatever the interrupt flag says.
+fn cleanup_git(args: &[&str]) -> Result<()> {
+    let out = Command::new("git")
+        .args(args)
+        .stdin(Stdio::null())
+        .process_group(0)
+        .output()
+        .context("cannot run git")?;
+    if !out.status.success() {
+        bail!(
+            "git {}: {}",
+            args.join(" "),
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+    }
+    Ok(())
+}
+
+/// Runs `cmd` to its end with no stdin, in its own process group, which is killed at the
+/// deadline (the review's budget; None: none) or on an interrupt; past either it does not start.
 fn output(cmd: &mut Command, deadline: Option<Instant>) -> Result<Output> {
     cmd.stdin(Stdio::null());
-    let Some(deadline) = deadline else {
-        return Ok(cmd.output()?);
-    };
     let program = cmd.get_program().to_string_lossy().into_owned();
     let spent = || anyhow!("the review's budget ran out while preparing ({program})");
+    let past = || deadline.is_some_and(|d| Instant::now() >= d);
     launch::interrupted()?;
-    if Instant::now() >= deadline {
+    if past() {
         return Err(spent());
     }
     let mut child = cmd
@@ -954,7 +975,7 @@ fn output(cmd: &mut Command, deadline: Option<Instant>) -> Result<Output> {
             launch::kill_group(&mut child);
             return Err(e);
         }
-        if Instant::now() >= deadline {
+        if past() {
             launch::kill_group(&mut child);
             return Err(spent());
         }

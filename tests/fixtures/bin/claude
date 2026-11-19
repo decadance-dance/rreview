@@ -35,6 +35,8 @@
 #                   $FAKE_LOG.reviewer), then never replies
 #   hang-once       hangs like `hang` unless resumed (--resume), then replies
 #   crash           prints nothing and exits 1
+#   orphan          leaves a grandchild running (its pid appended to $FAKE_LOG.grandchild), then
+#                   replies at once
 #   forge           first writes $FAKE_FORGED into out/<role>.json, which the sandbox allows
 #   symlink         first plants out/<role>.json as a symlink to $FAKE_LOG.victim
 # The scenario comes from fake.env next to this file (rreview drops FAKE_* from a reviewer's
@@ -80,6 +82,7 @@ if [ -n "$FAKE_REVIEW" ]; then
     echo $$ >> "$FAKE_LOG.reviewer"; sleep 60 & echo $! >> "$FAKE_LOG.grandchild"; sleep 60; exit 0
   fi
   [ "$mode" = crash ] && exit 1
+  if [ "$mode" = orphan ]; then sleep 60 & echo $! >> "$FAKE_LOG.grandchild"; fi
   file=$(dirname "$settings")/out/$role.json
   if [ "$mode" = forge ]; then printf '%s' "$FAKE_FORGED" > "$file" || exit 97; fi
   if [ "$mode" = symlink ]; then ln -s "$FAKE_LOG.victim" "$file" || exit 97; fi
