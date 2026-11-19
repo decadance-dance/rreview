@@ -34,11 +34,11 @@ config, and kept from changing your repo **by the OS sandbox**, not by the promp
 cleared the gate, so a script or an agent can act on it.
 
 <p align="center">
-  <img alt="The Rreview Orca plugin while a review runs: PR #1 with the orca runner, a progress bar at 2 of 4 passes done after 1 minute, the two codex lenses done, the reliability lens running and the coordinator waiting" src="docs/screenshots/orca-plugin-running.png" width="32%">
+  <img alt="The Rreview Orca plugin while a review runs: PR #1 on one line, the runner, Running and a stop button on the next, then 2 of 4 passes with the running badge, a progress bar, the two codex lenses done, the reliability lens running and the coordinator waiting" src="docs/screenshots/orca-plugin-running.png" width="32%">
   &nbsp;
-  <img alt="The Rreview Orca plugin after the review: no gated findings and degraded, the verdict patch is correct, then two P3 findings in docs/workflow/git-flow.md by file with the first one open: priority, confidence, stage, its file and line to copy and a link to its lines on GitHub" src="docs/screenshots/orca-plugin-findings.png" width="32%">
+  <img alt="The Rreview Orca plugin after the review: the verdict patch is correct with one line of counts (0 gated, 2 below gate, 4 of 5 passes, 17 minutes, degraded), then two P3 findings in docs/workflow/git-flow.md with full titles, the first one open with its body, its file and lines, a link to GitHub and the send checkbox" src="docs/screenshots/orca-plugin-findings.png" width="32%">
   <br>
-  <sub>The Rreview Orca plugin on a real review: each pass while it runs, then the findings by file.</sub>
+  <sub>The Rreview Orca plugin on a real review: each pass while it runs, then the verdict and the findings.</sub>
 </p>
 
 ## 📣 Recent updates
@@ -55,7 +55,7 @@ cleared the gate, so a script or an agent can act on it.
   terminal, and the runner gives up on a pass stuck on a permission dialog instead of waiting out
   its timeout.
 - **Run and cancel from Orca**: the Orca plugin reviews the focused workspace's PR, lists the
-  findings by file, sends the ones you pick to an agent you choose in that workspace, and cancels
+  findings with the verdict first, sends the ones you pick to an agent you choose in that workspace, and cancels
   a run.
 - **Upgrade note**: tested with Claude Code 2.1.316, codex-cli 0.167.0 and Orca 1.4.262 on macOS.
   On Linux, Claude's sandbox needs bubblewrap and socat. The default gate (P0-P2 and confidence
