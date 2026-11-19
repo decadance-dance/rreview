@@ -8,10 +8,10 @@ Status: pre-alpha. `rreview doctor` checks the `claude`, `codex` and `gh` logins
 
 ## Prerequisites
 
-- `claude` (Claude Code) and `codex`, each logged in with your subscription. Reviewers use the config of the process that runs rreview: Claude's `$CLAUDE_CONFIG_DIR`, else `~/.claude`, and Codex's `$CODEX_HOME`, else `~/.codex`.
+- `claude` (Claude Code) and `codex`, each logged in with your subscription. Reviewers use the Claude config and the Codex login of the process that runs rreview: Claude's `$CLAUDE_CONFIG_DIR`, else `~/.claude`, and the `auth.json` in `$CODEX_HOME`, else `~/.codex`. Each Codex pass gets a fresh Codex home holding only that login, so your Codex config does not apply.
 - `git`, and `gh` logged in to an account that can see the PR's repository.
-- zsh and a working Claude Code sandbox (on Linux, bubblewrap): rreview refuses to start a Claude reviewer without them.
-- For `--runner orca` and the Orca plugin: the Orca app running, with the repository added to Orca.
+- zsh and a working Claude Code sandbox (on Linux, bubblewrap and socat): without zsh rreview refuses to start a Claude reviewer, and without the sandbox Claude exits at startup.
+- For `--runner orca` and the Orca plugin: the Orca app running, with the repository added to Orca; `--runner orca` also needs the `orca` CLI on `PATH`.
 - To build: a stable Rust toolchain (`cargo build --release`).
 
 The review pipeline and its prompts are adapted from [block/review](https://github.com/block/review) (Apache-2.0); see [NOTICE](NOTICE).

@@ -7,8 +7,8 @@ Status: draft v0.1, 2026-11-18. Source: a research session (findings also in the
 `rreview <PR>` gives a pull request an independent, cross-model panel review before it is marked ready. It adapts the pipeline of [block/review](https://github.com/block/review) (Apache-2.0): fixed-lens reviewers in parallel, a coordinator that tries to disprove every candidate, and a judge that re-examines only the dropped candidates.
 
 What makes it ours:
-- **Isolated reviewers.** A reviewer sees the code, never the user's CLAUDE.md, AGENTS.md, plugins, skills, hooks or MCP, and never the reviewed PR's own `.claude/` config. Same result on any machine.
-- **Read-only by the OS, not by the prompt.** Reviewers cannot write to the worktree, its git dir, or anywhere else except the run directory.
+- **Isolated reviewers.** A reviewer sees the code, without the CLAUDE.md, skills, plugins, hooks, MCP servers or agents of the user or the reviewed PR (Claude's `--safe-mode`), and without the user's Codex config or AGENTS.md (a run-scoped Codex home holding only the login). Claude still merges other settings files, the user's and the worktree's `.claude/settings.json` and `settings.local.json` included; rreview checks them and refuses a launch where one would weaken the sandbox (§3).
+- **Read-only by the OS, not by the prompt.** Reviewers cannot write to the review worktree or its git common dir: the agents' OS sandboxes enforce it, not the prompt. §3 gives the limits: what a reviewer can still read, the credentials that reach its CLI, the network.
 - **Cross-model.** Discovery and the judge are split across Claude and Codex, so the coordinator and the judge never share a model family.
 - **Subscriptions, not API keys.** Runs on the user's Claude and ChatGPT logins through the official CLIs.
 - **Visible when wanted.** The same review runs headless (default, CI-like) or with every reviewer in a visible Orca terminal, and an Orca plugin shows progress and findings.
@@ -127,7 +127,7 @@ A `trusted-worker` plugin in `orca-plugin/` (TypeScript, no build step; Node `ch
 5. Orca plugin.
 6. Calibration on 3-5 already-reviewed PRs against the existing cross-model review; tune the gate.
 
-Each milestone is a GitHub issue with acceptance criteria; tests use fake `claude`/`codex` binaries on `PATH` (cheap checks first), with one opt-in live test per agent.
+Each milestone is a GitHub issue with acceptance criteria; tests use fake `claude`/`codex` binaries on `PATH` (cheap checks first), with opt-in live tests: two for Claude, one for Codex.
 
 ## 9. Open questions
 
