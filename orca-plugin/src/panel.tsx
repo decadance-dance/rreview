@@ -7,7 +7,6 @@ import {
   Box,
   Button,
   Callout,
-  Card,
   Checkbox,
   Code,
   Collapsible,
@@ -291,7 +290,8 @@ function Header() {
           <Text size="sm">Open a PR for this branch, or type a PR number or URL under Other PR, then press Refresh.</Text>
         </Callout>
       )}
-      {/* Orca has no segmented control: a horizontal RadioGroup is the closest. */}
+      {/* Orca has no segmented control: a horizontal RadioGroup is the closest. A small button with
+          no icon keeps both on one row at 280 px; Cancel sits on the run's status line. */}
       <Row justify="between" align="center" gap="sm" wrap>
         <RadioGroup
           label="Runner"
@@ -304,12 +304,9 @@ function Header() {
           ]}
           onChange={(v) => set(runner, v as Runner)}
         />
-        <Row gap="xs" align="center">
-          <Button icon="play" tone="accent" disabled={running || !t?.pr} onPress={startReview}>
-            {running ? 'Running…' : r && r.pr.url === t?.pr?.url ? 'Run again' : 'Run review'}
-          </Button>
-          {running ? <IconButton icon="stop" label="Cancel" tooltip="Cancel the review" onPress={cancelReview} /> : null}
-        </Row>
+        <Button size="sm" tone="accent" disabled={running || !t?.pr} onPress={startReview}>
+          {running ? 'Running…' : r && r.pr.url === t?.pr?.url ? 'Run again' : 'Run review'}
+        </Button>
       </Row>
       {t || !read(loading) ? (
         <Collapsible
@@ -366,7 +363,10 @@ function Status({ r }: { r: Run }) {
             {`${fixedDone} of ${FIXED.length} passes${judge ? `, judge ${finished(judge) ? judge.status : 'running'}` : ''} · `}
             <RelativeTime at={r.startedAt} format="duration" muted />
           </Text>
-          <Badge tone="accent">running</Badge>
+          <Row gap="xs" align="center">
+            <Badge tone="accent">running</Badge>
+            <IconButton icon="stop" label="Cancel" tooltip="Cancel the review" size="sm" onPress={cancelReview} />
+          </Row>
         </Row>
         {/* Once the fixed passes are done, whether the judge runs is unknown: no value, no 100 %. */}
         <Progress label="Passes done" labelHidden value={fixedDone < FIXED.length ? Math.round((100 * fixedDone) / FIXED.length) : undefined} />
@@ -471,7 +471,7 @@ function Detail({ f, r, res }: { f: Finding; r: Run; res: Result }) {
   const key = findingKey(f)
   const url = githubUrl(r.pr.url, res.head, f)
   return (
-    <Card>
+    <Box border radius="md" padding="sm">
       <Stack gap="sm">
         <Markdown content={f.body} />
         <Input label="File and line (select to copy)" labelHidden value={`${f.file}:${lines(f)}`} />
@@ -488,7 +488,7 @@ function Detail({ f, r, res }: { f: Finding; r: Run; res: Result }) {
           ) : null}
         </Row>
       </Stack>
-    </Card>
+    </Box>
   )
 }
 
@@ -530,14 +530,11 @@ function Findings({ r }: { r: Run }) {
           {list.map((f) => {
             const key = findingKey(f)
             return (
-              <ListItem
-                key={key}
-                title={f.title}
-                description={`P${f.priority} · ${f.file.split('/').pop()}:${lines(f)} · conf ${f.confidence_score}`}
-                icon={severityIcon(f.priority)}
-                current={key === read(selected)}
-                onPress={() => set(selected, key)}
-              />
+              // The title as a child, not `title`, which Orca cuts with an ellipsis.
+              <ListItem key={key} icon={severityIcon(f.priority)} current={key === read(selected)} onPress={() => set(selected, key)}>
+                <Text size="sm">{f.title}</Text>
+                <Text size="xs" muted>{`P${f.priority} · ${f.file.split('/').pop()}:${lines(f)} · conf ${f.confidence_score}`}</Text>
+              </ListItem>
             )
           })}
         </List>

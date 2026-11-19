@@ -19,8 +19,8 @@ const cells = (view: TestPanel) => passRows(view).map((n) => n.text)
 const roles = (view: TestPanel) => passRows(view).map((n) => String(n.key).slice('pass:'.length))
 
 /** The findings list's items as title, the line under it, and icon. */
-const leaves = (view: TestPanel) => view.findAll({ type: 'ListItem' }).map((n) => [n.props?.title, n.props?.description, n.props?.icon])
-const current = (view: TestPanel) => view.findAll({ type: 'ListItem' }).find((n) => n.props?.current)?.props?.title
+const leaves = (view: TestPanel) => view.findAll({ type: 'ListItem' }).map((n) => [n.text, n.props?.icon])
+const current = (view: TestPanel) => view.findAll({ type: 'ListItem' }).find((n) => n.props?.current)?.text
 
 function setup(run: Run | null = null) {
   const calls: { name: string; input: unknown }[] = []
@@ -71,7 +71,7 @@ test('shows the workspace PR and starts a review with the chosen runner', async 
   await view.post('review.changed', done)
   assert.deepEqual(roles(view), ['intent_contracts', 'reliability', 'security', 'coordinator'])
   assert.equal(calls.at(-1)?.name, 'review.result')
-  assert.equal(leaves(view)[0][0], 'Terminal leaks when close fails')
+  assert.match(String(leaves(view)[0][0]), /^Terminal leaks when close fails /)
   assert.equal(view.find({ type: 'Progress' }), null)
   // The verdict's one line of counts replaces the status heading.
   assert.match(JSON.stringify(view.find({ type: 'Callout', text: /Patch is incorrect/ })), /2 gated · 1 below gate · 3\/4 passes · 2m 0s · .*degraded/)
@@ -88,8 +88,8 @@ test('a finished review lists the findings and sends the picked ones', async () 
   const view = await mount(panel, { host })
   // Full titles; severity as `P<n>` text and an icon per severity, never color alone.
   assert.deepEqual(leaves(view), [
-    ['Terminal leaks when close fails', 'P1 · orca.rs:120-124 · conf 0.9', 'error'],
-    ['Budget skips setup', 'P2 · review.rs:40-44 · conf 0.85', 'warning']
+    ['Terminal leaks when close fails P1 · orca.rs:120-124 · conf 0.9', 'error'],
+    ['Budget skips setup P2 · review.rs:40-44 · conf 0.85', 'warning']
   ])
   assert.ok(view.find({ type: 'Text', text: 'degraded' }))
   // The failed pass is named with its reason, rreview's own prefix cut.
@@ -103,21 +103,21 @@ test('a finished review lists the findings and sends the picked ones', async () 
 
   // The most urgent finding opens with its detail: its body, a copyable location and a link to
   // its lines at the reviewed head.
-  assert.equal(current(view), 'Terminal leaks when close fails')
+  assert.match(current(view) ?? '', /^Terminal leaks when close fails /)
   assert.equal(view.valueOf({ label: 'File and line (select to copy)' }), 'src/orca.rs:120-124')
   assert.equal(view.find({ label: 'File and line (select to copy)' })?.props?.onChange, undefined)
   assert.equal(
     view.find({ type: 'Link', text: 'Open on GitHub' })?.props?.href,
     `https://github.com/acme/repo/blob/${'a'.repeat(40)}/src/orca.rs#L120-L124`
   )
-  assert.match(JSON.stringify(view.find({ type: 'Card' })), /Terminal leaks when close fails\*\*: what fails/)
+  assert.match(JSON.stringify(view.find({ type: 'Markdown' })), /Terminal leaks when close fails\*\*: what fails/)
 
   await view.toggle({ label: 'Below the gate too' })
-  assert.deepEqual(leaves(view)[2], ['Unclear error text', 'P3 · orca.rs:300-304 · conf 0.6', 'info'])
+  assert.deepEqual(leaves(view)[2], ['Unclear error text P3 · orca.rs:300-304 · conf 0.6', 'info'])
 
   // Both gated findings start picked; unpick one through its detail.
   await view.press({ type: 'ListItem', text: /Budget skips setup/ })
-  assert.equal(current(view), 'Budget skips setup')
+  assert.match(current(view) ?? '', /^Budget skips setup /)
   assert.match(JSON.stringify(view.tree()), /Budget skips setup\*\*: what fails/)
   await view.toggle({ label: 'Send to the author' })
   // No recipient is chosen for the person: the agents are the reviewed run's (ws1), shells left out.
@@ -341,7 +341,7 @@ test('the most urgent finding opens first, whatever order rreview listed them in
   const below = await mountRun(done, res)
   await below.toggle({ label: 'Below the gate too' })
   // The list is most urgent first too.
-  assert.deepEqual(leaves(below).map((l) => String(l[1]).slice(0, 2)), ['P1', 'P2', 'P3'])
+  assert.deepEqual(leaves(below).map((l) => String(l[0]).match(/ (P\d) · /)?.[1]), ['P1', 'P2', 'P3'])
   await below.press({ type: 'ListItem', text: /Unclear error text/ })
   await below.toggle({ label: 'Below the gate too' })
   assert.equal(below.valueOf({ label: 'File and line (select to copy)' }), 'src/orca.rs:120-124')
