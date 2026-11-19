@@ -44,16 +44,14 @@ Settings (Settings > Plugins > rreview):
 - **GitHub account**: a `gh` account whose token gh and rreview get, for a repository gh's active
   account cannot see. The worker fetches it with `gh auth token -u <account>` for each call and
   passes it as `GH_TOKEN` to those two child processes only; it is never stored or logged.
+  Reviewers never get it: rreview gives them only an allowlist of variables, with no `GH_TOKEN`,
+  in both runners (spec §3, [#17](https://github.com/decadance-dance/rreview/issues/17)).
 
 ## Limits
 
 - The worker runs with Orca's environment, not a terminal's: `CLAUDE_CONFIG_DIR` and `CODEX_HOME`
   are unset, so the headless runner uses `~/.claude` and `~/.codex`, not an Orca per-account home.
   The orca runner's reviewers run in Orca terminals with Orca's own environment.
-- Until [#17](https://github.com/decadance-dance/rreview/issues/17) lands, rreview passes its whole
-  environment to headless reviewers, so with the GitHub account setting the token is in the claude
-  and codex processes' environment, as it is when you run `GH_TOKEN=... rreview` in a shell. The orca
-  runner's reviewers do not get it.
 - A worker restart (Orca stops an idle worker; a save in dev mode) loses the child it was watching:
   that run shows as failed, with its run dir. `rreview show <run dir>` prints its result once it
   finishes.
