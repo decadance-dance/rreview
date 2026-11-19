@@ -433,8 +433,16 @@ pub fn codex(worktree: &Path, runroot: &Path, out_name: &str, user_auth: &Path) 
 /// reply file too, so it runs `workspace-write` rooted at `<runroot>/out` with `/tmp` and
 /// `$TMPDIR` excluded: `out/` is its only writable dir; it reads the worktree by absolute path.
 /// `-a never` returns a refused command to the model instead of asking the user.
+/// Orca's `codex` shell function prepends `-c shell_environment_policy.set.ORCA_*=...` (its
+/// terminal and workspace ids, its data dir); Codex applies `include_only` after `set`, so the
+/// reviewer's commands get only the allowlist, whichever `-c` comes first (spec §3).
 pub fn codex_tui(worktree: &Path, runroot: &Path, user_auth: &Path) -> Result<Launch> {
     let worktree = absolute(worktree)?;
+    let names: Vec<_> = INHERIT.iter().map(|n| format!("\"{n}\"")).collect();
+    let include_only = format!(
+        "shell_environment_policy.include_only=[{}]",
+        names.join(",")
+    );
     fs::create_dir_all(runroot.join("out")).with_context(|| format!("{}", runroot.display()))?;
     let (runroot, env) = codex_home(runroot, user_auth)?;
     Ok(Launch {
@@ -452,6 +460,8 @@ pub fn codex_tui(worktree: &Path, runroot: &Path, user_auth: &Path) -> Result<La
             "sandbox_workspace_write.exclude_tmpdir_env_var=true",
             "-c",
             "check_for_update_on_startup=false",
+            "-c",
+            &include_only,
         ]
         .map(String::from)
         .into(),
