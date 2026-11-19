@@ -5,6 +5,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, OpenOptions};
 use std::io::{Read, Write};
+use std::os::unix::fs::DirBuilderExt;
 use std::os::unix::process::CommandExt;
 use std::path::{Component, Path, PathBuf};
 use std::process::{Command, Output, Stdio};
@@ -200,7 +201,13 @@ pub fn run(args: &Args) -> Result<u8> {
     if runroot.exists() {
         fs::remove_dir_all(&runroot).with_context(|| format!("{}", runroot.display()))?;
     }
-    fs::create_dir_all(runroot.join("out")).with_context(|| format!("{}", runroot.display()))?;
+    // Private from its creation, whatever the umask: it holds prompts with the PR and task text,
+    // reviewer logs and run-scoped Codex sessions. Its parent exists: lock_head made it.
+    fs::DirBuilder::new()
+        .mode(0o700)
+        .create(&runroot)
+        .and_then(|()| fs::create_dir(runroot.join("out")))
+        .with_context(|| format!("{}", runroot.display()))?;
     let runroot = fs::canonicalize(&runroot)?;
     // The run's own id, also in meta.json: a later run that replaces this dir may get the same
     // path and inode, so the Orca plugin compares this id before it trusts the dir's files.

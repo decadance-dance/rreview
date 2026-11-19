@@ -158,7 +158,14 @@ impl Fixture {
             ("FAKE_GH_PR", pr.to_string()),
         ];
         fake_env::write(&bin, &[&fakes[..], scenario].concat());
-        let out = Command::new(env!("CARGO_BIN_EXE_rreview"))
+        // Under umask 022, the common default, so the modes a run creates do not depend on the
+        // caller's umask.
+        let out = Command::new("/bin/sh")
+            .args([
+                "-c",
+                "umask 022 && exec \"$0\" \"$@\"",
+                env!("CARGO_BIN_EXE_rreview"),
+            ])
             .args(args)
             .current_dir(&self.clone)
             .env("PATH", format!("{}:/usr/bin:/bin", bin.display()))
@@ -788,6 +795,15 @@ fn a_timed_out_pass_is_resumed_for_its_wrap_up() {
         assert_dead(&fx, 1);
         fx.assert_worktree_removed();
     }
+}
+
+#[test]
+fn a_fresh_run_dir_is_private() {
+    use std::os::unix::fs::PermissionsExt;
+    let fx = fixture();
+    let run = fx.run(&[], &claude_says("Done."));
+    let mode = fs::metadata(fx.runroot()).unwrap().permissions().mode() & 0o777;
+    assert_eq!(mode, 0o700, "{run:?}");
 }
 
 #[test]
