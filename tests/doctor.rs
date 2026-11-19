@@ -37,6 +37,8 @@ fn doctor_with(args: &[&str], fakes: &[&str], scenario: &[(&str, &str)]) -> Run 
     let (bin, codex_home) = (root.join("bin"), root.join("codex"));
     fs::create_dir_all(&bin).unwrap();
     fs::create_dir_all(&codex_home).unwrap();
+    // The user's Claude config dir, which doctor's stand-in HOME for Claude links to.
+    fs::create_dir_all(root.join(".claude")).unwrap();
     fs::write(codex_home.join("auth.json"), "{}").unwrap();
     let fixtures = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/bin");
     for fake in fakes {
@@ -196,13 +198,29 @@ fn fails_when_the_shell_startup_files_reach_a_reviewer() {
     assert_lines(
         &run,
         &[
-            "FAIL  claude: shell startup files: read: RREVIEW_STARTUP_CANARY",
-            "FAIL  codex: shell startup files: read: RREVIEW_STARTUP_CANARY",
+            "FAIL  claude: shell startup files: read: the export, function or alias",
+            "FAIL  codex: shell startup files: read: the export, function or alias",
         ],
     );
-    let run = doctor(ALL, &[("FAKE_CLAUDE", "no-control")]);
+    // A Claude whose command sources the snapshot of the stand-in .zshrc, checked by the real
+    // probe: the planted function and alias give it away.
+    let run = doctor(ALL, &[("FAKE_CLAUDE", "snapshot-leak")]);
     assert!(!run.passed);
-    assert_lines(&run, &["FAIL  claude: shell startup files: control failed"]);
+    assert_lines(&run, &["FAIL  claude: shell startup files: read"]);
+    for (scenario, why) in [
+        (
+            "no-control",
+            "control failed: the reviewer's shell did not read",
+        ),
+        ("no-snapshot", "control failed: no shell snapshot"),
+    ] {
+        let run = doctor(ALL, &[("FAKE_CLAUDE", scenario)]);
+        assert!(!run.passed);
+        assert_lines(
+            &run,
+            &[&format!("FAIL  claude: shell startup files: {why}")],
+        );
+    }
 }
 
 #[test]
