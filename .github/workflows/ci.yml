@@ -1,0 +1,30 @@
+name: ci
+on:
+  pull_request:
+  push:
+    branches: [develop, main]
+env:
+  # The Orca CLI for Linux, from the desktop AppImage: the headless server tarball lacks the plugin
+  # test kit that `orca plugin check` and `orca plugin test` load. Bump the version and its sha256
+  # (GitHub's asset digest) together.
+  ORCA_VERSION: 1.4.262
+  ORCA_SHA256: 8a02e7904dfc923c031e1e87e2b80bd59c27573319f158e212cb94a49f81af7e
+jobs:
+  ci-ok:
+    name: ci-ok
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - run: rustup toolchain install # the toolchain and components in rust-toolchain.toml
+      # A Claude reviewer launch needs zsh (spec §3); the runner image may lack it.
+      - run: command -v zsh || { sudo apt-get update -q && sudo apt-get install -yq zsh; }
+      - name: Install the Orca CLI
+        run: |
+          cd "$RUNNER_TEMP"
+          curl -fsSL -o orca.AppImage "https://github.com/stablyai/orca/releases/download/v$ORCA_VERSION/orca-linux.AppImage"
+          echo "$ORCA_SHA256  orca.AppImage" | sha256sum -c -
+          # Unpacks without FUSE; the CLI runs Electron in Node mode, so no display is needed.
+          chmod +x orca.AppImage && ./orca.AppImage --appimage-extract >/dev/null && rm orca.AppImage
+          mkdir -p "$RUNNER_TEMP/bin" && ln -s "$RUNNER_TEMP/squashfs-root/resources/bin/orca-ide" "$RUNNER_TEMP/bin/orca"
+          echo "$RUNNER_TEMP/bin" >> "$GITHUB_PATH"
+      - run: bin/check

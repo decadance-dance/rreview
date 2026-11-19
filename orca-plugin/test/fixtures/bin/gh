@@ -1,0 +1,15 @@
+#!/bin/sh
+# Fake `gh` for the plugin's tests: `gh pr view [pr] --json ...` answers PR 11, or with
+# FAKE_GH=none fails as gh does on a branch without a PR. `gh auth token -u <a>` prints `tok-<a>`,
+# or fails for the account `nobody`. Each call's cwd and argv go to $FAKE_LOG, and a GH_TOKEN it got.
+printf 'gh %s | %s\n' "$PWD" "$*" >> "${FAKE_LOG:-/dev/null}"
+[ -n "$GH_TOKEN" ] && echo "gh token $GH_TOKEN" >> "${FAKE_LOG:-/dev/null}"
+if [ "$1 $2" = "auth token" ]; then
+  [ "$4" = nobody ] && { echo "no account found for nobody" >&2; exit 1; }
+  echo "tok-$4"; exit 0
+fi
+if [ "$FAKE_GH" = none ]; then
+  echo 'no pull requests found for branch "topic"' >&2
+  exit 1
+fi
+echo '{"number":11,"title":"Orca runner","url":"https://github.com/acme/repo/pull/11","state":"MERGED"}'

@@ -1,0 +1,118 @@
+// The panel <-> worker contract, declared once: src/panel.tsx and src/worker.ts both read it.
+// Shapes follow rreview's data contract (docs/VISION-AND-SPEC.md §5).
+
+export type Runner = 'headless' | 'orca'
+
+export type Pr = { number: number; title: string; url: string; state: string }
+
+/** The focused workspace and the PR the panel would review there. */
+export type Target = {
+  workspaceId: string
+  name: string
+  path: string
+  pr: Pr | null
+  /** Why there is no PR (gh's own message), when there is none. */
+  error: string | null
+}
+
+/** One line of `<runroot>/progress.jsonl`. A run stopped by a signal ends with
+ * `{ts, role: "run", status: "interrupted", error}`, which has no agent, model or duration. */
+export type PassEvent = {
+  ts: number
+  role: string
+  status: string
+  agent: string
+  model: string
+  duration_ms: number
+  error?: string
+}
+
+/** A finding of `result.json`. */
+export type Finding = {
+  title: string
+  body: string
+  file: string
+  start_line: number
+  end_line: number
+  priority: number
+  confidence_score: number
+  stage: string
+}
+
+export type Pass = { role: string; agent: string; status: string; duration_ms: number; error?: string }
+
+/** The parts of `result.json` the panel shows. */
+export type Result = {
+  findings: Finding[]
+  ungated_findings: Finding[]
+  overall_correctness: string
+  overall_explanation: string
+  passes: Pass[]
+  head: string
+  degraded: boolean
+  /** Findings left out of what the panel got, to keep it within Orca's message limits. */
+  omitted?: number
+}
+
+/** A finished run's counts, small enough for every post and the plugin's storage. */
+export type Summary = { gated: number; all: number; degraded: boolean }
+
+export type Run = {
+  /** `cancelled`: stopped with `review.cancel`; rreview cleaned up and exited 2. */
+  status: 'running' | 'done' | 'failed' | 'cancelled'
+  pr: Pr
+  workspaceId: string
+  runner: Runner
+  /** Unique to the run, assigned before rreview starts: what `review.cancel` names. */
+  token: string
+  /** For display only; a clock set back can repeat it. */
+  startedAt: number
+  runDir: string | null
+  /** The id rreview printed and wrote into the run dir's meta.json: a later run for the same PR
+   * head replaces the dir (same path, maybe the same inode), and the worker then stops reading it. */
+  runId?: string
+  events: PassEvent[]
+  /** Set when the run is done; the result itself comes from `review.result`. */
+  summary: Summary | null
+  /** rreview's exit code: 0 no gated findings, 1 gated findings, 2 failed. */
+  exitCode: number | null
+  error: string | null
+}
+
+declare module 'orca' {
+  interface PluginRequests {
+    /** The focused workspace and its PR, or the PR `pr` (number or URL) names. Null: none focused. */
+    'target.get': { input: { pr?: string }; output: Target | null }
+    /** Starts `rreview <pr> --runner <runner> --json` in the workspace; one run at a time. */
+    'review.start': { input: { workspaceId: string; pr?: string; runner: Runner }; output: Run }
+    /** The current or last run. */
+    'review.get': { output: Run | null }
+    /** Sends the running rreview SIGTERM: it stops its reviewers, removes its worktree (and the
+     * orca runner's terminals and branch) and exits 2, and the run shows as cancelled once rreview
+     * reports the stop. Refused unless the run that `token` names is running. */
+    'review.cancel': { input: { token: string }; output: Run }
+    /** The finished run's result, bodies and length cut to Orca's limits (the full text stays in
+     * result.json); null when no finished run or its run dir is gone or replaced. */
+    'review.result': { output: Result | null }
+    /** Writes the findings `keys` name (see findingKey) to a file in the run dir and asks the
+     * agent in `terminalId` to read it. Refused unless that terminal still runs the agent session
+     * `sessionId` in the reviewed run's workspace. */
+    'findings.send': {
+      input: { terminalId: string; sessionId: string | null; keys: string[] }
+      output: { sent: number; file: string }
+    }
+  }
+  interface PluginPanelEvents {
+    /** Posted to every open panel when the run changes. */
+    'review.changed': Run
+  }
+}
+
+/** Text past this many characters is cut for the panel (the worker's `review.result`). */
+export const TEXT_CAP = 4_000
+
+/** A finding's key: rreview dedupes on file, start line and title, so this is unique in a result.
+ * Only the title's first `TEXT_CAP` characters count, so a title cut for the panel keeps its key. */
+export function findingKey(f: Finding): string {
+  return `${f.file}#${f.start_line}#${f.title.slice(0, TEXT_CAP)}`
+}

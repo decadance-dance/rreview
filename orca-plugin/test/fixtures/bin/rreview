@@ -1,0 +1,77 @@
+#!/bin/sh
+# Fake `rreview` for the plugin's tests. Logs its cwd, argv and a GH_TOKEN to $FAKE_LOG, makes a run
+# dir under $FAKE_STATE with a meta.json, prints its run id and dir on stderr as rreview does, writes progress.jsonl, writes the result
+# ($FAKE_RESULT_FILE, else $FAKE_RESULT) to result.json and stdout, and plays FAKE_RREVIEW:
+#   ok (default)  three panelists and the coordinator complete; exits $FAKE_EXIT (1)
+#   degraded      as ok, but the security panelist failed
+#   fail          the coordinator fails: an `error:` line on stderr, exit 2
+#   garbage       exits 0 with no JSON on stdout
+#   slow          as ok, but names the run dir in two writes a second apart and pauses 2 s
+#                 once the panelists have started
+#   split         as ok, in a run dir named `café-<pid>`, with the run dir line and stdout each
+#                 written in two parts split inside the é
+#   replaced      as ok, but 1.5 s after the panelists start another run replaces the run dir
+#                 with its own meta.json and progress (role `foreign`); the dir keeps its inode, as
+#                 Linux gives a dir made right after one removed
+#   hang          once the panelists have started, logs `rreview waits for TERM` and waits (30 s
+#                 at most) for a SIGTERM; then, as rreview, logs `rreview got TERM`, takes
+#                 $FAKE_STOP_DELAY seconds to clean up, ends progress.jsonl with the stop, exits 2
+#   ignore-term   as hang, but a SIGTERM does not stop it: it fails on its own (a coordinator
+#                 error, no stop line) and exits 2
+printf 'rreview %s | %s\n' "$PWD" "$*" >> "${FAKE_LOG:-/dev/null}"
+[ -n "$GH_TOKEN" ] && echo "rreview token $GH_TOKEN" >> "${FAKE_LOG:-/dev/null}"
+dir="$FAKE_STATE/run-$$"
+[ "$FAKE_RREVIEW" = split ] && dir="$FAKE_STATE/café-$$"
+mkdir -p "$dir"
+echo "{\"run_id\":\"fake-$$\"}" > "$dir/meta.json"
+echo "run id: fake-$$" >&2
+case "$FAKE_RREVIEW" in
+slow) printf 'run dir: %s' "${dir%/*}" >&2; sleep 1; printf '/%s\n' "${dir##*/}" >&2 ;;
+split) printf 'run dir: %s/caf\303' "$FAKE_STATE" >&2; sleep 0.5; printf '\251-%s\n' "$$" >&2 ;;
+*) echo "run dir: $dir" >&2 ;;
+esac
+p="$dir/progress.jsonl"
+ev() { printf '{"ts":%s000,"role":"%s","status":"%s","agent":"%s","model":"default","duration_ms":%s%s}\n' "$(date +%s)" "$1" "$2" "$3" "$4" "$5" >> "$p"; }
+for r in intent_contracts reliability security; do ev $r started claude 0; done
+[ "$FAKE_RREVIEW" = slow ] && sleep 2
+if [ "$FAKE_RREVIEW" = ignore-term ]; then
+  got=; trap 'got=1' TERM
+  i=0; while [ -z "$got" ] && [ $i -lt 300 ]; do sleep 0.1; i=$((i + 1)); done
+  echo "error: coordinator: bad JSON" >&2
+  exit 2
+fi
+if [ "$FAKE_RREVIEW" = hang ]; then
+  trap 'echo "rreview got TERM" >> "${FAKE_LOG:-/dev/null}"; sleep "${FAKE_STOP_DELAY:-0}"
+    printf '"'"'{"ts":%s000,"role":"run","status":"interrupted","error":"interrupted by SIGTERM"}\n'"'"' "$(date +%s)" >> "$p"
+    echo "error: interrupted by SIGTERM" >&2; exit 2' TERM
+  echo "rreview waits for TERM" >> "${FAKE_LOG:-/dev/null}"
+  i=0; while [ $i -lt 300 ]; do sleep 0.1; i=$((i + 1)); done
+  exit 2
+fi
+if [ "$FAKE_RREVIEW" = replaced ]; then
+  sleep 1.5; rm -rf "$dir"/*; echo '{"run_id":"foreign"}' > "$dir/meta.json"
+  for r in foreign foreign foreign foreign foreign foreign foreign foreign; do ev $r started codex 0; done
+  sleep 1.5
+fi
+ev intent_contracts completed codex 1200
+ev reliability completed claude 1500
+if [ "$FAKE_RREVIEW" = degraded ]; then ev security failed codex 900 ',"error":"no reply"'; else ev security completed codex 900; fi
+ev coordinator started claude 0
+case "$FAKE_RREVIEW" in
+fail)
+  ev coordinator failed claude 300 ',"error":"bad JSON"'
+  echo "error: coordinator: bad JSON" >&2
+  echo "run dir: $dir" >&2
+  exit 2 ;;
+garbage) echo "summary, not JSON"; exit 0 ;;
+esac
+ev coordinator completed claude 2000
+if [ -n "$FAKE_RESULT_FILE" ]; then cp "$FAKE_RESULT_FILE" "$dir/result.json"; else printf '%s\n' "$FAKE_RESULT" > "$dir/result.json"; fi
+if [ "$FAKE_RREVIEW" = split ]; then
+  n=$(grep -bo 'é' "$dir/result.json" | head -n 1 | cut -d: -f1)
+  head -c "$((n + 1))" "$dir/result.json"; sleep 0.5; tail -c "+$((n + 2))" "$dir/result.json"
+else
+  cat "$dir/result.json"
+fi
+echo "run dir: $dir" >&2
+exit "${FAKE_EXIT:-1}"

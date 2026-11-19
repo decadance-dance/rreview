@@ -1,0 +1,177 @@
+#!/bin/sh
+# Fake `claude` for doctor tests. Like the real one it fires the project's hooks
+# (.claude/settings.json in its cwd) unless given --safe-mode, and without --safe-mode (the
+# doctor's hook control, which has no login) it then fails. FAKE_CLAUDE:
+#   ok (default)    behaves like a working sandbox
+#   no-safe-mode    --help does not offer --safe-mode
+#   leak            runs the probe unsandboxed, as if the sandbox let everything through
+#   ignore          does not run the probe
+#   lie             skips the probe and reports "write=0 commit=0 branch=0 diff=99 startup=0 control=1"
+#   startup         reports that the startup canary reached the probe (startup=1)
+#   no-control      reports that even the control did not see the startup canary (control=0)
+#   no-sandbox      a host where the sandbox cannot start: exits at startup when the settings
+#                   say failIfUnavailable, else runs the probe unsandboxed, as Claude Code does
+#   snapshot-leak   sources its shell snapshot, then the probe, both unsandboxed, as a Claude
+#                   whose sandbox let the command read the snapshot would
+# Like Claude Code, a probe pass first writes a shell snapshot of $HOME/.zshrc into
+# ${CLAUDE_CONFIG_DIR:-$HOME/.claude}/shell-snapshots.
+#   crash           writes the normal results, then exits 42
+#   hook            fires the project hooks even under --safe-mode
+#   dead-hook       never fires hooks, as if the planted hook were broken
+#   tools           the Write and Edit tools are offered and work in the worktree
+#   offered         the Write and Edit tools are offered but never tried
+#   refused         the Write and Edit tools are offered, tried and refused for want of permission
+#   error           the Write and Edit tools are offered, tried and fail for another reason
+#   mixed           the Write and Edit tools are offered, tried twice: refused, then they work
+#   bare-shape      the transcript records a request shape without its tools
+#   no-transcript   leaves no session transcript
+#   nudge           (TUI) does nothing until the runner's reminder, then plays the probe
+# A probe pass leaves a session transcript as Claude Code does, under
+# ${CLAUDE_CONFIG_DIR:-$HOME/.claude}/projects/<cwd with every non-alphanumeric as ->/: the tools
+# offered to the model (api-request-shape) and any Write or Edit call with its result.
+# A TUI launch (--permission-mode) with nothing on stdin is the orca runner's launch and exits;
+# with a prompt on stdin (FAKE_ORCA=play) it plays the probe as above and writes `{}` to the
+# reply file the prompt names.
+# Argv is appended to $FAKE_LOG.
+# With FAKE_REVIEW set it is a review pass instead. The pass's role comes from the prompt
+# (a panelist's task id, the coordinator's or the judge's heading) or, on --resume, from the
+# session it resumes. The prompt (stdin) is appended to $FAKE_LOG.prompt and
+# $FAKE_LOG.prompt.<role>. It prints, first match wins: $FAKE_RESUME_<role> on a resumed turn,
+# $FAKE_OUT_<role>, $FAKE_STDOUT. The mode is $FAKE_MODE_<role>, else FAKE_REVIEW:
+#   ok              replies at once
+#   hang            starts a grandchild (pids appended to $FAKE_LOG.grandchild; its own to
+#                   $FAKE_LOG.reviewer), then never replies
+#   hang-once       hangs like `hang` unless resumed (--resume), then replies
+#   crash           prints nothing and exits 1
+#   orphan          leaves a grandchild running (its pid appended to $FAKE_LOG.grandchild), then
+#                   replies at once
+#   forge           first writes $FAKE_FORGED into out/<role>.json, which the sandbox allows
+#   symlink         first plants out/<role>.json as a symlink to $FAKE_LOG.victim
+# The scenario comes from fake.env next to this file (rreview drops FAKE_* from a reviewer's
+# environment). The environment a launch (not a --version probe) got is appended to
+# $FAKE_LOG.env under "== claude".
+[ -f "${0%/*}/fake.env" ] && . "${0%/*}/fake.env"
+echo "claude $*" >> "${FAKE_LOG:-/dev/null}"
+case "$1" in
+--version) echo "9.9.9 (Claude Code)"; exit 0 ;;
+--help)
+  echo "Usage: claude [options] [prompt]"
+  [ "$FAKE_CLAUDE" = no-safe-mode ] || echo "  --safe-mode  Disable user and project customizations"
+  exit 0 ;;
+auth) echo '{"loggedIn": true, "authMethod": "fake"}'; exit 0 ;;
+esac
+[ -n "$FAKE_LOG" ] && { echo "== claude"; env; } >> "$FAKE_LOG.env"
+tui=no; case " $* " in *" --permission-mode "*) tui=yes ;; esac
+if [ $tui = yes ]; then prompt=$(cat); [ -z "$prompt" ] && exit 0; fi
+if [ -n "$FAKE_REVIEW" ]; then
+  prompt=$(cat)
+  printf '%s\n' "$prompt" >> "$FAKE_LOG.prompt"
+  settings=; session=; resume=; prev=
+  for a; do
+    [ "$prev" = --settings ] && settings=$a
+    [ "$prev" = --session-id ] && session=$a
+    [ "$prev" = --resume ] && resume=$a
+    prev=$a
+  done
+  if [ -n "$resume" ]; then
+    resumed=yes role=$(grep "^$resume " "$FAKE_LOG.sessions" | cut -d' ' -f2)
+  else
+    case "$prompt" in
+    *"## Coordinator: reconcile"*) role=coordinator ;;
+    "You are the judge"*) role=judge ;;
+    *) role=$(printf '%s' "$prompt" | grep -o 'task id "[a-z_]*"' | head -n 1 | cut -d'"' -f2) ;;
+    esac
+    resumed=no; echo "$session $role" >> "$FAKE_LOG.sessions"
+  fi
+  printf '%s\n' "$prompt" >> "$FAKE_LOG.prompt.$role"
+  eval "mode=\${FAKE_MODE_$role:-\$FAKE_REVIEW} out=\${FAKE_OUT_$role-\$FAKE_STDOUT}"
+  [ $resumed = yes ] && eval "out=\${FAKE_RESUME_$role-\$out}"
+  if [ "$mode" = hang ] || { [ "$mode" = hang-once ] && [ $resumed = no ]; }; then
+    echo $$ >> "$FAKE_LOG.reviewer"; sleep 60 & echo $! >> "$FAKE_LOG.grandchild"; sleep 60; exit 0
+  fi
+  [ "$mode" = crash ] && exit 1
+  if [ "$mode" = orphan ]; then sleep 60 & echo $! >> "$FAKE_LOG.grandchild"; fi
+  file=$(dirname "$settings")/out/$role.json
+  if [ "$mode" = forge ]; then printf '%s' "$FAKE_FORGED" > "$file" || exit 97; fi
+  if [ "$mode" = symlink ]; then ln -s "$FAKE_LOG.victim" "$file" || exit 97; fi
+  printf '%s\n' "$out"; exit 0
+fi
+fire_hooks() {
+  [ "$FAKE_CLAUDE" = dead-hook ] && return
+  sh -c "$(sed -n 's/.*"command":"\([^"]*\)".*/\1/p' .claude/settings.json)"
+}
+case " $* " in
+*" --safe-mode "*) [ "$FAKE_CLAUDE" = hook ] && fire_hooks ;;
+*)
+  echo "control-env HOME=$HOME XDG_CONFIG_HOME=$XDG_CONFIG_HOME XDG_CACHE_HOME=$XDG_CACHE_HOME XDG_DATA_HOME=$XDG_DATA_HOME XDG_STATE_HOME=$XDG_STATE_HOME CLAUDE_CONFIG_DIR=$CLAUDE_CONFIG_DIR" >> "${FAKE_LOG:-/dev/null}"
+  fire_hooks; echo '{"type": "result", "is_error": true, "result": "Not logged in"}'; exit 1 ;;
+esac
+if [ "$FAKE_CLAUDE" = no-sandbox ]; then
+  settings=; prev=; for a; do [ "$prev" = --settings ] && settings=$a; prev=$a; done
+  if grep -q '"failIfUnavailable": true' "$settings"; then
+    echo "Error: sandbox required (sandbox.failIfUnavailable) but it cannot start" >&2; exit 1
+  fi
+fi
+# A reviewer pass: the prompt on stdin names the probe script, in out/.
+[ $tui = yes ] || prompt=$(cat)
+if [ "$FAKE_CLAUDE" = nudge ] && [ $tui = yes ]; then
+  case "$prompt" in *"You stopped without writing"*) ;; *) exit 0 ;; esac
+fi
+replyfile=$(printf '%s\n' "$prompt" | grep -o '/[^`'"'"' ]*/reply\.txt' | head -n 1)
+probe=$(printf '%s\n' "$prompt" | grep -o "/[^']*/probe\.sh")
+# The runner's reminder names only the reply file, which sits next to the probe.
+[ -z "$probe" ] && probe=$(dirname "$replyfile")/probe.sh
+out=$(dirname "$probe")
+reply() { [ $tui = no ] || echo 'write=1 commit=128 branch=128 diff=0' > "$replyfile"; }
+transcript() {
+  [ "$FAKE_CLAUDE" = no-transcript ] && return
+  dir=${CLAUDE_CONFIG_DIR:-$HOME/.claude}/projects/$(printf '%s' "$PWD" | sed 's/[^A-Za-z0-9]/-/g')
+  mkdir -p "$dir"
+  case "$FAKE_CLAUDE" in
+  bare-shape) echo '{"type":"api-request-shape","shape":{}}' > "$dir/fake.jsonl"; return ;;
+  tools | offered | refused | error | mixed) tools='"Bash","Read","Write","Edit"' ;;
+  *) tools='"Bash","Read"' ;;
+  esac
+  echo '{"type":"api-request-shape","shape":{"tools":['"$(echo "$tools" | sed 's/"\([A-Za-z]*\)"/{"name":"\1"}/g')"']}}' > "$dir/fake.jsonl"
+  denied='"Claude requested permissions to write to '"$PWD"', but you haven'"'"'t granted it yet."'
+  case "$FAKE_CLAUDE" in
+  tools) results='false,"ok"' ;;
+  refused) results="true,$denied" ;;
+  error) results='true,"String to replace not found in file."' ;;
+  mixed) results="true,$denied
+false,\"ok\"" ;;
+  *) results= ;;
+  esac
+  # One line per round of calls: is_error, then the result's JSON content.
+  [ -n "$results" ] && printf '%s\n' "$results" | while read -r r; do
+    for t in Write Edit; do
+      id=t$t$(grep -c tool_use "$dir/fake.jsonl")
+      echo '{"type":"assistant","message":{"content":[{"type":"tool_use","id":"'$id'","name":"'$t'","input":{}}]}}'
+      echo '{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"'$id'","is_error":'"${r%%,*}"',"content":'"${r#*,}"'}]}}'
+    done >> "$dir/fake.jsonl"
+  done
+}
+transcript
+snapshot=${CLAUDE_CONFIG_DIR:-$HOME/.claude}/shell-snapshots/snapshot-zsh-fake-$$.sh
+mkdir -p "${snapshot%/*}" && cat "$HOME/.zshrc" > "$snapshot" 2> /dev/null
+if [ "$FAKE_CLAUDE" = tools ]; then
+  echo x > "$(printf '%s\n' "$prompt" | grep -o '/[^ ]*/rreview-probe-claude-tool\.txt')"
+  echo b >> f.txt
+fi
+case "$FAKE_CLAUDE" in
+ignore) reply; echo '{"type": "result", "result": "no"}'; exit 0 ;;
+leak | no-sandbox) sh "$probe" > /dev/null 2>&1 ;;
+snapshot-leak) sh -c '. "$1"; sh "$2"' - "$snapshot" "$probe" > /dev/null 2>&1 ;;
+lie) git diff > "$out/diff.txt"; echo "write=0 commit=0 branch=0 diff=99 startup=0 control=1" > "$out/probe.txt" ;;
+*)
+  # What a working sandbox lets through: git diff and writes into out/.
+  git diff > "$out/diff.txt"
+  s=0 k=1
+  [ "$FAKE_CLAUDE" = startup ] && s=1
+  [ "$FAKE_CLAUDE" = no-control ] && k=0
+  echo "write=1 commit=128 branch=128 diff=0 startup=$s control=$k" > "$out/probe.txt" ;;
+esac
+reply
+echo '{"type": "result", "result": "done"}'
+[ "$FAKE_CLAUDE" = crash ] && exit 42
+exit 0
