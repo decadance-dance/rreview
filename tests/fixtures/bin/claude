@@ -31,7 +31,8 @@
 # $FAKE_LOG.prompt.<role>. It prints, first match wins: $FAKE_RESUME_<role> on a resumed turn,
 # $FAKE_OUT_<role>, $FAKE_STDOUT. The mode is $FAKE_MODE_<role>, else FAKE_REVIEW:
 #   ok              replies at once
-#   hang            starts a grandchild (pids appended to $FAKE_LOG.grandchild), then never replies
+#   hang            starts a grandchild (pids appended to $FAKE_LOG.grandchild; its own to
+#                   $FAKE_LOG.reviewer), then never replies
 #   hang-once       hangs like `hang` unless resumed (--resume), then replies
 #   crash           prints nothing and exits 1
 #   forge           first writes $FAKE_FORGED into out/<role>.json, which the sandbox allows
@@ -76,7 +77,7 @@ if [ -n "$FAKE_REVIEW" ]; then
   eval "mode=\${FAKE_MODE_$role:-\$FAKE_REVIEW} out=\${FAKE_OUT_$role-\$FAKE_STDOUT}"
   [ $resumed = yes ] && eval "out=\${FAKE_RESUME_$role-\$out}"
   if [ "$mode" = hang ] || { [ "$mode" = hang-once ] && [ $resumed = no ]; }; then
-    sleep 60 & echo $! >> "$FAKE_LOG.grandchild"; sleep 60; exit 0
+    echo $$ >> "$FAKE_LOG.reviewer"; sleep 60 & echo $! >> "$FAKE_LOG.grandchild"; sleep 60; exit 0
   fi
   [ "$mode" = crash ] && exit 1
   file=$(dirname "$settings")/out/$role.json

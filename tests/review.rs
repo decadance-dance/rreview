@@ -152,6 +152,12 @@ impl Fixture {
     }
 
     fn rreview(&self, pr: &Value, args: &[&str], scenario: &[(&str, String)]) -> Run {
+        let out = self.command(pr, args, scenario).output().unwrap();
+        self.ran(out)
+    }
+
+    /// `rreview <args>` against the fakes, not yet started.
+    fn command(&self, pr: &Value, args: &[&str], scenario: &[(&str, String)]) -> Command {
         let (bin, codex_home) = self.install_fakes();
         let fakes = [
             ("FAKE_LOG", self.root.join("log").display().to_string()),
@@ -159,26 +165,28 @@ impl Fixture {
         ];
         fake_env::write(&bin, &[&fakes[..], scenario].concat());
         // Under umask 022, the common default, so the modes a run creates do not depend on the
-        // caller's umask.
-        let out = Command::new("/bin/sh")
-            .args([
-                "-c",
-                "umask 022 && exec \"$0\" \"$@\"",
-                env!("CARGO_BIN_EXE_rreview"),
-            ])
-            .args(args)
-            .current_dir(&self.clone)
-            .env("PATH", format!("{}:/usr/bin:/bin", bin.display()))
-            .env("HOME", &self.root)
-            .env("XDG_STATE_HOME", self.root.join("state"))
-            .env("CODEX_HOME", &codex_home)
-            .env("TMPDIR", &self.root)
-            .env("GIT_CONFIG_GLOBAL", "/dev/null")
-            .env("FAKE_LOG", self.root.join("log"))
-            .env("FAKE_GH_PR", pr.to_string())
-            .envs(scenario.iter().map(|(k, v)| (k, v)))
-            .output()
-            .unwrap();
+        // caller's umask. `exec` keeps rreview's pid the child's, for a test that signals it.
+        let mut cmd = Command::new("/bin/sh");
+        cmd.args([
+            "-c",
+            "umask 022 && exec \"$0\" \"$@\"",
+            env!("CARGO_BIN_EXE_rreview"),
+        ])
+        .args(args)
+        .current_dir(&self.clone)
+        .env("PATH", format!("{}:/usr/bin:/bin", bin.display()))
+        .env("HOME", &self.root)
+        .env("XDG_STATE_HOME", self.root.join("state"))
+        .env("CODEX_HOME", &codex_home)
+        .env("TMPDIR", &self.root)
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("FAKE_LOG", self.root.join("log"))
+        .env("FAKE_GH_PR", pr.to_string())
+        .envs(scenario.iter().map(|(k, v)| (k, v)));
+        cmd
+    }
+
+    fn ran(&self, out: std::process::Output) -> Run {
         let read = |name: &str| fs::read_to_string(self.root.join(name)).unwrap_or_default();
         Run {
             code: out.status.code(),
@@ -698,7 +706,14 @@ fn bad_replies_fail_the_pass() {
 
 /// The fakes started `count` grandchildren, and none of them is alive.
 fn assert_dead(fx: &Fixture, count: usize) {
-    let pids = fs::read_to_string(fx.root.join("log.grandchild")).unwrap();
+    assert_all_dead(
+        &fs::read_to_string(fx.root.join("log.grandchild")).unwrap(),
+        count,
+    );
+}
+
+/// `pids` holds `count` pids, and none of them is alive.
+fn assert_all_dead(pids: &str, count: usize) {
     assert_eq!(pids.split_whitespace().count(), count, "{pids:?}");
     for pid in pids.split_whitespace() {
         let alive = || {
@@ -713,7 +728,7 @@ fn assert_dead(fx: &Fixture, count: usize) {
         while alive() && Instant::now() < deadline {
             std::thread::sleep(Duration::from_millis(50));
         }
-        assert!(!alive(), "grandchild {pid} outlived the timeout");
+        assert!(!alive(), "{pid} outlived the run");
     }
 }
 
@@ -738,6 +753,56 @@ fn a_pass_that_never_replies_times_out_after_a_wrap_up() {
         assert_eq!(fx.statuses(), ["started", "wrapup", "failed"]);
         assert_eq!(fx.out(), None);
         assert_dead(&fx, 2);
+        fx.assert_worktree_removed();
+    }
+}
+
+#[test]
+fn an_interrupt_kills_every_reviewer_and_removes_the_worktree() {
+    for signal in ["INT", "TERM"] {
+        let fx = fixture();
+        let child = fx
+            .command(&fx.pr(), &["7"], &[("FAKE_REVIEW", "hang".into())])
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        // Mid-pass: all three panelists have started their grandchild.
+        let started = Instant::now();
+        let count = |name: &str| {
+            fs::read_to_string(fx.root.join(name))
+                .unwrap_or_default()
+                .lines()
+                .count()
+        };
+        while count("log.grandchild") < 3 {
+            assert!(
+                started.elapsed() < Duration::from_secs(20),
+                "no pass started"
+            );
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        let sent = Command::new("kill")
+            .args([&format!("-{signal}"), &child.id().to_string()])
+            .status()
+            .unwrap();
+        assert!(sent.success());
+        let run = fx.ran(child.wait_with_output().unwrap());
+        // The fakes sleep 60 s; the run ended because of the signal, not because they did.
+        assert!(started.elapsed() < Duration::from_secs(30), "{run:?}");
+        assert_eq!(run.code, Some(2), "{run:?}");
+        assert!(
+            run.stderr.contains(&format!("interrupted by SIG{signal}")),
+            "{run:?}"
+        );
+        assert_eq!(fx.prompt_of("coordinator"), "", "{run:?}");
+        assert_eq!(fx.result(), None);
+        // The reviewers (the fakes themselves) and their children are gone.
+        assert_dead(&fx, 3);
+        assert_all_dead(
+            &fs::read_to_string(fx.root.join("log.reviewer")).unwrap(),
+            3,
+        );
         fx.assert_worktree_removed();
     }
 }

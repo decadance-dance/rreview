@@ -6,6 +6,7 @@ use std::io::{ErrorKind, Write};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
+use std::sync::atomic::{AtomicI32, Ordering};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
@@ -67,10 +68,10 @@ impl Launch {
     }
 
     /// Runs with `prompt` on stdin. Stdout and stderr go to `<log>.stdout` and `<log>.stderr`.
-    /// The child leads its own process group, so a timeout kills everything it started.
-    // limit: in its own group the child misses the terminal's Ctrl-C; an interrupted rreview
-    // leaves a running reviewer behind.
+    /// The child leads its own process group, so a timeout or an interrupt (see
+    /// [`catch_interrupts`]) kills everything it started.
     pub fn run(&self, prompt: &str, log: &Path, timeout: Duration) -> Result<ExitStatus> {
+        interrupted()?;
         let stdout = log.with_extension("stdout");
         let stderr = log.with_extension("stderr");
         let mut child = Command::new(&self.program)
@@ -94,6 +95,10 @@ impl Launch {
         loop {
             if let Some(status) = child.try_wait()? {
                 return Ok(status);
+            }
+            if let Err(e) = interrupted() {
+                kill_group(&mut child);
+                return Err(e);
             }
             if started.elapsed() >= timeout {
                 kill_group(&mut child);
@@ -151,6 +156,61 @@ impl std::fmt::Display for TimedOut {
 }
 
 impl std::error::Error for TimedOut {}
+
+/// The signal that interrupted rreview, 0 for none.
+static SIGNAL: AtomicI32 = AtomicI32::new(0);
+const SIGINT: i32 = 2;
+const SIGTERM: i32 = 15;
+const SIG_DFL: usize = 0;
+
+unsafe extern "C" {
+    /// libc's; std exposes no signal API and a few lines do not earn a crate.
+    fn signal(signum: i32, handler: usize) -> usize;
+}
+
+extern "C" fn on_signal(signum: i32) {
+    SIGNAL.store(signum, Ordering::SeqCst);
+    // A second signal ends rreview at once, as if none were caught. `signal` is async-signal-safe.
+    for s in [SIGINT, SIGTERM] {
+        unsafe { signal(s, SIG_DFL) };
+    }
+}
+
+/// SIGINT and SIGTERM only set a flag: the waits that poll it ([`Launch::run`], the review's
+/// prepare steps) kill their process group and return [`Interrupted`], which unwinds through
+/// the run's cleanup guards (spec §4). Every reviewer leads its own process group, so the
+/// terminal's Ctrl-C reaches rreview alone.
+pub fn catch_interrupts() {
+    for s in [SIGINT, SIGTERM] {
+        // SAFETY: the handler only stores an atomic and calls `signal`, both async-signal-safe.
+        unsafe { signal(s, on_signal as extern "C" fn(i32) as usize) };
+    }
+}
+
+/// `Err(Interrupted)` once rreview has caught SIGINT or SIGTERM.
+pub fn interrupted() -> Result<()> {
+    match SIGNAL.load(Ordering::SeqCst) {
+        0 => Ok(()),
+        s => Err(Interrupted(s).into()),
+    }
+}
+
+/// rreview was told to stop; the run fails (exit 2) after its cleanup.
+#[derive(Debug)]
+pub struct Interrupted(i32);
+
+impl std::fmt::Display for Interrupted {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        let name = if self.0 == SIGINT {
+            "SIGINT"
+        } else {
+            "SIGTERM"
+        };
+        write!(f, "interrupted by {name}")
+    }
+}
+
+impl std::error::Error for Interrupted {}
 
 /// `claude -p --safe-mode --settings <runroot>/claude-settings.json --output-format json`.
 /// Writes the settings file: no edit/write/MCP tools, Bash sandboxed, writes denied in the

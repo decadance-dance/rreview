@@ -363,6 +363,8 @@ pub fn run(args: &Args) -> Result<u8> {
             .map(|t| t.join().map_err(|_| anyhow!("a panel thread panicked")))
             .collect::<Result<Vec<_>>>()
     })?;
+    // An interrupted pass fails like any other; the run stops here, its guards clean up.
+    launch::interrupted()?;
     // Every candidate gets a stable id, `<role>-<n>`, which the coordinator accounts for.
     let ids: Vec<Vec<String>> = panel
         .iter()
@@ -467,6 +469,7 @@ pub fn run(args: &Args) -> Result<u8> {
             }
         }
     }
+    launch::interrupted()?;
     // Terminals close before their worktree goes.
     drop(ctx);
     drop(runner);
@@ -694,8 +697,10 @@ impl<R: Runner> Ctx<'_, R> {
     }
 }
 
-/// The review worktree; removed when dropped (also on an error path) unless kept.
-// limit: a killed rreview (SIGKILL, Ctrl-C) leaves it; the next run for the same head says so.
+/// The review worktree; removed when dropped (also on an error path or an interrupt) unless
+/// kept.
+// limit: a killed rreview (SIGKILL, a second Ctrl-C) leaves it; the next run for the same head
+// says so.
 struct Worktree {
     path: PathBuf,
     keep: bool,
@@ -912,6 +917,7 @@ fn output(cmd: &mut Command, deadline: Option<Instant>) -> Result<Output> {
     };
     let program = cmd.get_program().to_string_lossy().into_owned();
     let spent = || anyhow!("the review's budget ran out while preparing ({program})");
+    launch::interrupted()?;
     if Instant::now() >= deadline {
         return Err(spent());
     }
@@ -943,6 +949,10 @@ fn output(cmd: &mut Command, deadline: Option<Instant>) -> Result<Output> {
                 stdout: stdout.join().unwrap_or_default(),
                 stderr: stderr.join().unwrap_or_default(),
             });
+        }
+        if let Err(e) = launch::interrupted() {
+            launch::kill_group(&mut child);
+            return Err(e);
         }
         if Instant::now() >= deadline {
             launch::kill_group(&mut child);

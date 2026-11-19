@@ -182,23 +182,26 @@ fn main() -> ExitCode {
             return ExitCode::from(2);
         }
         Some(Command::Show { target, repo, json }) => review::show(&target, repo.as_deref(), json),
-        None => review::run(&review::Args {
-            pr: cli.pr.unwrap_or_default(),
-            repo: cli.repo,
-            head: cli.head,
-            only: cli.only,
-            author: cli.author,
-            role_agents: cli.role_agents,
-            role_models: cli.role_models,
-            role_efforts: cli.role_efforts,
-            context_file: cli.context_file,
-            gate: if cli.all { Gate::NONE } else { cli.gate },
-            json: cli.json,
-            keep_worktree: cli.keep_worktree,
-            timeout: Duration::from_secs(cli.timeout),
-            budget: Duration::from_secs(cli.budget),
-            orca: matches!(cli.runner, RunnerKind::Orca),
-        }),
+        None => {
+            launch::catch_interrupts();
+            review::run(&review::Args {
+                pr: cli.pr.unwrap_or_default(),
+                repo: cli.repo,
+                head: cli.head,
+                only: cli.only,
+                author: cli.author,
+                role_agents: cli.role_agents,
+                role_models: cli.role_models,
+                role_efforts: cli.role_efforts,
+                context_file: cli.context_file,
+                gate: if cli.all { Gate::NONE } else { cli.gate },
+                json: cli.json,
+                keep_worktree: cli.keep_worktree,
+                timeout: Duration::from_secs(cli.timeout),
+                budget: Duration::from_secs(cli.budget),
+                orca: matches!(cli.runner, RunnerKind::Orca),
+            })
+        }
     };
     match code {
         Ok(code) => ExitCode::from(code),
