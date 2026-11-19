@@ -2290,7 +2290,7 @@ fn orca_pass_end_to_end() {
             agent == "codex",
             "{shim}"
         );
-        // Each wait is a slice of at most 5 s, between which rreview looks for a dialog.
+        // Each wait is a slice of at most 10 s, between which rreview looks for a dialog.
         let ms: Vec<u64> = run
             .log
             .split("--for tui-idle --timeout-ms ")
@@ -2298,7 +2298,7 @@ fn orca_pass_end_to_end() {
             .map(|r| r.split(' ').next().unwrap().parse().unwrap())
             .collect();
         assert_eq!(ms.len(), 2, "{run:?}");
-        assert!(ms.iter().all(|&m| m <= 5_000 && m > 4_000), "{ms:?}");
+        assert!(ms.iter().all(|&m| m <= 10_000 && m > 9_000), "{ms:?}");
         assert!(
             run.log
                 .contains("orca terminal close --terminal term_reliability --json"),
@@ -2504,9 +2504,9 @@ fn orca_fails_a_pass_stuck_on_a_dialog_and_types_nothing_into_it() {
     // `tui-idle` only times out while the dialog shows; Orca's `agentWait` names it.
     let fx = fixture();
     let start = Instant::now();
-    let run = orca_run(&fx, &["--timeout", "30"], "dialog", &env);
+    let run = orca_run(&fx, &["--timeout", "60"], "dialog", &env);
     assert_eq!(run.code, Some(2), "{run:?}");
-    assert!(start.elapsed() < Duration::from_secs(20), "{run:?}");
+    assert!(start.elapsed() < Duration::from_secs(30), "{run:?}");
     assert_eq!(fx.statuses(), ["started", "failed"]);
     assert!(
         run.stderr

@@ -35,7 +35,7 @@ const SETTLE: Duration = Duration::from_secs(30);
 /// `tui-idle` does not report Claude's permission dialog, only `terminal show`'s `agentWait`
 /// does, so a wait returns this often to look. A dialog open for `DIALOG` is one nobody will
 /// answer: Claude also shows some and clears them itself seconds later (*verified*, #28).
-const WAIT_SLICE: Duration = Duration::from_secs(5);
+const WAIT_SLICE: Duration = Duration::from_secs(10);
 const DIALOG: Duration = Duration::from_secs(30);
 
 /// The runner drives Orca through its CLI, which needs the app running with its runtime
