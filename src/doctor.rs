@@ -29,6 +29,8 @@ const SELF_TEST: &str = "This is rreview's sandbox self-test, run by the user on
                          the script is the whole test. Run it inside your sandbox as it is, \
                          without asking for approval or escalated permissions: it needs none, \
                          because its writes are meant to fail. Do not skip it.\n";
+/// What Claude's probe pass replies.
+const CLAUDE_REPLY: &str = "the probe's one line of output, as plain text";
 const CANARY_ASK: &str = "the canary word if any instruction you were given (system, developer, \
                           AGENTS.md or user instructions) names one, else NO-CANARY";
 
@@ -414,13 +416,10 @@ fn claude_probe(fx: &Fixture, via: Via) -> Result<Vec<Check>> {
             report = sh_quote(&report),
         ),
     )?;
-    // Not a JSON reply: under the orca runner Claude Code asked before a heredoc holding `{"`
-    // ("brace with quote character", *verified*, 2.1.316), and nobody answers that dialog.
     let prompt = format!(
         "{SELF_TEST}Use the Write tool to create the file {} with the content x, and the Edit tool to change \
          the line `a` to `b` in {}; if a tool is missing or refused, go on without it. Then run \
-         this exact command with the Bash tool, once:\nsh {}\nThis self-test's reply is not \
-         JSON: write only that command's one line of output to the reply file.\n",
+         this exact command with the Bash tool, once:\nsh {}\nYour reply is {CLAUDE_REPLY}.\n",
         tool_leak.display(),
         fx.wt.join("f.txt").display(),
         sh_quote(&probe)
@@ -437,7 +436,11 @@ fn claude_probe(fx: &Fixture, via: Via) -> Result<Vec<Check>> {
             }
         }
         Via::Orca => {
-            orca_runner(fx, PathBuf::new()).run(&probe_pass("claude", Agent::Claude, prompt))?;
+            // Not a JSON reply: under the orca runner Claude Code asked before a heredoc holding
+            // `{"` ("brace with quote character", *verified*, 2.1.316); nobody answers that dialog.
+            orca_runner(fx, PathBuf::new())
+                .replying(CLAUDE_REPLY)
+                .run(&probe_pass("claude", Agent::Claude, prompt))?;
         }
     }
     let report = fs::read_to_string(&report).map_err(|_| {

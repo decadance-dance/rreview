@@ -14,6 +14,7 @@
 #   offered         the Write and Edit tools are offered but never tried
 #   refused         the Write and Edit tools are offered, tried and refused
 #   no-transcript   leaves no session transcript
+#   nudge           (TUI) does nothing until the runner's reminder, then plays the probe
 # A probe pass leaves a session transcript as Claude Code does, under
 # ${CLAUDE_CONFIG_DIR:-$HOME/.claude}/projects/<cwd with every non-alphanumeric as ->/: the tools
 # offered to the model (api-request-shape) and any Write or Edit call with its result.
@@ -92,9 +93,15 @@ case " $* " in
 esac
 # A reviewer pass: the prompt on stdin names the probe script, in out/.
 [ $tui = yes ] || prompt=$(cat)
+if [ "$FAKE_CLAUDE" = nudge ] && [ $tui = yes ]; then
+  case "$prompt" in *"You stopped without writing"*) ;; *) exit 0 ;; esac
+fi
+replyfile=$(printf '%s\n' "$prompt" | grep -o '/[^`'"'"' ]*/reply\.txt' | head -n 1)
 probe=$(printf '%s\n' "$prompt" | grep -o "/[^']*/probe\.sh")
+# The runner's reminder names only the reply file, which sits next to the probe.
+[ -z "$probe" ] && probe=$(dirname "$replyfile")/probe.sh
 out=$(dirname "$probe")
-reply() { [ $tui = no ] || echo '{}' > "$(printf '%s\n' "$prompt" | grep -o '/[^`'"'"' ]*/reply\.txt' | head -n 1)"; }
+reply() { [ $tui = no ] || echo 'write=1 commit=128 branch=128 diff=0' > "$replyfile"; }
 transcript() {
   [ "$FAKE_CLAUDE" = no-transcript ] && return
   dir=${CLAUDE_CONFIG_DIR:-$HOME/.claude}/projects/$(printf '%s' "$PWD" | sed 's/[^A-Za-z0-9]/-/g')

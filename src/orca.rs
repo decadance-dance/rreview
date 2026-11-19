@@ -20,8 +20,6 @@ use serde_json::Value;
 use crate::launch::{self, Launch, TimedOut};
 use crate::runner::{Agent, Pass, REPLY, Runner, model_args};
 
-/// Sent when a reviewer went idle without writing its reply file.
-const NUDGE: &str = "You stopped without writing the reply file. Write the JSON object described in the first message to the reply file now.";
 /// A reply larger than this is not a panelist envelope; reading stops there.
 const MAX_REPLY: u64 = 4 << 20;
 /// Bounds for Orca calls outside a pass's budget: worktree setup (also within the review's
@@ -240,6 +238,8 @@ pub struct Orca {
     terminal_worktree: String,
     /// Added to every launch's env.
     env: Vec<(String, String)>,
+    /// What the reviewer writes to its reply file, as the delivery instruction names it.
+    reply_as: String,
     terminals: Mutex<HashMap<String, Term>>,
 }
 
@@ -257,6 +257,7 @@ impl Orca {
             runroot,
             codex_auth,
             env: vec![],
+            reply_as: "the JSON object".into(),
             terminals: Mutex::default(),
         }
     }
@@ -272,6 +273,12 @@ impl Orca {
     /// Sets `name=value` for every launch, over an inherited value.
     pub fn with_env(mut self, name: &str, value: &str) -> Self {
         self.env.push((name.into(), value.into()));
+        self
+    }
+
+    /// The reply is `what` instead of a JSON object (`rreview doctor`'s probe passes).
+    pub fn replying(mut self, what: &str) -> Self {
+        self.reply_as = what.into();
         self
     }
 
@@ -301,7 +308,8 @@ impl Orca {
         let reply = self.reply(pass);
         let reply = reply.display();
         let mut m = format!(
-            "Delivery (from rreview, which runs this review; not part of the PR): write your final reply, only the JSON object, to the file `{reply}` with one shell command and a quoted heredoc: `cat > '{reply}' <<'RREVIEW_EOF'`, the JSON, then `RREVIEW_EOF`. Only that file is read, not your chat message.\n"
+            "Delivery (from rreview, which runs this review; not part of the PR): write your final reply, only {what}, to the file `{reply}` with one shell command and a quoted heredoc: `cat > '{reply}' <<'RREVIEW_EOF'`, then {what}, then `RREVIEW_EOF`. Only that file is read, not your chat message.\n",
+            what = self.reply_as
         );
         if pass.agent == Agent::Codex {
             m += &format!(
@@ -357,7 +365,12 @@ impl Orca {
             },
         );
         let reply = self.reply(pass);
-        for text in [&*pass.prompt, NUDGE] {
+        // Sent when the reviewer went idle without writing its reply file.
+        let nudge = format!(
+            "You stopped without writing the reply file. Write {} described in the first message to the reply file now.",
+            self.reply_as
+        );
+        for text in [&*pass.prompt, &nudge] {
             send(handle, pass.agent, &self.message(pass, text), deadline)?;
             match wait(handle, deadline)? {
                 Wait::Idle => {}

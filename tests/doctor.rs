@@ -13,6 +13,8 @@ struct Run {
     passed: bool,
     stdout: String,
     log: String,
+    /// Every prompt the fake orca typed into a terminal titled `rreview:claude...`.
+    claude_prompts: String,
 }
 
 fn doctor(fakes: &[&str], scenario: &[(&str, &str)]) -> Run {
@@ -59,6 +61,15 @@ fn doctor_with(args: &[&str], fakes: &[&str], scenario: &[(&str, &str)]) -> Run 
         passed: out.status.success(),
         stdout: String::from_utf8_lossy(&out.stdout).into(),
         log: fs::read_to_string(root.join("log")).unwrap_or_default(),
+        claude_prompts: fs::read_dir(&root)
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .filter(|p| {
+                p.file_name()
+                    .is_some_and(|n| n.to_string_lossy().starts_with("log.prompt.claude"))
+            })
+            .map(|p| fs::read_to_string(p).unwrap())
+            .collect(),
     };
     fs::remove_dir_all(&root).unwrap();
     run
@@ -486,4 +497,23 @@ fn write_and_edit_need_evidence_that_claude_could_not_use_them() {
             }
         }
     }
+}
+
+/// Claude's probe pass asks for a plain-text reply, in the delivery line and the runner's
+/// reminder too: a JSON heredoc stops the TUI at a permission dialog.
+#[test]
+fn the_orca_claude_probe_never_asks_for_json() {
+    let run = doctor_orca(&[("FAKE_CLAUDE", "nudge")]);
+    assert!(run.passed, "{}", run.stdout);
+    assert!(
+        run.claude_prompts
+            .contains("You stopped without writing the reply file"),
+        "{}",
+        run.claude_prompts
+    );
+    assert!(
+        !run.claude_prompts.contains("JSON"),
+        "{}",
+        run.claude_prompts
+    );
 }
