@@ -103,6 +103,19 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
+    /// Start a reviewer with only the variables it inherits (the orca runner's shim).
+    #[command(hide = true)]
+    ExecReviewer {
+        /// A variable passed on when set. Repeatable.
+        #[arg(long)]
+        inherit: Vec<String>,
+        /// NAME=VALUE for the reviewer. Repeatable.
+        #[arg(long)]
+        set: Vec<String>,
+        /// The program and its arguments.
+        #[arg(last = true, required = true)]
+        command: Vec<String>,
+    },
 }
 
 /// A full hex id only: it becomes a git argument, so nothing that reads as a flag or a rev range.
@@ -152,6 +165,17 @@ fn main() -> ExitCode {
                     ExitCode::FAILURE
                 }
             };
+        }
+        Some(Command::ExecReviewer {
+            inherit,
+            set,
+            command,
+        }) => {
+            eprintln!(
+                "error: {:#}",
+                launch::exec_reviewer(&inherit, &set, &command)
+            );
+            return ExitCode::from(2);
         }
         Some(Command::Show { target, repo, json }) => review::show(&target, repo.as_deref(), json),
         None => review::run(&review::Args {

@@ -11,16 +11,61 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result, bail};
 use serde_json::json;
 
-/// One reviewer process: program, argument vector, extra env and working directory.
-#[derive(Debug)]
+/// What every reviewer inherits from the environment it starts in (spec §3); every other
+/// variable, such as a `GH_TOKEN` meant for rreview's own `gh`, is dropped.
+const INHERIT: &[&str] = &[
+    // Run at all, find the user's login (the macOS keychain), give the sandboxed Bash a shell.
+    "PATH",
+    "HOME",
+    "USER",
+    "LOGNAME",
+    "SHELL",
+    "TMPDIR",
+    // Locale and the terminal the TUI draws in (the Orca runner).
+    "LANG",
+    "LC_ALL",
+    "LC_CTYPE",
+    "LC_COLLATE",
+    "LC_MESSAGES",
+    "LC_MONETARY",
+    "LC_NUMERIC",
+    "LC_TIME",
+    "TZ",
+    "TERM",
+    "COLORTERM",
+    // Reach the API from a network behind a proxy or a private CA. A proxy URL may carry the
+    // proxy's user and password; when set, they reach the CLI and so the reviewer.
+    "HTTPS_PROXY",
+    "https_proxy",
+    "NO_PROXY",
+    "no_proxy",
+    "NODE_EXTRA_CA_CERTS",
+    "SSL_CERT_FILE",
+];
+
+/// Claude's own subscription login: its config dir (an Orca account home, say) or a
+/// `claude setup-token` OAuth token, which then reaches the reviewer. Not `ANTHROPIC_API_KEY`:
+/// it would move the review to API billing (spec §1: subscriptions, not API keys). Codex needs
+/// none: its login is the `auth.json` in its run-scoped home.
+const CLAUDE_INHERIT: &[&str] = &["CLAUDE_CONFIG_DIR", "CLAUDE_CODE_OAUTH_TOKEN"];
+
+/// One reviewer process: program, argument vector, the variables it inherits (see [`INHERIT`]),
+/// extra env and working directory.
+#[derive(Clone, Debug)]
 pub struct Launch {
     pub program: String,
     pub args: Vec<String>,
+    pub inherit: Vec<&'static str>,
     pub env: Vec<(String, String)>,
     pub cwd: PathBuf,
 }
 
 impl Launch {
+    /// Whether the reviewer inherits `name` from the environment it starts in.
+    pub fn inherits(&self, name: &str) -> bool {
+        self.inherit.contains(&name)
+    }
+
     /// Runs with `prompt` on stdin. Stdout and stderr go to `<log>.stdout` and `<log>.stderr`.
     /// The child leads its own process group, so a timeout kills everything it started.
     // limit: in its own group the child misses the terminal's Ctrl-C; an interrupted rreview
@@ -30,6 +75,8 @@ impl Launch {
         let stderr = log.with_extension("stderr");
         let mut child = Command::new(&self.program)
             .args(&self.args)
+            .env_clear()
+            .envs(std::env::vars_os().filter(|(k, _)| k.to_str().is_some_and(|k| self.inherits(k))))
             .envs(self.env.iter().map(|(k, v)| (k, v)))
             .current_dir(&self.cwd)
             .stdin(Stdio::piped())
@@ -60,6 +107,27 @@ impl Launch {
             std::thread::sleep(Duration::from_millis(100));
         }
     }
+}
+
+/// `rreview exec-reviewer` (the orca runner's shim, spec §3): replaces this process with
+/// `command`, given only the `inherit` variables of this environment that are set plus `set`.
+/// Values stay in the environment across the exec, out of every argv. Returns only on failure.
+pub fn exec_reviewer(inherit: &[String], set: &[String], command: &[String]) -> anyhow::Error {
+    let Some((program, args)) = command.split_first() else {
+        return anyhow::anyhow!("exec-reviewer: no program");
+    };
+    let mut cmd = Command::new(program);
+    cmd.args(args).env_clear().envs(
+        std::env::vars_os()
+            .filter(|(k, _)| k.to_str().is_some_and(|k| inherit.iter().any(|i| i == k))),
+    );
+    for kv in set {
+        match kv.split_once('=') {
+            Some((k, v)) => cmd.env(k, v),
+            None => return anyhow::anyhow!("exec-reviewer: --set {kv:?} is not NAME=VALUE"),
+        };
+    }
+    anyhow::Error::new(cmd.exec()).context(format!("cannot start {program}"))
 }
 
 /// Kills `child`, which leads its own process group, and everything it started.
@@ -101,6 +169,7 @@ pub fn claude(worktree: &Path, git_common_dir: &Path, runroot: &Path) -> Result<
         ]
         .map(String::from)
         .into(),
+        inherit: [INHERIT, CLAUDE_INHERIT].concat(),
         env: vec![],
         cwd,
     })
@@ -108,8 +177,9 @@ pub fn claude(worktree: &Path, git_common_dir: &Path, runroot: &Path) -> Result<
 
 /// The same isolation as [`claude`] as an interactive session (the orca runner). The reply file
 /// is written by a sandboxed Bash redirect into `<runroot>/out`; Claude asks before such a write
-/// outside its working dirs (`dontAsk` refuses it), so `out` is added as a working dir and
-/// `acceptEdits` takes it without a dialog nobody would answer. The deny rules still remove
+/// outside its working dirs, so `out` is added as a working dir and `acceptEdits` takes it
+/// without a dialog nobody would answer. Not `dontAsk`: on a live pass it refused the
+/// reviewer's heredoc reply twice (*verified*, Claude Code 2.1.316). The deny rules still remove
 /// Edit and Write, and the sandbox still refuses every other write.
 pub fn claude_tui(worktree: &Path, git_common_dir: &Path, runroot: &Path) -> Result<Launch> {
     let (settings, cwd) = claude_settings(worktree, git_common_dir, runroot)?;
@@ -127,6 +197,7 @@ pub fn claude_tui(worktree: &Path, git_common_dir: &Path, runroot: &Path) -> Res
         ]
         .map(String::from)
         .into(),
+        inherit: [INHERIT, CLAUDE_INHERIT].concat(),
         env: vec![],
         cwd,
     })
@@ -147,7 +218,10 @@ fn claude_settings(
     let settings = json!({
         "permissions": { "deny": [
             "Edit", "Write", "NotebookEdit", "mcp__*",
-            "Bash(gh *)", "Bash(git push*)", "Bash(curl *)", "Bash(wget *)"
+            "Bash(gh *)", "Bash(git push*)", "Bash(curl *)", "Bash(wget *)",
+            // Network tools; under the orca runner a WebSearch also stopped the pass at a
+            // permission dialog until its timeout (*verified*).
+            "WebSearch", "WebFetch"
         ] },
         "sandbox": {
             "enabled": true,
@@ -192,6 +266,7 @@ pub fn codex(worktree: &Path, runroot: &Path, out_name: &str, user_auth: &Path) 
         ]
         .map(String::from)
         .into(),
+        inherit: INHERIT.into(),
         env,
         cwd: worktree,
     })
@@ -223,6 +298,7 @@ pub fn codex_tui(worktree: &Path, runroot: &Path, user_auth: &Path) -> Result<La
         ]
         .map(String::from)
         .into(),
+        inherit: INHERIT.into(),
         env,
         cwd: worktree,
     })
@@ -315,7 +391,9 @@ mod tests {
                 "Bash(gh *)",
                 "Bash(git push*)",
                 "Bash(curl *)",
-                "Bash(wget *)"
+                "Bash(wget *)",
+                "WebSearch",
+                "WebFetch"
             ])
         );
         let sandbox = &s["sandbox"];
@@ -409,6 +487,7 @@ mod tests {
                 "-c".into(),
                 format!("sleep 60 & echo $! > '{}'; sleep 60", pid_file.display()),
             ],
+            inherit: vec![],
             env: vec![],
             cwd: root.clone(),
         };

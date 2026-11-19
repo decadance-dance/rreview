@@ -7,7 +7,8 @@
 
 use std::collections::HashMap;
 use std::fs::{self, File};
-use std::io::{ErrorKind, Read};
+use std::io::{ErrorKind, Read, Write};
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::{Mutex, mpsc};
@@ -330,7 +331,10 @@ impl Runner for Orca {
             }
             _ => {}
         }
-        let command = shell_line(&self.launch(pass)?)?;
+        // limit: the shim runs this executable by path; replacing it mid-run (a rebuild) breaks
+        // the later launches of the run.
+        let exe = std::env::current_exe().context("cannot find the rreview executable")?;
+        let command = shell_line(&self.launch(pass)?, &self.scratch(pass).join("bin"), &exe)?;
         let v = orca(
             &[
                 "terminal",
@@ -563,25 +567,76 @@ fn printable(text: &str) -> String {
         .collect()
 }
 
-/// Orca types `--command` into the terminal's login shell, so the launch becomes one shell line:
-/// `NAME='value' ... exec 'program' 'arg' ...`, every value and word single-quoted. `exec` leaves
-/// no shell behind the agent to receive later input. Not `exec env ...`: Orca then does not
-/// recognize the agent for `send` and types the prompt raw (*verified*, Orca 1.4.262).
-fn shell_line(launch: &Launch) -> Result<String> {
+/// Orca types `--command` into the terminal's login shell, whose environment is Orca's and the
+/// shell's own, not rreview's. So the agent starts through a shim, `<bin>/<program>`, that hands
+/// it to `<exe> exec-reviewer` (this binary): that builds the environment from nothing at the
+/// last exec (spec §3), each inherited variable that is set plus the launch's own env. Nothing
+/// the shell holds can slip past it: a read-only export, a name that is no identifier, an
+/// exported function. Only names go into an argv, never an inherited value. The line is
+/// `PATH='<bin>':"$PATH" exec 'program' 'arg' ...`, every word single-quoted, no value on it
+/// (the shell may keep it in its history), and the shim takes `<bin>` off `PATH` again. `exec`
+/// leaves no shell behind the agent to receive later input. The program must be `exec`'s first
+/// word: with `exec env ...` or `exec '<path>/program'` Orca still names the agent, but its
+/// `send` reports provider "unsupported" and types the prompt raw (*verified*, Orca 1.4.262).
+// limit: a POSIX-family login shell (sh, bash, zsh) types the line.
+fn shell_line(launch: &Launch, bin: &Path, exe: &Path) -> Result<String> {
     let quote = |w: &str| -> Result<String> {
         if w.chars().any(char::is_control) {
             bail!("cannot put {w:?} on a shell line");
         }
         Ok(format!("'{}'", w.replace('\'', r"'\''")))
     };
-    let mut line = String::new();
+    let name = |k: &str| !k.is_empty() && k.chars().all(|c| c == '_' || c.is_ascii_alphanumeric());
+    if launch.program.contains('/') || launch.program.starts_with('.') || launch.program.is_empty()
+    {
+        bail!("cannot shim the program {:?}", launch.program);
+    }
+    fs::create_dir_all(bin).with_context(|| format!("{}", bin.display()))?;
+    let bin = fs::canonicalize(bin).with_context(|| format!("{}", bin.display()))?;
+    // A `:` splits a PATH entry, and the shell would then find the real program, unfiltered.
+    if launch::utf8(&bin)?.contains(':') {
+        bail!(
+            "the run dir {} holds a ':', which a PATH entry cannot; \
+             set XDG_STATE_HOME to a path without one",
+            bin.display()
+        );
+    }
+    let bin_q = quote(launch::utf8(&bin)?)?;
+    let mut shim = format!(
+        "#!/bin/sh\n# rreview: {} with only the variables it inherits (spec §3).\n\
+         PATH=${{PATH#{bin_q}:}}\nexec {} exec-reviewer",
+        launch.program,
+        quote(launch::utf8(exe)?)?
+    );
+    for k in &launch.inherit {
+        if !name(k) {
+            bail!("cannot inherit the variable {k:?}");
+        }
+        shim += &format!(" --inherit {k}");
+    }
     for (k, v) in &launch.env {
-        if k.is_empty() || !k.chars().all(|c| c == '_' || c.is_ascii_alphanumeric()) {
+        if !name(k) {
             bail!("cannot put the variable {k:?} on a shell line");
         }
-        line += &format!("{k}={} ", quote(v)?);
+        shim += &format!(" --set {}", quote(&format!("{k}={v}"))?);
     }
-    line += "exec";
+    shim += &format!(" -- {} \"$@\"\n", quote(&launch.program)?);
+    let path = bin.join(&launch.program);
+    // A fresh file: whatever stands at that path is replaced, never written through.
+    match fs::remove_file(&path) {
+        Err(e) if e.kind() != ErrorKind::NotFound => {
+            return Err(e).with_context(|| format!("{}", path.display()));
+        }
+        _ => {}
+    }
+    fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o700)
+        .open(&path)
+        .and_then(|mut f| f.write_all(shim.as_bytes()))
+        .with_context(|| format!("{}", path.display()))?;
+    let mut line = format!("PATH={bin_q}:\"$PATH\" exec");
     for w in [&launch.program].into_iter().chain(&launch.args) {
         line += &format!(" {}", quote(w)?);
     }
@@ -672,21 +727,72 @@ mod tests {
 
     #[test]
     fn shell_line_quotes_every_word() {
+        let root = crate::doctor::fresh_temp_dir("rreview-test").unwrap();
+        let bin = root.join("it's bin");
         let launch = Launch {
             program: "codex".into(),
             args: vec!["-C".into(), "/a b/it's".into()],
+            inherit: vec!["PATH", "LC_ALL"],
             env: vec![("CODEX_HOME".into(), "/h $x".into())],
             cwd: PathBuf::from("/"),
         };
+        let exe = Path::new("/opt/it's/rreview");
+        let q = r"'\''";
         assert_eq!(
-            shell_line(&launch).unwrap(),
-            r"CODEX_HOME='/h $x' exec 'codex' '-C' '/a b/it'\''s'"
+            shell_line(&launch, &bin, exe).unwrap(),
+            format!(
+                "PATH='{}/it{q}s bin':\"$PATH\" exec 'codex' '-C' '/a b/it{q}s'",
+                root.display()
+            )
         );
-        let bad = Launch {
-            args: vec!["a\nrm -rf x".into()],
-            ..launch
+        // Names only: no inherited value is expanded into the exec-reviewer argv.
+        assert_eq!(
+            fs::read_to_string(bin.join("codex")).unwrap(),
+            format!(
+                "#!/bin/sh\n# rreview: codex with only the variables it inherits (spec §3).\n\
+                 PATH=${{PATH#'{}/it{q}s bin':}}\n\
+                 exec '/opt/it{q}s/rreview' exec-reviewer --inherit PATH --inherit LC_ALL \
+                 --set 'CODEX_HOME=/h $x' -- 'codex' \"$@\"\n",
+                root.display()
+            )
+        );
+        for bad in [
+            Launch {
+                args: vec!["a\nrm -rf x".into()],
+                ..launch.clone()
+            },
+            Launch {
+                inherit: vec!["X) ;; *) rm -rf x"],
+                ..launch.clone()
+            },
+            Launch {
+                program: "../codex".into(),
+                ..launch.clone()
+            },
+        ] {
+            assert!(shell_line(&bad, &bin, exe).is_err(), "{bad:?}");
+        }
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    /// A `:` in the run dir would split the shim's PATH entry, and the shell would start the real
+    /// program with the terminal's whole environment (review of PR #24, round 2): refuse it.
+    #[test]
+    fn shell_line_refuses_a_run_dir_with_a_colon() {
+        let root = crate::doctor::fresh_temp_dir("rreview-test").unwrap();
+        let launch = Launch {
+            program: "claude".into(),
+            args: vec![],
+            inherit: vec!["PATH"],
+            env: vec![],
+            cwd: PathBuf::from("/"),
         };
-        assert!(shell_line(&bad).is_err());
+        let err = shell_line(&launch, &root.join("a:b/bin"), Path::new("/rreview")).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("holds a ':', which a PATH entry cannot"),
+            "{err:#}"
+        );
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

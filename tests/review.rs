@@ -9,6 +9,9 @@ use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
 
+#[path = "fixtures/fake_env.rs"]
+mod fake_env;
+
 /// An upstream repo `<root>/acme/widget` whose PR #7 head (`refs/pull/7/head`, on no branch)
 /// adds `src/lib.rs` on top of `base`, while `main` moved on; and a clone of it that has
 /// `main` only, so rreview must fetch the PR head.
@@ -150,6 +153,11 @@ impl Fixture {
 
     fn rreview(&self, pr: &Value, args: &[&str], scenario: &[(&str, String)]) -> Run {
         let (bin, codex_home) = self.install_fakes();
+        let fakes = [
+            ("FAKE_LOG", self.root.join("log").display().to_string()),
+            ("FAKE_GH_PR", pr.to_string()),
+        ];
+        fake_env::write(&bin, &[&fakes[..], scenario].concat());
         let out = Command::new(env!("CARGO_BIN_EXE_rreview"))
             .args(args)
             .current_dir(&self.clone)
@@ -329,6 +337,82 @@ fn claude_pass_end_to_end() {
     assert!(run.log.contains("gh pr view 7 --json number,"), "{run:?}");
     assert!(!run.log.contains("--repo"), "{run:?}");
     fx.assert_worktree_removed();
+}
+
+/// A token rreview holds for `gh` (and anything else not on the launch allowlist) never reaches
+/// a reviewer; what the CLIs need does, Claude's own config only to Claude (spec §3).
+#[test]
+fn reviewers_inherit_only_what_the_cli_needs() {
+    let fx = fixture();
+    let env = envelope("src/lib.rs");
+    let claude = fx.run(
+        &[],
+        &[
+            &claude_says(&format!("```json\n{env}\n```"))[..],
+            &env_canaries(),
+        ]
+        .concat(),
+    );
+    assert_eq!(claude.code, Some(0), "{claude:?}");
+    let codex = fx.run(
+        &["--role-agent", "reliability=codex"],
+        &[
+            &[
+                ("FAKE_REVIEW", "ok".into()),
+                ("FAKE_REPLY", env.to_string()),
+            ][..],
+            &env_canaries(),
+        ]
+        .concat(),
+    );
+    assert_eq!(codex.code, Some(0), "{codex:?}");
+    assert_inherited_only_what_the_cli_needs(&fx);
+}
+
+/// What rreview (and so, under the fake orca, the terminal) holds: tokens a reviewer must not
+/// see, an API key that would move Claude off the subscription, and what it needs.
+fn env_canaries() -> Scenario {
+    vec![
+        ("GH_TOKEN", "gh-canary".into()),
+        ("OTHER_SECRET", "other-canary".into()),
+        ("ANTHROPIC_API_KEY", "api-canary".into()),
+        ("CLAUDE_CONFIG_DIR", "/claude-config".into()),
+        ("CLAUDE_CODE_OAUTH_TOKEN", "oauth".into()),
+        ("LC_CTYPE", "C".into()),
+    ]
+}
+
+/// Checks the environments the fake claude and codex logged against [`env_canaries`].
+fn assert_inherited_only_what_the_cli_needs(fx: &Fixture) {
+    let seen = fs::read_to_string(fx.root.join("log.env")).unwrap();
+    let section = |agent: &str| -> Vec<String> {
+        seen.split(&format!("== {agent}\n"))
+            .skip(1)
+            .flat_map(|s| s.split("\n== ").next().unwrap().lines())
+            .map(String::from)
+            .collect()
+    };
+    let (claude, codex) = (section("claude"), section("codex"));
+    assert!(!claude.is_empty() && !codex.is_empty(), "{seen}");
+    for line in claude.iter().chain(&codex) {
+        assert!(!line.contains("canary"), "a reviewer saw {line}");
+    }
+    let has = |env: &[String], line: &str| env.iter().any(|l| l == line);
+    let home = format!("HOME={}", fx.root.display());
+    for env in [&claude, &codex] {
+        assert!(has(env, &home) && has(env, "LC_CTYPE=C"), "{env:?}");
+    }
+    for line in [
+        "CLAUDE_CONFIG_DIR=/claude-config",
+        "CLAUDE_CODE_OAUTH_TOKEN=oauth",
+    ] {
+        assert!(has(&claude, line), "{claude:?}");
+        assert!(!has(&codex, line), "{codex:?}");
+    }
+    assert!(
+        codex.iter().any(|l| l.starts_with("CODEX_HOME=")),
+        "{codex:?}"
+    );
 }
 
 #[test]
@@ -1753,9 +1837,10 @@ fn orca_pass_end_to_end() {
             "{run:?}"
         );
         let out = runroot.join("scratch/reliability/out");
-        let command = if agent == "claude" {
+        let bin = runroot.join("scratch/reliability/bin");
+        let args = if agent == "claude" {
             format!(
-                "exec 'claude' '--safe-mode' '--settings' '{}' '--permission-mode' 'acceptEdits' '--add-dir' '{}'",
+                "'--safe-mode' '--settings' '{}' '--permission-mode' 'acceptEdits' '--add-dir' '{}'",
                 runroot
                     .join("scratch/reliability/claude-settings.json")
                     .display(),
@@ -1763,17 +1848,34 @@ fn orca_pass_end_to_end() {
             )
         } else {
             format!(
-                "CODEX_HOME='{}' exec 'codex' '-C' '{}' '-s' 'workspace-write' '-a' 'never' '-c' 'sandbox_workspace_write.exclude_slash_tmp=true' '-c' 'sandbox_workspace_write.exclude_tmpdir_env_var=true' '-c' 'check_for_update_on_startup=false'",
-                runroot.join("scratch/reliability/codex-home").display(),
+                "'-C' '{}' '-s' 'workspace-write' '-a' 'never' '-c' 'sandbox_workspace_write.exclude_slash_tmp=true' '-c' 'sandbox_workspace_write.exclude_tmpdir_env_var=true' '-c' 'check_for_update_on_startup=false'",
                 out.display()
             )
         };
+        // The agent is exec's first word (Orca pastes to it) and starts through the shim.
         assert!(
             run.log.contains(&format!(
-                "orca terminal create --worktree path:{} --title rreview:reliability --command {command} --json\n",
-                wt.display()
+                "orca terminal create --worktree path:{} --title rreview:reliability --command PATH='{}':\"$PATH\" exec '{agent}' {args} --json\n",
+                wt.display(),
+                bin.display()
             )),
             "{run:?}"
+        );
+        let shim = fs::read_to_string(bin.join(agent)).unwrap();
+        assert!(
+            shim.contains(&format!(
+                "exec '{}' exec-reviewer --inherit PATH ",
+                env!("CARGO_BIN_EXE_rreview")
+            )),
+            "{shim}"
+        );
+        assert_eq!(
+            shim.contains(&format!(
+                "'CODEX_HOME={}'",
+                runroot.join("scratch/reliability/codex-home").display()
+            )),
+            agent == "codex",
+            "{shim}"
         );
         // Each wait gets what is left of the pass's 900 s.
         let ms: Vec<u64> = run
@@ -1824,6 +1926,72 @@ fn orca_pass_end_to_end() {
         assert!(run.prompt.find("IGNORE PREVIOUS INSTRUCTIONS").unwrap() > boundary);
         fx.assert_orca_worktree_removed();
     }
+}
+
+/// Under Orca the agent starts from the terminal's shell, whose environment rreview does not
+/// build: a read-only export, an exported function or a non-identifier name there (bash), or a
+/// read-only export that makes zsh abort an `unset` (review of PR #24), still never reach the
+/// reviewer, and Orca still pastes to the agent.
+#[test]
+fn orca_reviewers_inherit_only_what_the_cli_needs() {
+    let env = envelope("src/lib.rs");
+    for shell in ["bash", "zsh", "sh"] {
+        if !Path::new("/bin").join(shell).exists() {
+            continue;
+        }
+        let fx = fixture();
+        for agent in ["claude", "codex"] {
+            // The fake orca keeps one terminal's state per role; this is a new terminal.
+            let _ = fs::remove_file(fx.root.join("log.orca-reliability"));
+            let extra = [
+                &[
+                    ("FAKE_REPLY", env.to_string()),
+                    ("FAKE_ORCA_SHELL", shell.into()),
+                ][..],
+                &env_canaries(),
+            ]
+            .concat();
+            let run = orca_run_with(
+                &fx,
+                &["--role-agent", &format!("reliability={agent}")],
+                "ok",
+                &extra,
+            );
+            assert_eq!(run.code, Some(0), "{shell} {agent}: {run:?}");
+        }
+        let shell_log = fs::read_to_string(fx.root.join("log.orca-shell")).unwrap_or_default();
+        assert!(!shell_log.contains("launch failed"), "{shell}: {shell_log}");
+        assert_inherited_only_what_the_cli_needs(&fx);
+    }
+}
+
+/// A `:` in the run dir would split the shim's PATH entry, so the terminal's shell would start
+/// the real agent with its whole environment (review of PR #24, round 2). The run fails closed
+/// before any agent starts.
+#[test]
+fn orca_refuses_a_run_dir_whose_path_has_a_colon() {
+    let fx = fixture();
+    let state = fx.root.join("state:x");
+    let run = orca_run_with(
+        &fx,
+        &[],
+        "ok",
+        &[
+            ("FAKE_REPLY", envelope("src/lib.rs").to_string()),
+            ("FAKE_ORCA_SHELL", "bash".into()),
+            ("GH_TOKEN", "gh-canary".into()),
+            ("XDG_STATE_HOME", state.display().to_string()),
+        ],
+    );
+    assert_eq!(run.code, Some(2), "{run:?}");
+    assert!(
+        run.stderr
+            .contains("holds a ':', which a PATH entry cannot"),
+        "{run:?}"
+    );
+    // Give a launch that slipped through time to log what it saw.
+    std::thread::sleep(Duration::from_millis(500));
+    assert!(!fx.root.join("log.env").exists(), "an agent started");
 }
 
 #[test]

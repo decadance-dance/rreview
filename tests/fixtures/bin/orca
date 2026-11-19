@@ -17,7 +17,11 @@
 #   no-agent        Orca never recognizes an agent and every wait times out
 #   slow-agent      Orca recognizes the agent only at the third `terminal show`; tui-idle holds
 #                   before that (as it does for a starting Codex), and a prompt sent earlier is
-#                   typed raw (provider "unsupported")
+#                   typed raw (provider "unsupported"), as is every prompt to an agent that was
+#                   not exec's first word on the launch line
+# FAKE_ORCA_SHELL (bash, zsh, sh): `terminal create` runs the launch line in that shell (with a
+# hostile startup: a read-only export, an exported function, a non-identifier name; all hold
+# "canary"); a failed launch is logged to $FAKE_LOG.orca-shell.
 #   wrong-head      the worktree is checked out at the parent of the requested commit
 #   lost-reply      `worktree create` makes the worktree and branch, then fails without JSON
 #   foreign-branch  `worktree create` reports the branch `victim` instead of its own
@@ -61,12 +65,37 @@ case "$1 $2" in
   [ "$scenario" = no-ok ] && { echo '{"ok":false,"error":{"code":"boom","message":"no terminal"}}'; exit 0; }
   role=$(arg --title "$@"); role=${role#rreview:}
   echo open >> "$FAKE_LOG.orca-$role"
-  case "$(arg --command "$@")" in *"'claude'"*) agent=claude ;; *) agent=codex ;; esac
+  cmd=$(arg --command "$@")
+  case "$cmd" in *"'claude'"*) agent=claude ;; *) agent=codex ;; esac
   echo "agent $agent" >> "$FAKE_LOG.orca-$role"
+  # Like Orca, paste to the agent only when it is exec's first word, not behind `env` or a path.
+  case "$cmd" in *" exec '$agent' "*|*" exec '$agent'") ;; *) echo raw-launch >> "$FAKE_LOG.orca-$role" ;; esac
+  # With FAKE_ORCA_SHELL set, the terminal's login shell runs the line, in the background as
+  # Orca does, in its own environment (rreview's here) plus what a user's startup files may add:
+  # a read-only export, an exported function, a name that is no identifier. The agent's
+  # environment is logged by the fake claude or codex. Otherwise the agent is up at once.
+  if [ -n "$FAKE_ORCA_SHELL" ]; then
+    wt=$(arg --worktree "$@")
+    case "$FAKE_ORCA_SHELL" in
+    bash) startup='export RO_SECRET=canary; readonly RO_SECRET; f() { echo canary; }; export -f f; ' ;;
+    zsh) startup='typeset -rx RO_SECRET=canary; ' ;;
+    *) startup= ;;
+    esac
+    (
+      (cd "${wt#path:}" && env 'DOTTED.SECRET=canary' "$FAKE_ORCA_SHELL" -c "$startup$cmd") \
+        || echo "launch failed: $?" >> "$FAKE_LOG.orca-shell"
+      echo launched >> "$FAKE_LOG.orca-$role"
+    ) < /dev/null > /dev/null 2>> "$FAKE_LOG.orca-shell" &
+  else
+    echo launched >> "$FAKE_LOG.orca-$role"
+  fi
   ok "{\"terminal\":{\"handle\":\"term_$role\"}}" ;;
 "terminal show")
   echo show >> "$state"
+  # The agent is up once its launch line ran; give it up to 5 s.
+  i=0; while ! grep -q '^launched' "$state" && [ $i -lt 100 ]; do sleep 0.05; i=$((i + 1)); done
   agent=$(sed -n 's/^agent //p' "$state")
+  grep -q '^launched' "$state" || agent=
   case "$scenario" in
   no-agent) agent= ;;
   slow-agent) [ "$(grep -c '^show' "$state")" -lt 3 ] && agent= ;;
@@ -104,7 +133,11 @@ case "$1 $2" in
     if [ "$n" = 1 ]; then printf '%s' "$first" > "$state.pending"; else printf '%s' "$later" > "$state.pending"; fi
     printf '%s' "$text" | grep -o '/[^`'"'"' ]*/reply\.txt' | head -n 1 > "$state.path"
   fi
-  if grep -q agent-up "$state"; then provider=$(sed -n 's/^agent //p' "$state"); else provider=unsupported; fi
+  if grep -q agent-up "$state" && ! grep -q raw-launch "$state"; then
+    provider=$(sed -n 's/^agent //p' "$state")
+  else
+    provider=unsupported
+  fi
   ok "{\"send\":{\"accepted\":true,\"prompt\":{\"provider\":\"$provider\"}}}" ;;
 "terminal wait")
   [ -n "$FAKE_ORCA_WAIT_DELAY" ] && [ "$(sent)" -gt 0 ] && sleep "$FAKE_ORCA_WAIT_DELAY"
