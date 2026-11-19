@@ -9,6 +9,8 @@
 #   lie             skips the probe and reports "write=0 commit=0 branch=0 diff=99 startup=0 control=1"
 #   startup         reports that the startup canary reached the probe (startup=1)
 #   no-control      reports that even the control did not see the startup canary (control=0)
+#   no-sandbox      a host where the sandbox cannot start: exits at startup when the settings
+#                   say failIfUnavailable, else runs the probe unsandboxed, as Claude Code does
 #   snapshot-leak   sources its shell snapshot, then the probe, both unsandboxed, as a Claude
 #                   whose sandbox let the command read the snapshot would
 # Like Claude Code, a probe pass first writes a shell snapshot of $HOME/.zshrc into
@@ -104,6 +106,12 @@ case " $* " in
   echo "control-env HOME=$HOME XDG_CONFIG_HOME=$XDG_CONFIG_HOME XDG_CACHE_HOME=$XDG_CACHE_HOME XDG_DATA_HOME=$XDG_DATA_HOME XDG_STATE_HOME=$XDG_STATE_HOME CLAUDE_CONFIG_DIR=$CLAUDE_CONFIG_DIR" >> "${FAKE_LOG:-/dev/null}"
   fire_hooks; echo '{"type": "result", "is_error": true, "result": "Not logged in"}'; exit 1 ;;
 esac
+if [ "$FAKE_CLAUDE" = no-sandbox ]; then
+  settings=; prev=; for a; do [ "$prev" = --settings ] && settings=$a; prev=$a; done
+  if grep -q '"failIfUnavailable": true' "$settings"; then
+    echo "Error: sandbox required (sandbox.failIfUnavailable) but it cannot start" >&2; exit 1
+  fi
+fi
 # A reviewer pass: the prompt on stdin names the probe script, in out/.
 [ $tui = yes ] || prompt=$(cat)
 if [ "$FAKE_CLAUDE" = nudge ] && [ $tui = yes ]; then
@@ -152,7 +160,7 @@ if [ "$FAKE_CLAUDE" = tools ]; then
 fi
 case "$FAKE_CLAUDE" in
 ignore) reply; echo '{"type": "result", "result": "no"}'; exit 0 ;;
-leak) sh "$probe" > /dev/null 2>&1 ;;
+leak | no-sandbox) sh "$probe" > /dev/null 2>&1 ;;
 snapshot-leak) sh -c '. "$1"; sh "$2"' - "$snapshot" "$probe" > /dev/null 2>&1 ;;
 lie) git diff > "$out/diff.txt"; echo "write=0 commit=0 branch=0 diff=99 startup=0 control=1" > "$out/probe.txt" ;;
 *)

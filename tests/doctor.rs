@@ -282,6 +282,15 @@ fn fails_when_the_claude_pass_exits_non_zero() {
     );
 }
 
+/// Where the sandbox cannot start, Claude must refuse to run rather than run Bash unsandboxed.
+#[test]
+fn fails_closed_when_the_claude_sandbox_cannot_start() {
+    let run = doctor(ALL, &[("FAKE_CLAUDE", "no-sandbox")]);
+    assert!(!run.passed, "{}", run.stdout);
+    assert_lines(&run, &["FAIL  claude self-test: claude exit status: 1"]);
+    assert!(!run.stdout.contains("went through"), "{}", run.stdout);
+}
+
 #[test]
 fn fails_when_the_planted_hook_fires() {
     let run = doctor(ALL, &[("FAKE_CLAUDE", "hook")]);

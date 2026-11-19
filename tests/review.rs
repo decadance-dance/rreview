@@ -575,6 +575,13 @@ fn assert_inherited_only_what_the_cli_needs(fx: &Fixture) {
         codex.iter().any(|l| l.starts_with("CODEX_HOME=")),
         "{codex:?}"
     );
+    // Claude runs its commands in zsh, whose fallback login reads only the empty ZDOTDIR.
+    assert!(
+        claude
+            .iter()
+            .any(|l| l.starts_with("CLAUDE_CODE_SHELL=/") && l.ends_with("/zsh")),
+        "{claude:?}"
+    );
     // The user's zsh startup files stay out of the reviewer's commands (spec §3).
     for env in [&claude, &codex] {
         assert!(
@@ -2404,6 +2411,70 @@ fn orca_reviewers_inherit_only_what_the_cli_needs() {
         let shell_log = fs::read_to_string(fx.root.join("log.orca-shell")).unwrap_or_default();
         assert!(!shell_log.contains("launch failed"), "{shell}: {shell_log}");
         assert_inherited_only_what_the_cli_needs(&fx);
+    }
+}
+
+/// An Orca terminal's startup may set its own `CLAUDE_CONFIG_DIR` and `HOME`; Claude must get
+/// rreview's, which name the config dir whose shell snapshots its settings deny, whether
+/// rreview has a `CLAUDE_CONFIG_DIR` or not (review of PR #39, round 2).
+#[test]
+fn orca_claude_gets_rreviews_config_dir_not_the_terminals() {
+    let env = envelope("src/lib.rs");
+    for ours in ["/claude-config", ""] {
+        let fx = fixture();
+        let run = orca_run_with(
+            &fx,
+            &["--role-agent", "reliability=claude"],
+            "ok",
+            &[
+                ("FAKE_REPLY", env.to_string()),
+                ("FAKE_ORCA_SHELL", "sh".into()),
+                (
+                    "FAKE_ORCA_TERMINAL_ENV",
+                    "CLAUDE_CONFIG_DIR=/terminal-config HOME=/terminal-home".into(),
+                ),
+                ("CLAUDE_CONFIG_DIR", ours.into()),
+            ],
+        );
+        assert_eq!(run.code, Some(0), "{ours:?}: {run:?}");
+        let seen = fs::read_to_string(fx.root.join("log.env")).unwrap();
+        let claude: Vec<_> = seen
+            .split("== claude\n")
+            .nth(1)
+            .unwrap_or_else(|| panic!("no claude env in {seen}"))
+            .lines()
+            .take_while(|l| !l.starts_with("== "))
+            .collect();
+        assert!(
+            claude.contains(&format!("HOME={}", fx.root.display()).as_str()),
+            "{claude:?}"
+        );
+        let dir: Vec<_> = claude
+            .iter()
+            .filter(|l| l.starts_with("CLAUDE_CONFIG_DIR="))
+            .collect();
+        if ours.is_empty() {
+            assert!(dir.is_empty(), "{claude:?}");
+        } else {
+            assert_eq!(dir, [&"CLAUDE_CONFIG_DIR=/claude-config"], "{claude:?}");
+        }
+        let settings: Value = serde_json::from_str(
+            &fs::read_to_string(
+                fx.runroot()
+                    .join("scratch/reliability/claude-settings.json"),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let denied = if ours.is_empty() {
+            fx.root.join(".claude/shell-snapshots")
+        } else {
+            PathBuf::from("/claude-config/shell-snapshots")
+        };
+        assert_eq!(
+            settings["sandbox"]["filesystem"]["denyRead"],
+            json!([denied])
+        );
     }
 }
 

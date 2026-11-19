@@ -22,6 +22,7 @@
 # FAKE_ORCA_SHELL (bash, zsh, sh): `terminal create` runs the launch line in that shell (with a
 # hostile startup: a read-only export, an exported function, a non-identifier name; all hold
 # "canary"); a failed launch is logged to $FAKE_LOG.orca-shell.
+# FAKE_ORCA_TERMINAL_ENV: what that shell's startup also exports, as `NAME=value ...`.
 #   wrong-head      the worktree is checked out at the parent of the requested commit
 #   lost-reply      `worktree create` makes the worktree and branch, then fails without JSON
 #   foreign-branch  `worktree create` reports the branch `victim` instead of its own
@@ -144,6 +145,7 @@ case "$1 $2" in
     zsh) startup='typeset -rx RO_SECRET=canary; ' ;;
     *) startup= ;;
     esac
+    [ -n "$FAKE_ORCA_TERMINAL_ENV" ] && startup="export $FAKE_ORCA_TERMINAL_ENV; $startup"
     (
       (cd "${wt#path:}" && env 'DOTTED.SECRET=canary' "$FAKE_ORCA_SHELL" -c "$startup$cmd") \
         || echo "launch failed: $?" >> "$FAKE_LOG.orca-shell"

@@ -16,6 +16,8 @@ jobs:
     steps:
       - uses: actions/checkout@v5
       - run: rustup toolchain install # the toolchain and components in rust-toolchain.toml
+      # A Claude reviewer launch needs zsh (spec §3); the runner image may lack it.
+      - run: command -v zsh || { sudo apt-get update -q && sudo apt-get install -yq zsh; }
       - name: Install the Orca CLI
         run: |
           cd "$RUNNER_TEMP"
