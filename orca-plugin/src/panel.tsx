@@ -22,7 +22,6 @@ import {
   on,
   plugin,
   Progress,
-  RadioGroup,
   read,
   RelativeTime,
   Row,
@@ -33,7 +32,9 @@ import {
   Switch,
   Text,
   update,
+  Toolbar,
   type IconName,
+  type OrcaNode,
   type PanelContext,
   type Tone
 } from 'orca'
@@ -63,7 +64,7 @@ const agents = atom<{ value: string; label: string; session: string | null }[]>(
 /** The terminal the person chose; never picked for them. */
 const author = atom<{ terminalId: string; sessionId: string | null } | null>(null)
 const notice = atom<{ tone: Tone; text: string } | null>(null)
-/** "Passes" as the person left it for the shown run; null: open while a pass failed. */
+/** "Passes" as the person left it for the shown run; null: folded. */
 const passesOpen = atom<boolean | null>(null)
 /** "Other PR…" as the person left it; null: open only when the workspace has no PR. */
 const otherPr = atom<boolean | null>(null)
@@ -211,42 +212,51 @@ function passes(r: Run): { role: string; e?: PassEvent }[] {
 /** The time of the run's last progress line. */
 const runEnd = (r: Run) => Math.max(r.startedAt, ...r.events.map((e) => e.ts))
 const finished = (e?: PassEvent) => e?.status === 'completed' || e?.status === 'failed'
-/** A glyph and a word: the status reads without color. */
-const STATUS: Record<string, string> = { completed: '✓ done', failed: '✗ failed', started: '● running', wrapup: '● wrapping up' }
+/** A glyph per status, told by its shape as well as its color. */
+const GLYPH: Record<string, string> = { completed: '✓', failed: '✗', started: '●', wrapup: '●' }
 /** Why a pass failed, without rreview's `pass <role> (<agent>): ` prefix the callout already shows. */
 const reason = (e?: PassEvent) => (e?.error ?? 'no reason recorded').replace(/^pass \S+ \(\S+\): /, '').slice(0, TEXT_CAP)
 
 const STATUS_TONE: Record<string, Tone> = { completed: 'success', failed: 'danger', started: 'accent', wrapup: 'accent' }
 
-/** One line per pass, wrapping rather than cutting at any panel width: role and agent, then
- * the status and the time (a running pass's ticks). */
+/** A pass line's glyph, its tone and what follows the role on the right: the time, plus a word
+ * where the glyph alone would be unclear. */
+function passState(r: Run, e?: PassEvent): { glyph: string; tone?: Tone; right: OrcaNode } {
+  if (!e) return r.status === 'running' ? { glyph: '○', right: 'waiting' } : { glyph: '–', right: 'not run' }
+  // The run ended without this pass's last line: its clock stops with the run.
+  if (!finished(e) && r.status !== 'running')
+    return r.status === 'done'
+      ? { glyph: '?', right: `unknown · ${duration(runEnd(r) - (e.ts - e.duration_ms))}` }
+      : { glyph: '■', right: `interrupted · ${duration(runEnd(r) - (e.ts - e.duration_ms))}` }
+  const tone = STATUS_TONE[e.status]
+  if (e.status === 'completed') return { glyph: '✓', tone, right: duration(e.duration_ms) }
+  if (e.status === 'failed') return { glyph: '✗', tone, right: `failed · ${duration(e.duration_ms)}` }
+  const ticking = <RelativeTime at={e.ts - e.duration_ms} format="duration" tone="accent" />
+  return { glyph: GLYPH[e.status] ?? '●', tone, right: e.status === 'wrapup' ? ['wrap-up · ', ticking] : ticking }
+}
+
+/** One line per pass: the glyph, the role and its agent, then the time on the right. A pass not
+ * started yet is muted. */
 function PassRows({ r }: { r: Run }) {
   return (
-    <Box border radius="md" paddingX="sm" paddingY="xs">
-      <Stack gap="xs">
-        {passes(r).map(({ role, e }) => (
+    <Stack gap="xs">
+      {passes(r).map(({ role, e }) => {
+        const { glyph, tone, right } = passState(r, e)
+        return (
           <Row key={`pass:${role}`} justify="between" align="center" gap="xs" wrap>
-            <Text size="sm">
+            <Text size="sm" muted={!e}>
+              <Text size="sm" tone={tone} muted={!tone}>
+                {glyph}
+              </Text>{' '}
               {role} <Text size="sm" muted>{e?.agent ?? ''}</Text>
             </Text>
-            {/* Grows to the line's end, so a status wrapped under a narrow panel stays right-aligned. */}
-            <Box grow direction="row" justify="end">
-              {e && !finished(e) && r.status !== 'running' ? (
-                // The run ended without this pass's last line: its clock stops with the run.
-                <Text size="sm" muted>{`${r.status === 'done' ? '? unknown' : '■ interrupted'} · ${duration(runEnd(r) - (e.ts - e.duration_ms))}`}</Text>
-              ) : e ? (
-                <Text size="sm" tone={STATUS_TONE[e.status]}>
-                  {`${STATUS[e.status] ?? e.status} · `}
-                  {finished(e) ? duration(e.duration_ms) : <RelativeTime at={e.ts - e.duration_ms} format="duration" />}
-                </Text>
-              ) : (
-                <Text size="sm" muted>{r.status === 'running' ? '○ waiting' : '– not run'}</Text>
-              )}
-            </Box>
+            <Text size="sm" muted={!tone || e?.status === 'completed'} tone={e?.status === 'failed' ? 'danger' : undefined}>
+              {right}
+            </Text>
           </Row>
-        ))}
-      </Stack>
-    </Box>
+        )
+      })}
+    </Stack>
   )
 }
 
@@ -265,6 +275,32 @@ function Failure({ role, e }: { role: string; e?: PassEvent }) {
         </Collapsible>
       ) : null}
     </Stack>
+  )
+}
+
+/** An ended run puts "Other PR…" under its passes, so the verdict comes right after the
+ * controls; with no PR it stays on top, open. */
+const otherPrBelow = () => {
+  const r = read(run)
+  return !!r && r.status !== 'running' && !!read(target)?.pr
+}
+
+function OtherPr() {
+  return (
+    <Collapsible
+      title="Other PR…"
+      description={read(prArg) || undefined}
+      open={read(otherPr) ?? !read(target)?.pr}
+      onChange={(open) => set(otherPr, open)}
+    >
+      <Input
+        label="PR number or URL"
+        value={read(prArg)}
+        placeholder="empty: the workspace's PR"
+        onChange={(v) => set(prArg, v)}
+        onSubmit={() => void loadTarget()}
+      />
+    </Collapsible>
   )
 }
 
@@ -289,7 +325,7 @@ function Header() {
         // One line: the title is cut, the number and the state stay.
         <Row gap="xs" align="center">
           <Box grow shrink minWidth={0}>
-            <Text size="sm" weight="semibold" truncate>
+            <Text size="sm" truncate>
               <Link href={t.pr.url}>#{t.pr.number}</Link> {t.pr.title}
             </Text>
           </Box>
@@ -301,40 +337,57 @@ function Header() {
           <Text size="sm">Open a PR for this branch, or type a PR number or URL under Other PR, then press Refresh.</Text>
         </Callout>
       )}
-      {/* Orca has no segmented control: a horizontal RadioGroup is the closest. An xs button with
-          no icon and an xs gap keep both on one row at 280 px with a scrollbar; Cancel sits on the
-          run's status line. */}
+      {/* Orca has no segmented control: two xs buttons in a labelled Toolbar stand in for one, the
+          chosen one solid and checked, so the choice reads without color. */}
       <Row justify="between" align="center" gap="xs" wrap>
-        <RadioGroup
-          label="Runner"
-          labelHidden
-          orientation="horizontal"
-          value={read(runner)}
-          options={[
-            { value: 'headless', label: 'headless' },
-            { value: 'orca', label: 'orca' }
-          ]}
-          onChange={(v) => set(runner, v as Runner)}
-        />
-        <Button size="xs" tone="accent" disabled={running || read(loading) || !t?.pr} onPress={startReview}>
-          {running ? 'Running…' : r && isShown(r) ? 'Run again' : 'Run review'}
-        </Button>
+        <Toolbar label="Runner" gap="none">
+          {(['headless', 'orca'] as const).map((v) => (
+            <Button
+              key={`runner:${v}`}
+              size="xs"
+              variant={read(runner) === v ? 'solid' : 'ghost'}
+              icon={read(runner) === v ? 'check' : undefined}
+              tooltip={`Run the reviewers ${v === 'orca' ? 'in Orca terminals' : 'headless'}`}
+              onPress={() => set(runner, v)}
+            >
+              {v}
+            </Button>
+          ))}
+        </Toolbar>
+        <Row gap="xs" align="center">
+          <Button
+            size="xs"
+            variant="solid"
+            tone="accent"
+            icon={running ? undefined : 'play'}
+            disabled={running || read(loading) || !t?.pr}
+            onPress={startReview}
+          >
+            {running ? 'Running…' : r && isShown(r) ? 'Run again' : 'Run review'}
+          </Button>
+          {running ? <IconButton icon="stop" label="Cancel" tooltip="Cancel the review" size="xs" onPress={cancelReview} /> : null}
+        </Row>
       </Row>
-      {t || !read(loading) ? (
-        <Collapsible
-          title="Other PR…"
-          description={read(prArg) || undefined}
-          open={read(otherPr) ?? !t?.pr}
-          onChange={(open) => set(otherPr, open)}
-        >
-          <Input
-            label="PR number or URL"
-            value={read(prArg)}
-            placeholder="empty: the workspace's PR"
-            onChange={(v) => set(prArg, v)}
-            onSubmit={() => void loadTarget()}
-          />
-        </Collapsible>
+      {!otherPrBelow() && (t || !read(loading)) ? <OtherPr /> : null}
+    </Stack>
+  )
+}
+
+/** The first sentence or line of `text`, and the rest. */
+export function lead(text: string): [string, string] {
+  const t = text.trim()
+  const head = t.match(/^[^\n]*?[.!?](?=\s)/)?.[0] ?? t.split('\n')[0]
+  return [head, t.slice(head.length).trim()]
+}
+
+/** A long text as its first sentence, the rest behind "More": the verdict and the detail stay short. */
+function Lead({ text, markdown }: { text: string; markdown?: boolean }) {
+  const [head, rest] = lead(text)
+  return (
+    <Stack gap="xs">
+      {markdown ? <Markdown content={head} /> : <Text size="sm" muted>{head}</Text>}
+      {rest ? (
+        <Collapsible title="More">{markdown ? <Markdown content={rest} /> : <Text size="sm" muted>{rest}</Text>}</Collapsible>
       ) : null}
     </Stack>
   )
@@ -383,10 +436,7 @@ function Status({ r }: { r: Run }) {
             {`${fixedDone} of ${FIXED.length} passes${judge ? `, judge ${finished(judge) ? judge.status : 'running'}` : ''} · `}
             <RelativeTime at={r.startedAt} format="duration" muted />
           </Text>
-          <Row gap="xs" align="center">
-            <Badge tone="accent">running</Badge>
-            <IconButton icon="stop" label="Cancel" tooltip="Cancel the review" size="sm" onPress={cancelReview} />
-          </Row>
+          <Badge tone="accent">running</Badge>
         </Row>
         {/* Once the fixed passes are done, whether the judge runs is unknown: no value, no 100 %. */}
         <Progress label="Passes done" labelHidden value={fixedDone < FIXED.length ? Math.round((100 * fixedDone) / FIXED.length) : undefined} />
@@ -423,7 +473,7 @@ function Status({ r }: { r: Run }) {
       icon={ok ? 'check' : 'warning'}
       title={res.overall_correctness.charAt(0).toUpperCase() + res.overall_correctness.slice(1)}
     >
-      <Text size="sm">{res.overall_explanation}</Text>
+      <Lead text={res.overall_explanation} />
       <Counts r={r} />
     </Callout>
   ) : (
@@ -431,8 +481,8 @@ function Status({ r }: { r: Run }) {
   )
 }
 
-/** Each pass and why any failed: in full while the run runs, then folded at the bottom, open when
- * a pass failed. */
+/** Each pass and why any failed: in full while the run runs, then folded at the bottom; its title
+ * counts the failed ones. */
 function Passes({ r }: { r: Run }) {
   const list = passes(r)
   const failures = list.filter(({ e }) => e?.status === 'failed')
@@ -458,10 +508,9 @@ function Passes({ r }: { r: Run }) {
   if (r.status === 'running') return body
   const ok = list.filter(({ e }) => e?.status === 'completed').length
   return (
-    // Controlled: a failure the result reports after the fold appeared still opens it.
     <Collapsible
       title={`Passes · ${ok}/${list.length} done${failures.length ? `, ${failures.length} failed` : ''}`}
-      open={read(passesOpen) ?? failures.length > 0}
+      open={read(passesOpen) ?? false}
       onChange={(open) => set(passesOpen, open)}
     >
       {body}
@@ -495,21 +544,21 @@ function Detail({ f, r, res }: { f: Finding; r: Run; res: Result }) {
   const url = githubUrl(r.pr.url, res.head, f)
   return (
     <Box border radius="md" padding="sm">
-      <Stack gap="sm">
-        <Markdown content={f.body} />
-        <Input label="File and line (select to copy)" labelHidden value={`${f.file}:${lines(f)}`} />
-        <Row justify="between" align="center" gap="sm" wrap>
-          <Checkbox
-            label="Send to the author"
-            checked={read(picked).includes(key)}
-            onChange={(on) => update(picked, (k) => (on ? [...k, key] : k.filter((x) => x !== key)))}
-          />
+      <Stack gap="xs">
+        <Lead text={f.body} markdown />
+        <Row gap="xs" align="center" wrap>
+          <Code>{`${f.file}:${lines(f)}`}</Code>
           {url ? (
-            <Text size="sm">
-              <Link href={url}>Open on GitHub</Link>
+            <Text size="xs">
+              <Link href={url}>GitHub ↗</Link>
             </Text>
           ) : null}
         </Row>
+        <Checkbox
+          label="Send to the author"
+          checked={read(picked).includes(key)}
+          onChange={(on) => update(picked, (k) => (on ? [...k, key] : k.filter((x) => x !== key)))}
+        />
       </Stack>
     </Box>
   )
@@ -541,7 +590,7 @@ function Findings({ r }: { r: Run }) {
         <Heading level={3}>
           Findings <Badge>{`${list.length}`}</Badge>
         </Heading>
-        <Switch label="Below the gate too" checked={all} onChange={toggle} />
+        <Switch label="below gate" checked={all} onChange={toggle} />
       </Row>
       {res.omitted ? (
         <Text size="xs" muted>
@@ -569,17 +618,20 @@ function Findings({ r }: { r: Run }) {
         />
       )}
       {sel ? <Detail f={sel} r={r} res={res} /> : null}
-      <Row gap="sm" align="center" wrap>
-        <Select
-          label="Author agent (in the reviewed workspace)"
-          labelHidden
-          placeholder={read(agents).length ? 'Author agent' : 'No agent in the reviewed workspace'}
-          value={read(author)?.terminalId ?? undefined}
-          options={read(agents).map(({ value, label }) => ({ value, label }))}
-          onChange={(v) => set(author, { terminalId: v, sessionId: read(agents).find((o) => o.value === v)?.session ?? null })}
-        />
-        <Button icon="next" disabled={!keys.length || !read(author)} onPress={sendToAuthor}>
-          {`Send ${keys.length} to author`}
+      {/* One row: the picker takes what the button leaves. */}
+      <Row gap="xs" align="center">
+        <Box grow shrink minWidth={0}>
+          <Select
+            label="Author agent (in the reviewed workspace)"
+            labelHidden
+            placeholder={read(agents).length ? 'Author agent' : 'No agent in the reviewed workspace'}
+            value={read(author)?.terminalId ?? undefined}
+            options={read(agents).map(({ value, label }) => ({ value, label }))}
+            onChange={(v) => set(author, { terminalId: v, sessionId: read(agents).find((o) => o.value === v)?.session ?? null })}
+          />
+        </Box>
+        <Button icon="next" tooltip="Send the checked findings to the author agent" disabled={!keys.length || !read(author)} onPress={sendToAuthor}>
+          {`Send ${keys.length}`}
         </Button>
       </Row>
       {read(sent)?.token === r.token ? <Sent /> : null}
@@ -591,7 +643,7 @@ export default function Panel() {
   const r = read(run)
   const n = read(notice)
   return (
-    <Stack gap="md">
+    <Stack gap="sm">
       <Header />
       {n ? <Callout tone={n.tone}>{n.text}</Callout> : null}
       {r || read(target)?.pr ? <Separator /> : null}
@@ -612,6 +664,7 @@ export default function Panel() {
       ) : null}
       {r ? <Findings r={r} /> : null}
       {r ? <Passes r={r} /> : null}
+      {otherPrBelow() ? <OtherPr /> : null}
     </Stack>
   )
 }
