@@ -3,11 +3,13 @@
 import {
   atom,
   Badge,
+  Box,
   Button,
   Callout,
   Card,
   Checkbox,
   Code,
+  Collapsible,
   EmptyState,
   Heading,
   host,
@@ -28,13 +30,11 @@ import {
   set,
   Stack,
   Switch,
-  Table,
   Text,
   Tree,
   update,
   type IconName,
   type PanelContext,
-  type TableRow,
   type Tone,
   type TreeItem
 } from 'orca'
@@ -241,15 +241,50 @@ const STATUS: Record<string, string> = { completed: '✓ completed', failed: '�
 /** Why a pass failed, without rreview's `pass <role> (<agent>): ` prefix the callout already shows. */
 const reason = (e?: PassEvent) => (e?.error ?? 'no reason recorded').replace(/^pass \S+ \(\S+\): /, '').slice(0, TEXT_CAP)
 
-function passRows(r: Run): TableRow[] {
-  return passes(r).map(({ role, e }) => ({
-    key: role,
-    cells: {
-      pass: e?.agent ? `${role} · ${e.agent}` : role,
-      status: e ? (STATUS[e.status] ?? e.status) : r.status === 'running' ? '○ waiting' : '– not run',
-      time: e && finished(e) ? duration(e.duration_ms) : e ? { type: 'relative', at: e.ts - e.duration_ms, format: 'duration' } : ''
-    }
-  }))
+const STATUS_TONE: Record<string, Tone> = { completed: 'success', failed: 'danger', started: 'accent', wrapup: 'accent' }
+
+/** One line per pass, wrapping rather than cutting at any panel width: role and agent, then
+ * the status and the time (a running pass's ticks). */
+function PassRows({ r }: { r: Run }) {
+  return (
+    <Box border radius="md" paddingX="sm" paddingY="xs">
+      <Stack gap="xs">
+        {passes(r).map(({ role, e }) => (
+          <Row key={`pass:${role}`} justify="between" align="center" gap="xs" wrap>
+            <Text size="sm">
+              {role} <Text size="sm" muted>{e?.agent ?? ''}</Text>
+            </Text>
+            {e ? (
+              <Text size="sm" tone={STATUS_TONE[e.status]}>
+                {`${STATUS[e.status] ?? e.status} · `}
+                {finished(e) ? duration(e.duration_ms) : <RelativeTime at={e.ts - e.duration_ms} format="duration" />}
+              </Text>
+            ) : (
+              <Text size="sm" muted>{r.status === 'running' ? '○ waiting' : '– not run'}</Text>
+            )}
+          </Row>
+        ))}
+      </Stack>
+    </Box>
+  )
+}
+
+/** A failed pass's reason: the start in the callout, all of it behind "Full reason" when long. */
+function Failure({ role, e }: { role: string; e?: PassEvent }) {
+  const text = reason(e)
+  const long = text.length > 160
+  return (
+    <Stack gap="xs">
+      <Text size="sm">
+        <Code>{`${role} (${e?.agent})`}</Code> {long ? `${text.slice(0, 160)}…` : text}
+      </Text>
+      {long ? (
+        <Collapsible title="Full reason">
+          <Text size="sm">{text}</Text>
+        </Collapsible>
+      ) : null}
+    </Stack>
+  )
 }
 
 function Header() {
@@ -344,21 +379,11 @@ function Status({ r }: { r: Run }) {
       ) : r.events.length ? (
         <Text size="sm" muted>{`${done} of ${list.length} passes finished in ${duration(last - r.startedAt)}`}</Text>
       ) : null}
-      <Table
-        label="Passes"
-        columns={[
-          { key: 'pass', label: 'Pass' },
-          { key: 'status', label: 'Status', width: 'sm' },
-          { key: 'time', label: 'Time', width: 'xs', align: 'end' }
-        ]}
-        rows={passRows(r)}
-      />
+      <PassRows r={r} />
       {failures.length ? (
         <Callout tone="warning" title={`${failures.length} pass${failures.length === 1 ? '' : 'es'} failed`}>
           {failures.map(({ role, e }) => (
-            <Text size="sm">
-              <Code>{`${role} (${e?.agent})`}</Code> {reason(e)}
-            </Text>
+            <Failure key={`failure:${role}`} role={role} e={e} />
           ))}
           {res?.degraded ? <Text size="sm">The coordinator covered the failed lens, so the findings still stand.</Text> : null}
         </Callout>

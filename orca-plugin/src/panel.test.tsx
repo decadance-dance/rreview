@@ -1,5 +1,5 @@
 // The panel over a mock host whose requests stand in for src/worker.ts.
-import type { TableRow, TreeItem } from 'orca'
+import type { TreeItem } from 'orca'
 import { assert, mockHost, mount, test, type TestPanel } from 'orca/testing'
 import { cancelled, done, doneResult, failed, running, target } from './fixtures'
 import * as panel from './panel'
@@ -14,14 +14,10 @@ const AGENTS: Record<string, unknown[]> = {
   ws2: [{ terminalId: 't9', title: 'other', agent: 'codex', state: 'waiting', stateStartedAt: 0, sessionId: 's9' }]
 }
 
-/** The passes table's cells per row; a live duration shows as `relative`. */
-const cells = (view: TestPanel) =>
-  (view.find({ label: 'Passes' })?.props?.rows as TableRow[]).map((r) =>
-    ['pass', 'status', 'time'].map((k) => {
-      const c = r.cells[k]
-      return typeof c === 'object' && c ? c.type : c
-    })
-  )
+/** Each pass's line as Orca draws its text, in order. */
+const passRows = (view: TestPanel) => view.findAll({ type: 'Row' }).filter((n) => String(n.key).startsWith('pass:'))
+const cells = (view: TestPanel) => passRows(view).map((n) => n.text)
+const roles = (view: TestPanel) => passRows(view).map((n) => String(n.key).slice('pass:'.length))
 
 /** The findings tree's leaves as label and icon. */
 const leaves = (view: TestPanel) => {
@@ -59,22 +55,23 @@ test('shows the workspace PR and starts a review with the chosen runner', async 
   assert.deepEqual(calls.at(-1), { name: 'review.start', input: { workspaceId: 'ws1', pr: '', runner: 'orca' } })
   // The worker's posts drive the passes table while it runs.
   assert.equal(view.find({ text: 'Running…' })?.text, 'Running…')
-  assert.deepEqual(view.rowsOf({ label: 'Passes' }), ['intent_contracts', 'reliability', 'security', 'coordinator'])
+  assert.deepEqual(roles(view), ['intent_contracts', 'reliability', 'security', 'coordinator'])
   // Each pass with its agent, a status that reads without color, and its own running time.
-  assert.deepEqual(cells(view), [
-    ['intent_contracts · codex', '✓ completed', '1m 1s'],
-    ['reliability · claude', '● running', 'relative'],
-    ['security · codex', '● running', 'relative'],
-    ['coordinator', '○ waiting', '']
-  ])
+  const lines = cells(view)
+  assert.equal(lines[0], 'intent_contracts codex ✓ completed · 1m 1s')
+  assert.match(lines[1], /^reliability claude ● running · \S+$/)
+  assert.equal(lines[3], 'coordinator ○ waiting')
+  // A running pass's time ticks from its start.
+  const ticking = view.findAll({ type: 'RelativeTime' }).map((n) => n.props?.at)
+  assert.ok(ticking.includes(running.events[1].ts))
   // Progress over the whole run and the time since it started.
   assert.equal(view.find({ type: 'Progress' })?.props?.value, 25)
   assert.match(JSON.stringify(view.tree()), /1 of 4 passes done · elapsed /)
-  assert.equal(view.find({ type: 'RelativeTime' })?.props?.at, running.startedAt)
+  assert.ok(ticking.includes(running.startedAt))
   assert.ok(!/No review yet/.test(view.summary().join('\n')))
   // The post that says done is small; the panel then asks for the result itself.
   await view.post('review.changed', done)
-  assert.deepEqual(view.rowsOf({ label: 'Passes' }), ['intent_contracts', 'reliability', 'security', 'coordinator'])
+  assert.deepEqual(roles(view), ['intent_contracts', 'reliability', 'security', 'coordinator'])
   assert.equal(calls.at(-1)?.name, 'review.result')
   assert.match(JSON.stringify(view.find({ label: 'Findings by file' })), /Terminal leaks when close fails/)
   assert.equal(view.find({ type: 'Progress' }), null)
@@ -187,7 +184,7 @@ test('a failed review is shown as failed with its error', async () => {
   const failures = JSON.stringify(view.find({ type: 'Callout', text: /2 passes failed/ }))
   assert.match(failures, /security \(codex\).*no reply/)
   assert.match(failures, /coordinator \(claude\).*the reply is not JSON/)
-  assert.deepEqual(cells(view).at(-1), ['coordinator · claude', '✗ failed', '30s'])
+  assert.equal(cells(view).at(-1), 'coordinator claude ✗ failed · 30s')
   assert.equal(view.find({ label: 'Findings by file' }), null)
   await view.unmount()
 })
@@ -207,7 +204,7 @@ test('cancel stops the running review, which then shows as cancelled', async () 
   assert.ok(!/Cancelling/.test(s), 'the notice goes with the run')
   assert.equal(view.find({ text: 'Cancel' }), null)
   // The stop line is no pass.
-  assert.deepEqual(view.rowsOf({ label: 'Passes' }), ['intent_contracts', 'reliability', 'security', 'coordinator'])
+  assert.deepEqual(roles(view), ['intent_contracts', 'reliability', 'security', 'coordinator'])
   assert.deepEqual(view.errors, [])
   await view.unmount()
 })
@@ -238,7 +235,20 @@ test('a run that failed before any pass says so without a time', async () => {
   const s = JSON.stringify(view.tree())
   assert.match(s, /cannot run rreview: ENOENT/)
   assert.ok(!/passes finished/.test(s))
-  assert.deepEqual(cells(view)[0], ['intent_contracts', '– not run', ''])
+  assert.equal(cells(view)[0], 'intent_contracts – not run')
+  await view.unmount()
+})
+
+test('a long failure reason shows its start and the rest behind Full reason', async () => {
+  const long = `pass reliability (claude): pass reliability timed out after 900s; ${'wrap-up failed. '.repeat(20)}the end`
+  const events = running.events.map((e) => (e.role === 'reliability' ? { ...e, status: 'failed', error: long } : e))
+  const view = await mount(panel, { host: setup({ ...running, events }).host })
+  const callout = view.find({ type: 'Callout', text: /1 pass failed/ })
+  const shown = view.findAll({ type: 'Text' }).find((n) => /^reliability \(claude\)/.test(n.text))?.text ?? ''
+  assert.match(shown, /^reliability \(claude\) pass reliability timed out after 900s;.*…$/)
+  assert.ok(shown.length < 200)
+  assert.match(JSON.stringify(view.find({ type: 'Collapsible' })), /Full reason.*the end/)
+  assert.ok(callout)
   await view.unmount()
 })
 
@@ -255,12 +265,6 @@ test('no PR and no workspace each say what to do next', async () => {
   assert.match(JSON.stringify(none.tree()), /Focus a workspace in Orca, then press Refresh/)
   assert.ok(!/No review yet/.test(none.summary().join('\n')))
   await none.unmount()
-})
-
-test('the passes table keeps every column in a narrow panel', async () => {
-  const view = await mount(panel, { host: setup(done).host })
-  assert.deepEqual(view.columnsOf({ label: 'Passes' }, { width: 240 }), ['pass', 'status', 'time'])
-  await view.unmount()
 })
 
 test('durations read as minutes and seconds', () => {
