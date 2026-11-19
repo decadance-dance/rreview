@@ -1,7 +1,7 @@
 {
   "manifestVersion": 2,
   "id": "rreview",
-  "name": "rreview",
+  "name": "Rreview",
   "version": "0.1.0",
   "description": "Runs an rreview cross-model panel review of the focused workspace's PR, shows each pass while it runs, and lists the findings by file.",
   "license": "Apache-2.0",
@@ -16,7 +16,7 @@
     "panels": [
       {
         "id": "rreview",
-        "title": "rreview",
+        "title": "Rreview",
         "icon": "search",
         "entry": "src/panel.tsx",
         "ui": "components"

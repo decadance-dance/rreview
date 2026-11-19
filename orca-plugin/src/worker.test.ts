@@ -172,7 +172,7 @@ test('a missing rreview binary fails the run and names the setting', async () =>
   await worker.request('review.start', { workspaceId: 'ws1', runner: 'headless' })
   const run = await ended(worker)
   assert.equal(run.status, 'failed')
-  assert.match(run.error ?? '', /cannot run .*nope.*Settings/)
+  assert.match(run.error ?? '', /cannot run .*nope.*Settings > Plugins > Rreview\)$/)
 })
 
 test('the GitHub account setting gives gh and rreview its token, and only them', async () => {

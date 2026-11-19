@@ -1,4 +1,4 @@
-# rreview Orca plugin
+# Rreview Orca plugin
 
 A sidebar panel in [Orca](https://github.com/stablyai/orca) that runs an rreview panel review of the
 focused workspace's pull request, shows each pass while it runs, and lists the findings by file
@@ -39,7 +39,7 @@ orca plugin dev load orca-plugin     # prints the access it asks for; approve wi
 orca plugin open local.rreview --panel rreview
 ```
 
-Settings (Settings > Plugins > rreview):
+Settings (Settings > Plugins > Rreview):
 
 - **rreview executable**: `rreview` on the worker's PATH, or an absolute path such as
   `<repo>/target/release/rreview`. The worker's PATH is Orca's, which may lack `~/.cargo/bin`.

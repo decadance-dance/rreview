@@ -228,7 +228,7 @@ function Header() {
   return (
     <Stack gap="sm">
       <Row justify="between">
-        <Heading>rreview</Heading>
+        <Heading>Rreview</Heading>
         <Button variant="ghost" size="sm" icon="refresh" onPress={loadTarget}>
           Refresh
         </Button>
