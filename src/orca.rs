@@ -243,6 +243,9 @@ pub struct Orca {
     /// What the reviewer writes to its reply file, as the delivery instruction names it.
     reply_as: String,
     terminals: Mutex<HashMap<String, Term>>,
+    /// Handles a later terminal of the same role replaced while still registered (a close that
+    /// failed); `Drop` closes them too.
+    replaced: Mutex<Vec<String>>,
 }
 
 impl Orca {
@@ -262,6 +265,7 @@ impl Orca {
             env: vec![],
             reply_as: "the JSON object".into(),
             terminals: Mutex::default(),
+            replaced: Mutex::default(),
         }
     }
 
@@ -354,7 +358,15 @@ impl Orca {
 
     fn set(&self, role: &str, term: Term) {
         let mut map = self.terminals.lock().unwrap_or_else(|e| e.into_inner());
-        map.insert(role.to_string(), term);
+        let handle = term.handle.clone();
+        if let Some(old) = map.insert(role.to_string(), term)
+            && old.handle != handle
+        {
+            self.replaced
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push(old.handle);
+        }
     }
 
     /// Closes the pass's terminal; one whose close fails stays registered for `Drop` to retry.
@@ -537,10 +549,12 @@ impl Runner for Orca {
 impl Drop for Orca {
     fn drop(&mut self) {
         let map = self.terminals.get_mut().unwrap_or_else(|e| e.into_inner());
-        for (_, term) in map.drain() {
+        let replaced = self.replaced.get_mut().unwrap_or_else(|e| e.into_inner());
+        let handles = map.drain().map(|(_, t)| t.handle).chain(replaced.drain(..));
+        for handle in handles {
             // One retry: a close can fail while Orca's runtime is briefly unavailable.
-            if close(&term.handle).is_err() && close(&term.handle).is_err() {
-                eprintln!("warning: Orca terminal {} is still open", term.handle);
+            if close(&handle).is_err() && close(&handle).is_err() {
+                eprintln!("warning: Orca terminal {handle} is still open");
             }
         }
     }

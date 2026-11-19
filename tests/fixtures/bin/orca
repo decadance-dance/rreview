@@ -36,7 +36,9 @@
 # FAKE_ORCA_SEND_DELAY: seconds every prompt send takes; FAKE_ORCA_CREATE_DELAY: seconds before
 # `worktree create` starts; FAKE_ORCA_WAIT_DELAY: seconds every `terminal wait` after a prompt
 # takes before it answers. FAKE_ORCA_CLOSE=fail-once: the first `terminal close` fails with
-# runtime_unavailable. FAKE_ORCA_STATUS: `down` reports the app not running, `hang` never answers.
+# runtime_unavailable. FAKE_ORCA_HANDLES=numbered: each create of a title gets its own handle,
+# `term_<role>~<n>`, logged as `created <handle>`; every successful close is logged as
+# `closed <handle>`. FAKE_ORCA_STATUS: `down` reports the app not running, `hang` never answers.
 # FAKE_ORCA_REPO=missing: `repo show` answers repo_not_found, as a runtime without this checkout.
 line=orca; for a; do line="$line $a"; done
 printf '%s\n' "$line" >> "${FAKE_LOG:-/dev/null}"
@@ -51,7 +53,7 @@ timeout() {
   sleep "$(awk "BEGIN { print $(arg --timeout-ms "$@") / 1000 }")"
   echo '{"ok":false,"error":{"code":"timeout","message":"timeout"}}'; exit 1
 }
-role=$(arg --terminal "$@"); role=${role#term_}
+handle=$(arg --terminal "$@"); role=${handle#term_}; role=${role%~*}
 state="$FAKE_LOG.orca-$role"
 sent() { grep -c '^sent' "$state" 2> /dev/null || echo 0; }
 case "$1 $2" in
@@ -110,7 +112,10 @@ case "$1 $2" in
   fi
   [ "$scenario" = lost-create ] && { echo "transport closed" >&2; exit 1; }
   [ "$scenario" = no-handle ] && ok '{"terminal":{}}'
-  ok "{\"terminal\":{\"handle\":\"term_$role\"}}" ;;
+  handle=term_$role
+  [ "$FAKE_ORCA_HANDLES" = numbered ] && handle="$handle~$(grep -c '^open$' "$FAKE_LOG.orca-$role")"
+  echo "created $handle" >> "${FAKE_LOG:-/dev/null}"
+  ok "{\"terminal\":{\"handle\":\"$handle\"}}" ;;
 "terminal list")
   rows=
   for f in "$FAKE_LOG".orca-*.title; do
@@ -138,6 +143,7 @@ case "$1 $2" in
     echo '{"ok":false,"error":{"code":"runtime_unavailable","message":"runtime_unavailable"}}'; exit 1
   fi
   echo closed >> "$state"
+  echo "closed $handle" >> "${FAKE_LOG:-/dev/null}"
   ok '{"close":{"ptyKilled":true}}' ;;
 "terminal send")
   text=$(arg --text "$@")

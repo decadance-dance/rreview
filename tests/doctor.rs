@@ -558,6 +558,35 @@ fn orca_terminals_created_without_a_handle_are_closed() {
     assert_eq!(created, count("orca terminal close"), "{}", run.log);
 }
 
+/// Codex's reminder in a new session must not forget the first session's terminal when its
+/// close failed: it stays for the runner's final cleanup.
+#[test]
+fn orca_codex_retry_keeps_the_first_terminal_for_cleanup() {
+    let run = doctor_orca(&[
+        ("FAKE_CODEX", "chat-refuse"),
+        ("FAKE_ORCA_CLOSE", "fail-once"),
+        ("FAKE_ORCA_HANDLES", "numbered"),
+    ]);
+    assert!(run.passed, "{}", run.stdout);
+    let handles = |prefix: &str| {
+        let mut h: Vec<_> = run
+            .log
+            .lines()
+            .filter_map(|l| l.strip_prefix(prefix))
+            .collect();
+        h.sort();
+        h.dedup();
+        h
+    };
+    let created = handles("created ");
+    assert!(
+        created.iter().any(|h| h.ends_with("~2")),
+        "no retry: {}",
+        run.log
+    );
+    assert_eq!(created, handles("closed "), "{}", run.log);
+}
+
 /// A Codex that refuses in chat, writing no reply file, still gets the script reminder, and one
 /// that never runs the probe reads as "the probe did not run", not as a failed self-test.
 #[test]
