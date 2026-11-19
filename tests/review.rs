@@ -1802,7 +1802,13 @@ fn orca_pass_end_to_end() {
             "{run:?}"
         );
         let shim = fs::read_to_string(bin.join(agent)).unwrap();
-        assert!(shim.contains(" /usr/bin/env -i "), "{shim}");
+        assert!(
+            shim.contains(&format!(
+                "exec '{}' exec-reviewer --inherit PATH ",
+                env!("CARGO_BIN_EXE_rreview")
+            )),
+            "{shim}"
+        );
         assert_eq!(
             shim.contains(&format!(
                 "'CODEX_HOME={}'",
@@ -1897,6 +1903,35 @@ fn orca_reviewers_inherit_only_what_the_cli_needs() {
         assert!(!shell_log.contains("launch failed"), "{shell}: {shell_log}");
         assert_inherited_only_what_the_cli_needs(&fx);
     }
+}
+
+/// A `:` in the run dir would split the shim's PATH entry, so the terminal's shell would start
+/// the real agent with its whole environment (review of PR #24, round 2). The run fails closed
+/// before any agent starts.
+#[test]
+fn orca_refuses_a_run_dir_whose_path_has_a_colon() {
+    let fx = fixture();
+    let state = fx.root.join("state:x");
+    let run = orca_run_with(
+        &fx,
+        &[],
+        "ok",
+        &[
+            ("FAKE_REPLY", envelope("src/lib.rs").to_string()),
+            ("FAKE_ORCA_SHELL", "bash".into()),
+            ("GH_TOKEN", "gh-canary".into()),
+            ("XDG_STATE_HOME", state.display().to_string()),
+        ],
+    );
+    assert_eq!(run.code, Some(2), "{run:?}");
+    assert!(
+        run.stderr
+            .contains("holds a ':', which a PATH entry cannot"),
+        "{run:?}"
+    );
+    // Give a launch that slipped through time to log what it saw.
+    std::thread::sleep(Duration::from_millis(500));
+    assert!(!fx.root.join("log.env").exists(), "an agent started");
 }
 
 #[test]

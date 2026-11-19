@@ -109,6 +109,27 @@ impl Launch {
     }
 }
 
+/// `rreview exec-reviewer` (the orca runner's shim, spec §3): replaces this process with
+/// `command`, given only the `inherit` variables of this environment that are set plus `set`.
+/// Values stay in the environment across the exec, out of every argv. Returns only on failure.
+pub fn exec_reviewer(inherit: &[String], set: &[String], command: &[String]) -> anyhow::Error {
+    let Some((program, args)) = command.split_first() else {
+        return anyhow::anyhow!("exec-reviewer: no program");
+    };
+    let mut cmd = Command::new(program);
+    cmd.args(args).env_clear().envs(
+        std::env::vars_os()
+            .filter(|(k, _)| k.to_str().is_some_and(|k| inherit.iter().any(|i| i == k))),
+    );
+    for kv in set {
+        match kv.split_once('=') {
+            Some((k, v)) => cmd.env(k, v),
+            None => return anyhow::anyhow!("exec-reviewer: --set {kv:?} is not NAME=VALUE"),
+        };
+    }
+    anyhow::Error::new(cmd.exec()).context(format!("cannot start {program}"))
+}
+
 /// Kills `child`, which leads its own process group, and everything it started.
 pub fn kill_group(child: &mut Child) {
     let _ = Command::new("kill")

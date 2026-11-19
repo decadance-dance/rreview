@@ -331,7 +331,8 @@ impl Runner for Orca {
             }
             _ => {}
         }
-        let command = shell_line(&self.launch(pass)?, &self.scratch(pass).join("bin"))?;
+        let exe = std::env::current_exe().context("cannot find the rreview executable")?;
+        let command = shell_line(&self.launch(pass)?, &self.scratch(pass).join("bin"), &exe)?;
         let v = orca(
             &[
                 "terminal",
@@ -565,17 +566,18 @@ fn printable(text: &str) -> String {
 }
 
 /// Orca types `--command` into the terminal's login shell, whose environment is Orca's and the
-/// shell's own, not rreview's. So the agent starts through a shim, `<bin>/<program>`, that builds
-/// its environment from nothing at the last exec (spec §3): `/usr/bin/env -i` with each inherited
-/// variable that is set and the launch's own env. Nothing the shell holds can slip past it: a
-/// read-only export, a name that is no identifier, an exported function. The line is
+/// shell's own, not rreview's. So the agent starts through a shim, `<bin>/<program>`, that hands
+/// it to `<exe> exec-reviewer` (this binary): that builds the environment from nothing at the
+/// last exec (spec §3), each inherited variable that is set plus the launch's own env. Nothing
+/// the shell holds can slip past it: a read-only export, a name that is no identifier, an
+/// exported function. Only names go into an argv, never an inherited value. The line is
 /// `PATH='<bin>':"$PATH" exec 'program' 'arg' ...`, every word single-quoted, no value on it
 /// (the shell may keep it in its history), and the shim takes `<bin>` off `PATH` again. `exec`
 /// leaves no shell behind the agent to receive later input. The program must be `exec`'s first
 /// word: with `exec env ...` or `exec '<path>/program'` Orca still names the agent, but its
 /// `send` reports provider "unsupported" and types the prompt raw (*verified*, Orca 1.4.262).
 // limit: a POSIX-family login shell (sh, bash, zsh) types the line.
-fn shell_line(launch: &Launch, bin: &Path) -> Result<String> {
+fn shell_line(launch: &Launch, bin: &Path, exe: &Path) -> Result<String> {
     let quote = |w: &str| -> Result<String> {
         if w.chars().any(char::is_control) {
             bail!("cannot put {w:?} on a shell line");
@@ -589,25 +591,34 @@ fn shell_line(launch: &Launch, bin: &Path) -> Result<String> {
     }
     fs::create_dir_all(bin).with_context(|| format!("{}", bin.display()))?;
     let bin = fs::canonicalize(bin).with_context(|| format!("{}", bin.display()))?;
+    // A `:` splits a PATH entry, and the shell would then find the real program, unfiltered.
+    if launch::utf8(&bin)?.contains(':') {
+        bail!(
+            "the run dir {} holds a ':', which a PATH entry cannot; \
+             set XDG_STATE_HOME to a path without one",
+            bin.display()
+        );
+    }
     let bin_q = quote(launch::utf8(&bin)?)?;
     let mut shim = format!(
         "#!/bin/sh\n# rreview: {} with only the variables it inherits (spec §3).\n\
-         PATH=${{PATH#{bin_q}:}}\nexec /usr/bin/env -i",
-        launch.program
+         PATH=${{PATH#{bin_q}:}}\nexec {} exec-reviewer",
+        launch.program,
+        quote(launch::utf8(exe)?)?
     );
     for k in &launch.inherit {
         if !name(k) {
             bail!("cannot inherit the variable {k:?}");
         }
-        shim += &format!(" ${{{k}+\"{k}=${k}\"}}");
+        shim += &format!(" --inherit {k}");
     }
     for (k, v) in &launch.env {
         if !name(k) {
             bail!("cannot put the variable {k:?} on a shell line");
         }
-        shim += &format!(" {}", quote(&format!("{k}={v}"))?);
+        shim += &format!(" --set {}", quote(&format!("{k}={v}"))?);
     }
-    shim += &format!(" {} \"$@\"\n", quote(&launch.program)?);
+    shim += &format!(" -- {} \"$@\"\n", quote(&launch.program)?);
     let path = bin.join(&launch.program);
     // A fresh file: whatever stands at that path is replaced, never written through.
     match fs::remove_file(&path) {
@@ -723,20 +734,25 @@ mod tests {
             env: vec![("CODEX_HOME".into(), "/h $x".into())],
             cwd: PathBuf::from("/"),
         };
+        let exe = Path::new("/opt/it's/rreview");
         let q = r"'\''";
         assert_eq!(
-            shell_line(&launch, &bin).unwrap(),
+            shell_line(&launch, &bin, exe).unwrap(),
             format!(
                 "PATH='{}/it{q}s bin':\"$PATH\" exec 'codex' '-C' '/a b/it{q}s'",
                 root.display()
             )
         );
-        let shim = fs::read_to_string(bin.join("codex")).unwrap();
-        assert!(
-            shim.ends_with(
-                " ${PATH+\"PATH=$PATH\"} ${LC_ALL+\"LC_ALL=$LC_ALL\"} 'CODEX_HOME=/h $x' 'codex' \"$@\"\n"
-            ),
-            "{shim}"
+        // Names only: no inherited value is expanded into the exec-reviewer argv.
+        assert_eq!(
+            fs::read_to_string(bin.join("codex")).unwrap(),
+            format!(
+                "#!/bin/sh\n# rreview: codex with only the variables it inherits (spec §3).\n\
+                 PATH=${{PATH#'{}/it{q}s bin':}}\n\
+                 exec '/opt/it{q}s/rreview' exec-reviewer --inherit PATH --inherit LC_ALL \
+                 --set 'CODEX_HOME=/h $x' -- 'codex' \"$@\"\n",
+                root.display()
+            )
         );
         for bad in [
             Launch {
@@ -752,66 +768,28 @@ mod tests {
                 ..launch.clone()
             },
         ] {
-            assert!(shell_line(&bad, &bin).is_err(), "{bad:?}");
+            assert!(shell_line(&bad, &bin, exe).is_err(), "{bad:?}");
         }
         fs::remove_dir_all(root).unwrap();
     }
 
-    /// The terminal's shell has Orca's environment and whatever the user's startup files add;
-    /// the agent gets exactly what it inherits and the launch's own env, in every shell family
-    /// Orca may start, whatever that shell cannot unset (review of PR #24).
+    /// A `:` in the run dir would split the shim's PATH entry, and the shell would start the real
+    /// program with the terminal's whole environment (review of PR #24, round 2): refuse it.
     #[test]
-    fn shell_line_drops_what_the_agent_does_not_inherit() {
+    fn shell_line_refuses_a_run_dir_with_a_colon() {
         let root = crate::doctor::fresh_temp_dir("rreview-test").unwrap();
         let launch = Launch {
-            program: "env".into(),
+            program: "claude".into(),
             args: vec![],
-            inherit: vec!["PATH", "HOME", "LC_CTYPE", "LC_ALL"],
-            env: vec![("CODEX_HOME".into(), "/run/codex-home".into())],
+            inherit: vec!["PATH"],
+            env: vec![],
             cwd: PathBuf::from("/"),
         };
-        let line = shell_line(&launch, &root.join("bin")).unwrap();
-        let mut ran = 0;
-        for (shell, startup) in [
-            ("/bin/sh", ""),
-            (
-                "/bin/bash",
-                "export RO_SECRET=canary; readonly RO_SECRET; \
-                 f() { echo canary; }; export -f f; ",
-            ),
-            ("/bin/zsh", "typeset -rx RO_SECRET=canary; "),
-        ] {
-            if !Path::new(shell).exists() {
-                continue;
-            }
-            let out = Command::new("/usr/bin/env")
-                .args(["-i", "PATH=/usr/bin:/bin", "HOME=/home/u", "LC_CTYPE=C"])
-                .args([
-                    "GH_TOKEN=canary",
-                    "DOTTED.SECRET=canary",
-                    "CODEX_HOME=/orca",
-                ])
-                .args(["MULTI=a\nGH_TOKEN=canary\nHOME=canary"])
-                .args([shell, "-c", &format!("{startup}{line}")])
-                .output()
-                .unwrap();
-            let env = String::from_utf8(out.stdout).unwrap();
-            let mut got: Vec<_> = env.lines().collect();
-            got.sort();
-            assert_eq!(
-                got,
-                [
-                    "CODEX_HOME=/run/codex-home",
-                    "HOME=/home/u",
-                    "LC_CTYPE=C",
-                    "PATH=/usr/bin:/bin"
-                ],
-                "{shell}: {}",
-                String::from_utf8_lossy(&out.stderr)
-            );
-            ran += 1;
-        }
-        assert!(ran > 0);
+        let err = shell_line(&launch, &root.join("a:b/bin"), Path::new("/rreview")).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("holds a ':', which a PATH entry cannot"),
+            "{err:#}"
+        );
         fs::remove_dir_all(root).unwrap();
     }
 
