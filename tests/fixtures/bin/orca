@@ -137,14 +137,21 @@ case "$1 $2" in
   echo "created $handle" >> "${FAKE_LOG:-/dev/null}"
   ok "{\"terminal\":{\"handle\":\"$handle\"}}" ;;
 "terminal list")
-  rows=
+  # As Orca's: a row's title is the one the running program set; the title `create --title` gave
+  # is the tab's, in the visual layout.
+  rows= tabs=
   for f in "$FAKE_LOG".orca-*.title; do
     [ -f "$f" ] || continue
     r=${f#"$FAKE_LOG.orca-"}; r=${r%.title}
     [ "$(grep -E '^(open|closed)$' "$FAKE_LOG.orca-$r" | tail -n 1)" = closed ] && continue
-    rows="$rows${rows:+,}{\"handle\":\"term_$r\",\"title\":\"$(cat "$f")\"}"
+    rows="$rows${rows:+,}{\"handle\":\"term_$r\",\"tabId\":\"tab_$r\",\"title\":\"Claude\"}"
+    tabs="$tabs${tabs:+,}{\"tabId\":\"tab_$r\",\"title\":\"$(cat "$f")\",\"panes\":{\"type\":\"terminal\",\"handle\":\"term_$r\",\"tabId\":\"tab_$r\",\"title\":\"Claude\"}}"
   done
-  ok "{\"terminals\":[$rows]}" ;;
+  layouts=
+  case " $* " in *" --include-visual-layouts "*)
+    layouts=",\"visualLayouts\":[{\"root\":{\"type\":\"group\",\"tabs\":[$tabs]}}]" ;;
+  esac
+  ok "{\"terminals\":[$rows]$layouts}" ;;
 "terminal show")
   echo show >> "$state"
   # The agent is up once its launch line ran; give it up to 5 s.

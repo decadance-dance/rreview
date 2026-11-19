@@ -320,7 +320,13 @@ impl Orca {
         let settle = Instant::now() + if unanswered { SETTLE } else { Duration::ZERO };
         loop {
             let listed = orca_to_end(
-                &["terminal", "list", "--worktree", &self.terminal_worktree],
+                &[
+                    "terminal",
+                    "list",
+                    "--worktree",
+                    &self.terminal_worktree,
+                    "--include-visual-layouts",
+                ],
                 Instant::now().checked_add(CLOSE),
             );
             let v = match listed {
@@ -330,16 +336,11 @@ impl Orca {
                     return;
                 }
             };
-            let mut found = false;
-            for t in v["terminals"].as_array().into_iter().flatten() {
-                if t["title"] == title
-                    && let Some(handle) = t["handle"].as_str()
-                {
-                    found = true;
-                    let _ = close(handle);
-                }
+            let handles = titled(&v, title);
+            for handle in &handles {
+                let _ = close(handle);
             }
-            if found || Instant::now() >= settle {
+            if !handles.is_empty() || Instant::now() >= settle {
                 return;
             }
             std::thread::sleep(Duration::from_millis(250));
@@ -700,6 +701,33 @@ fn agent_up(handle: &str, agent: Agent, deadline: Option<Instant>) -> Result<boo
     }
 }
 
+/// The listed terminals in tabs titled `title`, from a `terminal list --include-visual-layouts`
+/// reply. `terminal create --title` names the tab; a list row's own title can be the one the
+/// running program set (`Claude`).
+fn titled(list: &Value, title: &str) -> Vec<String> {
+    fn panes(v: &Value, title: &str, in_tab: bool, out: &mut Vec<String>) {
+        match v {
+            Value::Array(a) => a.iter().for_each(|x| panes(x, title, in_tab, out)),
+            Value::Object(o) => {
+                let in_tab =
+                    in_tab || (o.contains_key("panes") && o.get("title") == Some(&title.into()));
+                if in_tab && let Some(h) = o.get("handle").and_then(Value::as_str) {
+                    out.push(h.into());
+                }
+                o.values().for_each(|x| panes(x, title, in_tab, out));
+            }
+            _ => {}
+        }
+    }
+    let mut found = vec![];
+    panes(&list["visualLayouts"], title, false, &mut found);
+    // Only rows of the terminals' worktree: a layout of another worktree may hold the same title.
+    let listed = list["terminals"].as_array().into_iter().flatten();
+    let listed: Vec<_> = listed.filter_map(|t| t["handle"].as_str()).collect();
+    found.retain(|h| listed.contains(&h.as_str()));
+    found
+}
+
 /// Raw key bytes, as typed.
 fn send_keys(handle: &str, keys: &str, deadline: Option<Instant>) -> Result<()> {
     orca(
@@ -987,6 +1015,29 @@ mod tests {
             "{err:#}"
         );
         fs::remove_dir_all(root).unwrap();
+    }
+
+    /// Review of PR #34, round 2, finding 2: the tab's title counts, not the row's, and only
+    /// for the worktree's own terminals; a split tab's panes are all found.
+    #[test]
+    fn titled_finds_the_panes_of_the_tab_by_its_title() {
+        let list = serde_json::json!({
+            "terminals": [
+                {"handle": "t1", "title": "Claude"},
+                {"handle": "t2", "title": "rreview:a"},
+                {"handle": "t3", "title": "Claude"},
+            ],
+            "visualLayouts": [{"root": {"type": "group", "tabs": [
+                {"title": "rreview:a", "panes": {"type": "split", "children": [
+                    {"type": "terminal", "handle": "t1", "title": "Claude"},
+                    {"type": "terminal", "handle": "t3", "title": "Claude"},
+                ]}},
+                {"title": "zsh", "panes": {"type": "terminal", "handle": "t2", "title": "rreview:a"}},
+                {"title": "rreview:a", "panes": {"type": "terminal", "handle": "other-worktree"}},
+            ]}}],
+        });
+        assert_eq!(titled(&list, "rreview:a"), ["t1", "t3"]);
+        assert!(titled(&list, "rreview:b").is_empty());
     }
 
     #[test]
