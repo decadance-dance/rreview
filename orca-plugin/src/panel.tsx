@@ -51,9 +51,6 @@ const run = atom<Run | null>(null)
 /** The finished run's result, as `review.result` gives it. */
 const result = atom<Result | null>(null)
 const prArg = atom('prArg', '', { persist: 'workspace' })
-/** The `prArg` the shown target was resolved from: Run review starts that PR, not a value typed
- * under Other PR… and never submitted. */
-const targetArg = atom('')
 const runner = atom<Runner>('runner', 'headless', { persist: 'plugin' })
 const showAll = atom('showAll', false, { persist: 'plugin' })
 const selected = atom<string | null>(null)
@@ -78,7 +75,6 @@ async function loadTarget(): Promise<void> {
   try {
     const pr = read(prArg)
     set(target, await plugin.request('target.get', { pr }, { timeoutMs: 60_000 }))
-    set(targetArg, pr)
     set(otherPr, null)
   } catch (e) {
     set(notice, { tone: 'danger', text: errorText(e) })
@@ -133,7 +129,9 @@ async function startReview(): Promise<void> {
   if (!t) return
   set(notice, null)
   try {
-    showRun(await plugin.request('review.start', { workspaceId: t.workspaceId, pr: read(targetArg), runner: read(runner) }, { timeoutMs: 60_000 }))
+    // The shown PR's URL: an empty arg would let the worker's own lookup pick another PR (a new one
+    // for the branch), and a typed but unsubmitted Other PR… value is not what the header shows.
+    showRun(await plugin.request('review.start', { workspaceId: t.workspaceId, pr: t.pr?.url ?? '', runner: read(runner) }, { timeoutMs: 60_000 }))
   } catch (e) {
     set(notice, { tone: 'danger', text: errorText(e) })
   }
@@ -338,16 +336,17 @@ function Header() {
         </Callout>
       )}
       {/* Orca has no segmented control: two xs buttons in a labelled Toolbar stand in for one, the
-          chosen one solid and checked, so the choice reads without color. */}
+          chosen one solid and checked, so the choice reads without color. Buttons have no pressed
+          state, so the toolbar's name and the chosen button's tooltip say which one is chosen. */}
       <Row justify="between" align="center" gap="xs" wrap>
-        <Toolbar label="Runner" gap="none">
+        <Toolbar label={`Runner: ${read(runner)}`} gap="none">
           {(['headless', 'orca'] as const).map((v) => (
             <Button
               key={`runner:${v}`}
               size="xs"
               variant={read(runner) === v ? 'solid' : 'ghost'}
               icon={read(runner) === v ? 'check' : undefined}
-              tooltip={`Run the reviewers ${v === 'orca' ? 'in Orca terminals' : 'headless'}`}
+              tooltip={`${read(runner) === v ? 'Chosen: runs' : 'Run'} the reviewers ${v === 'orca' ? 'in Orca terminals' : 'headless'}`}
               onPress={() => set(runner, v)}
             >
               {v}
@@ -373,21 +372,38 @@ function Header() {
   )
 }
 
-/** The first sentence or line of `text`, and the rest. */
+/** The first sentence or line of `text`, and the rest. A leading fenced block is the whole lead,
+ * so the preview never renders half a fence. */
 export function lead(text: string): [string, string] {
   const t = text.trim()
-  const head = t.match(/^[^\n]*?[.!?](?=\s)/)?.[0] ?? t.split('\n')[0]
+  const head =
+    t.match(/^(`{3,}|~{3,})[^\n]*\n(?:[\s\S]*?\n\1[^\n]*(?=\n|$)|[\s\S]*$)/)?.[0] ??
+    t.match(/^[^\n]*?[.!?](?=\s)/)?.[0] ??
+    t.split('\n')[0]
   return [head, t.slice(head.length).trim()]
 }
 
-/** A long text as its first sentence, the rest behind "More": the verdict and the detail stay short. */
-function Lead({ text, markdown }: { text: string; markdown?: boolean }) {
+/** Which Leads the person opened, by id. */
+const moreOpen = atom<string[]>([])
+
+/** A long text as its first sentence, the whole text behind "More": the verdict and the detail stay
+ * short. Opened, the text renders as one document, never as a lead plus a rest that could split
+ * Markdown (a fence, a list) in two. */
+function Lead({ id, text, markdown }: { id: string; text: string; markdown?: boolean }) {
   const [head, rest] = lead(text)
+  const open = read(moreOpen).includes(id)
+  const show = (s: string) => (markdown ? <Markdown content={s} /> : <Text size="sm" muted>{s}</Text>)
   return (
     <Stack gap="xs">
-      {markdown ? <Markdown content={head} /> : <Text size="sm" muted>{head}</Text>}
+      {open && rest ? null : show(head)}
       {rest ? (
-        <Collapsible title="More">{markdown ? <Markdown content={rest} /> : <Text size="sm" muted>{rest}</Text>}</Collapsible>
+        <Collapsible
+          title={open ? 'Less' : 'More'}
+          open={open}
+          onChange={(o) => update(moreOpen, (ids) => (o ? [...ids, id] : ids.filter((x) => x !== id)))}
+        >
+          {show(text.trim())}
+        </Collapsible>
       ) : null}
     </Stack>
   )
@@ -418,9 +434,10 @@ function Counts({ r }: { r: Run }) {
   )
 }
 
-/** How to retry a run of another PR than the one shown: Run review would start the shown one. */
+/** How to retry a run of another PR than the one shown: Run review would start the shown one, and
+ * once that PR is shown again the button reads Run again. */
 const retryElsewhere = (r: Run) =>
-  `To review #${r.pr.number} again, focus its workspace or type it under Other PR…, then press Run review.`
+  `To review #${r.pr.number} again, focus its workspace or enter ${r.pr.url} under Other PR…, then press Run again.`
 
 function Status({ r }: { r: Run }) {
   const res = read(result)
@@ -473,7 +490,7 @@ function Status({ r }: { r: Run }) {
       icon={ok ? 'check' : 'warning'}
       title={res.overall_correctness.charAt(0).toUpperCase() + res.overall_correctness.slice(1)}
     >
-      <Lead text={res.overall_explanation} />
+      <Lead id={`verdict:${r.token}`} text={res.overall_explanation} />
       <Counts r={r} />
     </Callout>
   ) : (
@@ -539,21 +556,29 @@ function githubUrl(prUrl: string, head: string, f: Finding): string | null {
   return `${repo}/blob/${head}/${path}#L${f.start_line}${f.end_line > f.start_line ? `-L${f.end_line}` : ''}`
 }
 
+/** The longest `file:lines` the Code chip shows: what fits the detail at 280 px (31 at 7.4 px). Orca's inline Code
+ * never wraps and cannot take focus, so a longer one goes in a read-only field, which a keyboard
+ * can focus, select and copy from. */
+const CHIP_MAX = 31
+
 function Detail({ f, r, res }: { f: Finding; r: Run; res: Result }) {
   const key = findingKey(f)
   const url = githubUrl(r.pr.url, res.head, f)
+  const loc = `${f.file}:${lines(f)}`
   return (
     <Box border radius="md" padding="sm">
       <Stack gap="xs">
-        <Lead text={f.body} markdown />
-        <Row gap="xs" align="center" wrap>
-          <Code>{`${f.file}:${lines(f)}`}</Code>
-          {url ? (
-            <Text size="xs">
-              <Link href={url}>GitHub ↗</Link>
-            </Text>
-          ) : null}
-        </Row>
+        <Lead id={`body:${r.token}:${key}`} text={f.body} markdown />
+        {loc.length <= CHIP_MAX ? (
+          <Code>{loc}</Code>
+        ) : (
+          <Input label="File and lines (select to copy)" labelHidden value={loc} />
+        )}
+        {url ? (
+          <Text size="xs">
+            <Link href={url}>GitHub ↗</Link>
+          </Text>
+        ) : null}
         <Checkbox
           label="Send to the author"
           checked={read(picked).includes(key)}

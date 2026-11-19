@@ -28,6 +28,8 @@ const location = (view: TestPanel) => view.find({ type: 'Code', text: /:\d/ })?.
 const leaves = (view: TestPanel) => view.findAll({ type: 'ListItem' }).map((n) => [n.text, n.props?.icon])
 const current = (view: TestPanel) => view.findAll({ type: 'ListItem' }).find((n) => n.props?.current)?.text
 
+const pr12: Target = { ...target, pr: { ...target.pr!, number: 12, title: 'Other', url: 'https://github.com/acme/repo/pull/12' } }
+
 function setup(run: Run | null = null) {
   const calls: { name: string; input: unknown }[] = []
   const host = mockHost({
@@ -35,7 +37,7 @@ function setup(run: Run | null = null) {
       'agents.list': (p: { workspaceId?: string }) => ({ agents: AGENTS[p?.workspaceId ?? 'ws2'] ?? [] })
     },
     requests: {
-      'target.get': (input) => (calls.push({ name: 'target.get', input }), target),
+      'target.get': (input) => (calls.push({ name: 'target.get', input }), (input as { pr?: string })?.pr === '12' ? pr12 : target),
       'review.get': () => run,
       'review.result': () => (calls.push({ name: 'review.result', input: null }), doneResult),
       'review.start': (input) => (calls.push({ name: 'review.start', input }), running),
@@ -55,12 +57,17 @@ test('shows the workspace PR and starts a review with the chosen runner', async 
   assert.match(view.summary().join('\n'), /No review yet/)
   // The workspace has a PR: Other PR… stays folded, so the header keeps its two rows.
   assert.equal(view.find({ type: 'Collapsible', text: /Other PR/ })?.props?.open, false)
+  // Buttons have no pressed state: the toolbar's name says which runner Run review uses.
+  assert.equal(view.find({ type: 'Toolbar' })?.props?.label, 'Runner: headless')
   await view.press({ text: 'orca' })
+  assert.equal(view.find({ type: 'Toolbar' })?.props?.label, 'Runner: orca')
+  assert.match(String(view.find({ type: 'Button', text: 'orca' })?.props?.tooltip), /^Chosen: /)
+  assert.doesNotMatch(String(view.find({ type: 'Button', text: 'headless' })?.props?.tooltip), /Chosen/)
   // The chosen runner is solid and checked, so it reads without color.
   assert.equal(view.find({ type: 'Button', text: 'orca' })?.props?.icon, 'check')
   assert.equal(view.find({ type: 'Button', text: 'headless' })?.props?.variant, 'ghost')
   await view.press({ text: 'Run review' })
-  assert.deepEqual(calls.at(-1), { name: 'review.start', input: { workspaceId: 'ws1', pr: '', runner: 'orca' } })
+  assert.deepEqual(calls.at(-1), { name: 'review.start', input: { workspaceId: 'ws1', pr: 'https://github.com/acme/repo/pull/11', runner: 'orca' } })
   // The worker's posts drive the passes table while it runs.
   assert.equal(view.find({ text: 'Running…' })?.text, 'Running…')
   assert.deepEqual(roles(view), ['intent_contracts', 'reliability', 'security', 'coordinator'])
@@ -403,37 +410,42 @@ test('Run again starts the PR the header shows, not one typed under Other PR and
   await view.type({ label: 'PR number or URL' }, '12')
   await view.toggle({ label: /Other PR/ })
   await view.press({ text: 'Run again' })
-  assert.deepEqual(calls.at(-1), { name: 'review.start', input: { workspaceId: 'ws1', pr: '', runner: 'headless' } })
+  assert.deepEqual(calls.at(-1), { name: 'review.start', input: { workspaceId: 'ws1', pr: 'https://github.com/acme/repo/pull/11', runner: 'headless' } })
   // Submitted, the typed PR becomes the shown one, and the one Run review starts.
   await view.post('review.changed', done)
   await view.toggle({ label: /Other PR/ })
   await view.type({ label: 'PR number or URL' }, '', { submit: true })
   await view.press({ text: /Run/ })
-  assert.deepEqual(calls.at(-1)?.input, { workspaceId: 'ws1', pr: '12', runner: 'headless' })
+  assert.deepEqual(calls.at(-1)?.input, { workspaceId: 'ws1', pr: pr12.pr!.url, runner: 'headless' })
   await view.unmount()
 })
 
 test('Passes counts a failure the result reports after the fold appeared, and stays as the person left it', async () => {
   // security's `failed` line never reached progress.jsonl, and the result comes late.
   const lost = { ...done, events: done.events.filter((e) => !(e.role === 'security' && e.status === 'failed')) }
+  let deliver: (r: Result) => void = () => {}
+  const pending = new Promise<Result>((resolve) => (deliver = resolve))
   const view = await mount(panel, {
     host: mockHost({
       results: { 'agents.list': { agents: [] } },
-      requests: {
-        'target.get': () => target,
-        'review.get': () => running,
-        'review.result': () => new Promise<Result>((resolve) => setTimeout(() => resolve(doneResult), 100))
-      }
+      requests: { 'target.get': () => target, 'review.get': () => running, 'review.result': () => pending }
     })
   })
-  // The fold appears with the done run, before its result reports security's failure.
-  await view.post('review.changed', lost)
-  await view.settled()
-  assert.equal(view.find({ type: 'Collapsible', text: /Passes · 3\/4 done, 1 failed/ })?.props?.open, false)
-  // Opened by the person, it stays open.
-  await openPasses(view)
-  await view.rerender()
-  assert.equal(view.find({ type: 'Collapsible', text: /Passes · / })?.props?.open, true)
+  // The fold appears with the done run, folded, before its result reports security's failure.
+  // Acts resolve once the panel settles, which waits for the result: none is awaited until it lands.
+  const posted = view.post('review.changed', lost)
+  await new Promise((r) => setTimeout(r, 20))
+  const fold = () => view.find({ type: 'Collapsible', text: /Passes · / })
+  assert.equal(fold()?.props?.open, false)
+  assert.doesNotMatch(String(fold()?.label), /failed/)
+  // Opened by the person while the result is on its way, it stays open when the result lands.
+  const opened = openPasses(view)
+  await new Promise((r) => setTimeout(r, 20))
+  assert.equal(fold()?.props?.open, true)
+  deliver(doneResult)
+  await Promise.all([posted, opened])
+  assert.match(String(fold()?.label), /Passes · 3\/4 done, 1 failed/)
+  assert.equal(fold()?.props?.open, true)
   await view.unmount()
 })
 
@@ -449,8 +461,13 @@ test('a failed or cancelled run of another PR says how to retry that PR, not Run
     shown = pr12
     await view.emit('workspace.changed', { context: { workspaceId: 'ws2' } } as never)
     const s = JSON.stringify(view.find({ type: 'Callout', text: /The review (failed|was cancelled)/ }))
-    assert.match(s, /To review #11 again, focus its workspace or type it under Other PR…, then press Run review/)
-    assert.ok(!/Run again/.test(s), run.status)
+    assert.match(s, /To review #11 again, focus its workspace or enter https:\/\/github\.com\/acme\/repo\/pull\/11 under Other PR…, then press Run again\./)
+    assert.ok(view.find({ type: 'Button', text: 'Run review' }), 'the button starts #12 for now')
+    // Back on #11, the button the text named is there, and it starts #11.
+    shown = target
+    await view.emit('workspace.changed', { context: { workspaceId: 'ws1' } } as never)
+    assert.ok(view.find({ type: 'Button', text: 'Run again' }), run.status)
+    assert.doesNotMatch(JSON.stringify(view.find({ type: 'Callout', text: /The review (failed|was cancelled)/ })), /To review #11/)
     await view.unmount()
   }
 })
@@ -486,9 +503,68 @@ test('a lead is the first sentence or line', () => {
   assert.deepEqual(panel.lead('One. Two.\nThree'), ['One.', 'Two.\nThree'])
   assert.deepEqual(panel.lead('**Budget skips setup**: what fails and how.'), ['**Budget skips setup**: what fails and how.', ''])
   assert.deepEqual(panel.lead('no stop\n1. a list'), ['no stop', '1. a list'])
+  // A leading fence is the whole lead, closed or not, so the preview never shows half of one.
+  assert.deepEqual(panel.lead('```rust\nlet a = 1;\n```\nThe call leaks. More.'), ['```rust\nlet a = 1;\n```', 'The call leaks. More.'])
+  assert.deepEqual(panel.lead('```\nno close. here'), ['```\nno close. here', ''])
 })
 
 test('durations read as minutes and seconds', () => {
   assert.equal(panel.duration(9_400), '9s')
   assert.equal(panel.duration(901_917), '15m 2s')
+})
+
+test('More shows a finding body as one Markdown document, so a fenced block stays whole', async () => {
+  const body = '```rust\nfn close(t: Terminal) {\n    t.kill();\n}\n```\nThe kill above can fail. Then the terminal leaks.'
+  const res: Result = { ...doneResult, findings: [{ ...doneResult.findings[0], body }] }
+  const view = await mountRun(done, res)
+  const docs = () => view.findAll({ type: 'Markdown' }).map((n) => String(n.props?.content))
+  // Folded: the preview is the whole fenced block, never its opening line alone.
+  assert.deepEqual(docs(), ['```rust\nfn close(t: Terminal) {\n    t.kill();\n}\n```'])
+  await view.toggle({ label: 'More' })
+  assert.deepEqual(docs(), [body], 'one document: no rest that starts after the opening fence')
+  await view.toggle({ label: 'Less' })
+  assert.equal(docs().length, 1)
+  await view.unmount()
+})
+
+test('a location longer than the chip fits goes in a read-only field to select and copy; GitHub sits under it', async () => {
+  const file = `src/${'a'.repeat(80)}.rs`
+  const res: Result = { ...doneResult, findings: [{ ...doneResult.findings[0], file }] }
+  const view = await mountRun(done, res)
+  assert.equal(location(view), undefined, 'no chip: Orca\'s inline Code never wraps')
+  assert.equal(view.valueOf({ label: 'File and lines (select to copy)' }), `${file}:120-124`)
+  await view.unmount()
+  // A short one stays a chip, with GitHub on its own line under it.
+  const short = await mountRun(done, doneResult)
+  assert.equal(location(short), 'src/orca.rs:120-124')
+  assert.equal(short.find({ label: 'File and lines (select to copy)' }), null)
+  const detail = short.findAll({ type: 'Row' }).find((n) => /GitHub/.test(String(n.text)) && /orca\.rs:/.test(String(n.text)))
+  assert.equal(detail, undefined, 'the chip and the link do not share a row')
+  await short.unmount()
+})
+
+test('Run again starts the PR the header shows, even after the branch gets another PR', async () => {
+  // The worker resolves an empty PR arg itself: the branch's PR at that moment.
+  let branchPr = target
+  const started: string[] = []
+  const view = await mount(panel, {
+    host: mockHost({
+      results: { 'agents.list': { agents: [] } },
+      requests: {
+        'target.get': () => branchPr,
+        'review.get': () => done,
+        'review.result': () => doneResult,
+        'review.start': (input: { pr: string }) => {
+          const t = input.pr ? [target, pr12].find((x) => x.pr!.url === input.pr || String(x.pr!.number) === input.pr) : branchPr
+          started.push(t!.pr!.url)
+          return { ...running, pr: t!.pr! }
+        }
+      }
+    })
+  })
+  assert.ok(view.find({ type: 'Button', text: 'Run again' }))
+  branchPr = pr12
+  await view.press({ text: 'Run again' })
+  assert.deepEqual(started, [target.pr!.url])
+  await view.unmount()
 })
