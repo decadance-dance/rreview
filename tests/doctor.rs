@@ -365,7 +365,7 @@ fn orca_runner_passes_through_the_orca_launch_builders() {
     for title in ["claude", "codex", "codex_control"] {
         assert!(
             run.log.contains(&format!(
-                "orca terminal create --worktree current --title rreview:{title} --command PATH="
+                "orca terminal create --worktree current --title rreview:{title}:rreview-doctor-"
             )),
             "{}",
             run.log
@@ -515,5 +515,22 @@ fn the_orca_claude_probe_never_asks_for_json() {
         !run.claude_prompts.contains("JSON"),
         "{}",
         run.claude_prompts
+    );
+}
+
+/// A terminal whose `create` reply was lost is found by its title and closed: doctor's
+/// terminals live in the caller's worktree, which no teardown removes.
+#[test]
+fn orca_terminals_with_a_lost_create_reply_are_closed() {
+    let run = doctor_orca(&[("FAKE_ORCA", "lost-create")]);
+    assert!(!run.passed, "{}", run.stdout);
+    let count = |what: &str| run.log.lines().filter(|l| l.starts_with(what)).count();
+    let created = count("orca terminal create");
+    assert!(created >= 2, "{}", run.log);
+    assert_eq!(created, count("orca terminal close"), "{}", run.log);
+    assert!(
+        run.log.contains("--title rreview:claude:rreview-doctor-"),
+        "{}",
+        run.log
     );
 }

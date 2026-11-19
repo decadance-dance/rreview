@@ -148,7 +148,10 @@ fn orca_runner(fx: &Fixture, codex_auth: PathBuf) -> Orca {
         fx.root.join("orca"),
         codex_auth,
     )
-    .terminals_in("current")
+    .terminals_in(
+        "current",
+        &fx.root.file_name().unwrap_or_default().to_string_lossy(),
+    )
 }
 
 fn probe_pass(role: &str, agent: Agent, prompt: String) -> Pass<'_> {

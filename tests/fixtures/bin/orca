@@ -28,6 +28,7 @@
 #   no-ok           `terminal create` exits 0 with "ok": false
 #   refused         `terminal send` of a prompt answers "accepted": false
 #   blocked         after the prompt the agent waits on a permission dialog
+#   lost-create     `terminal create` opens the terminal, then fails without JSON
 #   play            the agent plays each prompt itself: the terminal's launch line runs again
 #                   with the prompt on stdin (through rreview's shim), and the fake agent writes
 #                   its own reply (`rreview doctor --runner orca`)
@@ -78,8 +79,9 @@ case "$1 $2" in
   ok '{"removed":true}' ;;
 "terminal create")
   [ "$scenario" = no-ok ] && { echo '{"ok":false,"error":{"code":"boom","message":"no terminal"}}'; exit 0; }
-  role=$(arg --title "$@"); role=${role#rreview:}
+  title=$(arg --title "$@"); role=${title#rreview:}
   echo open >> "$FAKE_LOG.orca-$role"
+  printf '%s' "$title" > "$FAKE_LOG.orca-$role.title"
   cmd=$(arg --command "$@")
   printf '%s' "$cmd" > "$FAKE_LOG.orca-$role.cmd"
   case "$cmd" in *"'claude'"*) agent=claude ;; *) agent=codex ;; esac
@@ -105,7 +107,17 @@ case "$1 $2" in
   else
     echo launched >> "$FAKE_LOG.orca-$role"
   fi
+  [ "$scenario" = lost-create ] && { echo "transport closed" >&2; exit 1; }
   ok "{\"terminal\":{\"handle\":\"term_$role\"}}" ;;
+"terminal list")
+  rows=
+  for f in "$FAKE_LOG".orca-*.title; do
+    [ -f "$f" ] || continue
+    r=${f#"$FAKE_LOG.orca-"}; r=${r%.title}
+    grep -q '^closed' "$FAKE_LOG.orca-$r" && continue
+    rows="$rows${rows:+,}{\"handle\":\"term_$r\",\"title\":\"$(cat "$f")\"}"
+  done
+  ok "{\"terminals\":[$rows]}" ;;
 "terminal show")
   echo show >> "$state"
   # The agent is up once its launch line ran; give it up to 5 s.

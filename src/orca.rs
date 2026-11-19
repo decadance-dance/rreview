@@ -236,6 +236,8 @@ pub struct Orca {
     codex_auth: PathBuf,
     /// The Orca worktree selector the terminals open in.
     terminal_worktree: String,
+    /// Appended to every terminal title, `rreview:<role>:<tag>`; empty for a review.
+    title_tag: String,
     /// Added to every launch's env.
     env: Vec<(String, String)>,
     /// What the reviewer writes to its reply file, as the delivery instruction names it.
@@ -252,6 +254,7 @@ impl Orca {
     ) -> Self {
         Orca {
             terminal_worktree: format!("path:{}", worktree.display()),
+            title_tag: String::new(),
             worktree,
             git_common_dir,
             runroot,
@@ -264,10 +267,39 @@ impl Orca {
 
     /// Terminals open in the Orca worktree `selector` instead of the review worktree, which
     /// Orca need not track (`rreview doctor`'s throwaway repo); the agent still starts in the
-    /// review worktree (the shim enters it).
-    pub fn terminals_in(mut self, selector: &str) -> Self {
+    /// review worktree (the shim enters it). Their titles end in `:<tag>`, unique to the run, so
+    /// a terminal whose create reply was lost can be found and closed: no teardown removes the
+    /// caller's worktree.
+    pub fn terminals_in(mut self, selector: &str, tag: &str) -> Self {
         self.terminal_worktree = selector.into();
+        self.title_tag = format!(":{tag}");
         self
+    }
+
+    fn title(&self, role: &str) -> String {
+        format!("rreview:{role}{}", self.title_tag)
+    }
+
+    /// Closes the terminals titled `title` in the terminals' worktree: a create whose reply was
+    /// lost may still have opened one. Best effort; a failure is a warning.
+    // limit: a create that opens its terminal only after this listing still leaves it open.
+    fn close_titled(&self, title: &str) {
+        let listed = orca(
+            &["terminal", "list", "--worktree", &self.terminal_worktree],
+            Instant::now().checked_add(CLOSE),
+        );
+        match listed {
+            Ok(v) => {
+                for t in v["terminals"].as_array().into_iter().flatten() {
+                    if t["title"] == title
+                        && let Some(handle) = t["handle"].as_str()
+                    {
+                        let _ = close(handle);
+                    }
+                }
+            }
+            Err(e) => eprintln!("warning: cannot list Orca terminals to close {title}: {e:#}"),
+        }
     }
 
     /// Sets `name=value` for every launch, over an inherited value.
@@ -407,6 +439,7 @@ impl Runner for Orca {
             &self.scratch(pass.role).join("bin"),
             &exe,
         )?;
+        let title = self.title(pass.role);
         let v = orca(
             &[
                 "terminal",
@@ -414,12 +447,13 @@ impl Runner for Orca {
                 "--worktree",
                 &self.terminal_worktree,
                 "--title",
-                &format!("rreview:{}", pass.role),
+                &title,
                 "--command",
                 &command,
             ],
             deadline,
-        )?;
+        )
+        .inspect_err(|_| self.close_titled(&title))?;
         let handle = v["terminal"]["handle"]
             .as_str()
             .context("orca terminal create: no handle")?
