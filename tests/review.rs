@@ -158,7 +158,14 @@ impl Fixture {
             ("FAKE_GH_PR", pr.to_string()),
         ];
         fake_env::write(&bin, &[&fakes[..], scenario].concat());
-        let out = Command::new(env!("CARGO_BIN_EXE_rreview"))
+        // Under umask 022, the common default, so the modes a run creates do not depend on the
+        // caller's umask.
+        let out = Command::new("/bin/sh")
+            .args([
+                "-c",
+                "umask 022 && exec \"$0\" \"$@\"",
+                env!("CARGO_BIN_EXE_rreview"),
+            ])
             .args(args)
             .current_dir(&self.clone)
             .env("PATH", format!("{}:/usr/bin:/bin", bin.display()))
@@ -787,6 +794,54 @@ fn a_timed_out_pass_is_resumed_for_its_wrap_up() {
         assert!(run.log.contains(&resumed), "want {resumed:?} in {run:?}");
         assert_dead(&fx, 1);
         fx.assert_worktree_removed();
+    }
+}
+
+#[test]
+fn a_fresh_run_dir_is_private() {
+    use std::os::unix::fs::PermissionsExt;
+    let fx = fixture();
+    let run = fx.run(&[], &claude_says("Done."));
+    let mode = fs::metadata(fx.runroot()).unwrap().permissions().mode() & 0o777;
+    assert_eq!(mode, 0o700, "{run:?}");
+}
+
+/// macOS ACLs are not masked by the mode: an inheritable grant on the state dir would reach
+/// every file of a 0700 run dir.
+#[cfg(target_os = "macos")]
+#[test]
+fn a_fresh_run_dir_drops_inherited_acls() {
+    let fx = fixture();
+    let parent = fx.runroot().parent().unwrap().to_path_buf();
+    fs::create_dir_all(&parent).unwrap();
+    let grant = "everyone allow list,search,read,file_inherit,directory_inherit";
+    let set = Command::new("/bin/chmod")
+        .args(["+a", grant])
+        .arg(&parent)
+        .status()
+        .unwrap();
+    if !set.success() {
+        eprintln!("skipped: this filesystem takes no ACL");
+        return;
+    }
+    let run = fx.run(&[], &claude_says("Done."));
+    let acl = |path: &Path| {
+        let out = Command::new("/bin/ls")
+            .arg("-lde")
+            .arg(path)
+            .output()
+            .unwrap();
+        String::from_utf8_lossy(&out.stdout).into_owned()
+    };
+    assert!(acl(&parent).contains("everyone"), "{}", acl(&parent));
+    let runroot = fx.runroot();
+    for path in [
+        runroot.clone(),
+        runroot.join("meta.json"),
+        runroot.join("logs/reliability.stdout"),
+    ] {
+        assert!(path.exists(), "{run:?}");
+        assert_eq!(acl(&path).lines().count(), 1, "{}", acl(&path));
     }
 }
 
