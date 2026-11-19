@@ -12,12 +12,19 @@ focused workspace's pull request, shows each pass while it runs, and lists the f
   lines on stderr and tails `<runroot>/progress.jsonl`, one row per pass: one bounded read at a
   time, and only while the dir's `meta.json` names this run's id (another rreview run for the same
   PR head replaces the dir, possibly with the same path and inode).
+  The panel shows how many passes are done with a progress bar and the time since the run
+  started, each pass with its agent, a status that reads without color (`✓ completed`,
+  `✗ failed`, `● running`, `○ waiting`) and its time, and each failed pass with its reason.
 - **Cancel** (while a run is running) sends rreview SIGTERM; see Limits.
 - **Result**: from rreview's exit code and its JSON on stdout (`result.json`). Exit 2, a crash or
   output that is not a valid result shows as a failed review with rreview's `error:` lines and the
   run dir; a review where a panelist or the judge failed shows as degraded.
-- **Findings**: a file tree (folders, files, then one item per finding with its lines, priority and
-  confidence); select one to read its body. Gated findings by default, all with the switch. Posts
+- **Findings**: the verdict, then a file tree (folders, files, then one item per finding: its
+  priority as text, `P0`-`P3`, with an icon per severity, and its lines). The most urgent finding
+  opens with its detail: full title, priority, confidence and stage, the `file:line` in a read-only
+  field to copy, a link to those lines on GitHub at the reviewed head, and its body. Gated
+  findings by default, all with the switch; with none above the gate the panel says how many are
+  below it. Posts
   and stored state carry only the run's status and counts; the panel fetches the result itself,
   with long texts cut and findings past about 200 KB left out (it says how many), so a large
   review stays within Orca's 256 KiB post and storage limits. The full text stays in `result.json`.
@@ -27,7 +34,8 @@ focused workspace's pull request, shows each pass while it runs, and lists the f
   same agent session in that workspace, and types one fixed line naming that file through
   `terminal.sendText` (capability `terminal:send`). Reviewer text is never typed, so it cannot reach
   a shell even if the agent has just exited; the line holds only characters a shell reads as plain
-  words.
+  words. The panel confirms the send next to the button, naming the agent and the file, and keeps
+  that confirmation for the run across panel reloads.
 
 ## Install for development
 
@@ -74,6 +82,14 @@ Settings (Settings > Plugins > Rreview):
 orca plugin types orca-plugin   # .orca/types, for tsc
 orca plugin test orca-plugin    # src/*.test.ts(x); fake gh and rreview in test/fixtures/bin
 orca plugin check orca-plugin   # renders each scenario of src/panel.check.ts
+```
+
+`docs/screenshots/orca-plugin-*.png` are the `pr1*` scenarios of `src/panel.check.ts`, which replay
+the real review of this repo's PR #1 (`src/screens.ts`), drawn by Orca with Orca's window
+minimized, without loading the plugin:
+
+```sh
+orca plugin shot orca-plugin --scenario pr1Running --theme dark --width 320 --out docs/screenshots/orca-plugin-running.png
 ```
 
 `bin/check` at the repo root runs both, and CI installs the Orca CLI from the Linux AppImage for them.

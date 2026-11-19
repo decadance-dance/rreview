@@ -5,19 +5,26 @@ import {
   Badge,
   Button,
   Callout,
+  Card,
   Checkbox,
+  Code,
   EmptyState,
   Heading,
   host,
+  IconButton,
   Input,
+  KeyValue,
   Link,
   Markdown,
   on,
   plugin,
+  Progress,
   RadioGroup,
   read,
+  RelativeTime,
   Row,
   Select,
+  Separator,
   set,
   Stack,
   Switch,
@@ -25,12 +32,13 @@ import {
   Text,
   Tree,
   update,
+  type IconName,
   type PanelContext,
   type TableRow,
   type Tone,
   type TreeItem
 } from 'orca'
-import { findingKey, type Finding, type Result, type Run, type Runner, type Target } from './protocol'
+import { findingKey, TEXT_CAP, type Finding, type PassEvent, type Result, type Run, type Runner, type Target } from './protocol'
 
 const ROLES = ['intent_contracts', 'reliability', 'security', 'coordinator', 'judge']
 
@@ -50,6 +58,8 @@ const agents = atom<{ value: string; label: string; session: string | null }[]>(
 /** The terminal the person chose; never picked for them. */
 const author = atom<{ terminalId: string; sessionId: string | null } | null>(null)
 const notice = atom<{ tone: Tone; text: string } | null>(null)
+/** The last "Send to author" of a run, kept so a reopened panel still shows this run's were sent. */
+const sent = atom<{ token: string; sent: number; file: string; to: string } | null>('sent', null, { persist: 'plugin' })
 
 const errorText = (e: unknown) => (e instanceof Error ? e.message : String(e))
 
@@ -98,7 +108,9 @@ async function showRun(r: Run | null): Promise<void> {
     if (read(run)?.token !== r.token) return
     set(result, res)
     set(picked, res ? res.findings.map(findingKey) : [])
-    set(selected, null)
+    // The first finding shown (rreview lists the most urgent first) opens with its detail.
+    const first = res && (read(showAll) ? res.ungated_findings : res.findings)[0]
+    set(selected, first ? findingKey(first) : null)
   }
 }
 
@@ -128,9 +140,11 @@ async function sendToAuthor(): Promise<void> {
   const a = read(author)
   if (!a) return
   const { terminalId, sessionId } = a
+  const token = read(run)?.token
   try {
-    const { sent, file } = await plugin.request('findings.send', { terminalId, sessionId, keys: read(picked) })
-    set(notice, { tone: 'success', text: `Sent ${sent} finding${sent === 1 ? '' : 's'} to the author (${file}).` })
+    const { sent: n, file } = await plugin.request('findings.send', { terminalId, sessionId, keys: read(picked) })
+    const to = read(agents).find((o) => o.value === terminalId)?.label ?? 'the author'
+    if (token) set(sent, { token, sent: n, file, to })
   } catch (e) {
     set(notice, { tone: 'danger', text: errorText(e) })
   }
@@ -155,6 +169,10 @@ export function setup(ctx: PanelContext): void {
 // The directory tree with single-child folders folded together follows buildTree() in
 // orca-pr-review's ui/app.js (https://github.com/Geromendez135/orca-pr-review),
 // Copyright (c) 2026 Geromendez135, MIT License; adapted to Orca's Tree items and findings.
+const lines = (f: Finding) => `${f.start_line}${f.end_line > f.start_line ? `-${f.end_line}` : ''}`
+/** Severity is told by the `P<n>` text and the icon's shape, never by color alone. */
+const severityIcon = (priority: number): IconName => (priority <= 1 ? 'error' : priority === 2 ? 'warning' : 'info')
+
 type Dir = { name: string; path: string; dirs: Map<string, Dir>; files: Map<string, Finding[]> }
 
 export function fileTree(findings: Finding[]): TreeItem[] {
@@ -192,9 +210,8 @@ export function fileTree(findings: Finding[]): TreeItem[] {
           .sort((a, b) => a.start_line - b.start_line)
           .map((f) => ({
             key: findingKey(f),
-            label: `L${f.start_line}${f.end_line > f.start_line ? `-${f.end_line}` : ''} [P${f.priority}] ${f.title}`,
-            description: `conf ${f.confidence_score}`,
-            icon: f.priority <= 1 ? ('error' as const) : ('warning' as const)
+            label: `P${f.priority} · L${lines(f)} · ${f.title}`,
+            icon: severityIcon(f.priority)
           }))
       }))
   ]
@@ -204,55 +221,66 @@ export function fileTree(findings: Finding[]): TreeItem[] {
 const allKeys = (items: readonly TreeItem[]): string[] =>
   items.flatMap((i) => (i.children ? [i.key, ...allKeys(i.children)] : []))
 
-function passRows(r: Run): TableRow[] {
+/** `95s` as `1m 35s`. */
+export function duration(ms: number): string {
+  const s = Math.round(ms / 1000)
+  return s < 60 ? `${s}s` : `${Math.floor(s / 60)}m ${s % 60}s`
+}
+
+/** Each pass's last event, in pipeline order; the judge only once it ran. */
+function passes(r: Run): { role: string; e?: PassEvent }[] {
   // The `run` line records a stop; it is no pass.
   const last = new Map(r.events.filter((e) => e.role !== 'run').map((e) => [e.role, e]))
   const roles = [...ROLES.filter((x) => x !== 'judge' || last.has('judge')), ...[...last.keys()].filter((x) => !ROLES.includes(x))]
-  return roles.map((role) => {
-    const e = last.get(role)
-    const done = e && (e.status === 'completed' || e.status === 'failed')
-    return {
-      key: role,
-      cells: {
-        role,
-        status: e?.status ?? (r.status === 'running' ? 'waiting' : 'not run'),
-        agent: e?.agent ?? '',
-        time: done ? `${Math.round(e.duration_ms / 1000)} s` : e ? { type: 'relative', at: e.ts - e.duration_ms, format: 'duration' } : ''
-      }
+  return roles.map((role) => ({ role, e: last.get(role) }))
+}
+
+const finished = (e?: PassEvent) => e?.status === 'completed' || e?.status === 'failed'
+/** A glyph and a word: the status reads without color. */
+const STATUS: Record<string, string> = { completed: '✓ completed', failed: '✗ failed', started: '● running', wrapup: '● wrapping up' }
+/** Why a pass failed, without rreview's `pass <role> (<agent>): ` prefix the callout already shows. */
+const reason = (e?: PassEvent) => (e?.error ?? 'no reason recorded').replace(/^pass \S+ \(\S+\): /, '').slice(0, TEXT_CAP)
+
+function passRows(r: Run): TableRow[] {
+  return passes(r).map(({ role, e }) => ({
+    key: role,
+    cells: {
+      pass: e?.agent ? `${role} · ${e.agent}` : role,
+      status: e ? (STATUS[e.status] ?? e.status) : r.status === 'running' ? '○ waiting' : '– not run',
+      time: e && finished(e) ? duration(e.duration_ms) : e ? { type: 'relative', at: e.ts - e.duration_ms, format: 'duration' } : ''
     }
-  })
+  }))
 }
 
 function Header() {
   const t = read(target)
   return (
     <Stack gap="sm">
-      <Row justify="between">
+      <Row justify="between" align="center">
         <Heading>Rreview</Heading>
-        <Button variant="ghost" size="sm" icon="refresh" onPress={loadTarget}>
-          Refresh
-        </Button>
+        <IconButton icon="refresh" label="Refresh the PR" variant="ghost" size="sm" onPress={loadTarget} />
       </Row>
-      <Input
-        label="PR (number or URL; empty: the workspace's)"
-        value={read(prArg)}
-        placeholder="the workspace's PR"
-        onChange={(v) => set(prArg, v)}
-        onSubmit={() => void loadTarget()}
-      />
       {read(loading) ? (
         <Text muted>Looking up the PR…</Text>
       ) : !t ? (
-        <EmptyState title="No workspace focused" icon="folder" />
+        <EmptyState title="No workspace focused" icon="folder" description="Focus a workspace in Orca, then press Refresh." />
       ) : t.pr ? (
-        <Text>
+        <Text weight="semibold">
           <Link href={t.pr.url}>#{t.pr.number}</Link> {t.pr.title} <Badge>{t.pr.state}</Badge>
         </Text>
       ) : (
         <Callout tone="warning" title={`No PR for ${t.name}`}>
           <Text size="sm">{t.error ?? ''}</Text>
+          <Text size="sm">Open a PR for this branch, or type a PR number or URL below, then press Refresh.</Text>
         </Callout>
       )}
+      <Input
+        label="PR number or URL"
+        value={read(prArg)}
+        placeholder="empty: the workspace's PR"
+        onChange={(v) => set(prArg, v)}
+        onSubmit={() => void loadTarget()}
+      />
     </Stack>
   )
 }
@@ -284,64 +312,128 @@ function Controls() {
   )
 }
 
+function StatusBadge({ r }: { r: Run }) {
+  if (r.status === 'running') return <Badge tone="accent">running</Badge>
+  if (r.status === 'failed') return <Badge tone="danger">failed</Badge>
+  if (r.status === 'cancelled') return <Badge tone="neutral">cancelled</Badge>
+  const gated = r.summary?.gated ?? 0
+  return <Badge tone={gated ? 'warning' : 'success'}>{gated ? `${gated} gated finding${gated === 1 ? '' : 's'}` : 'no gated findings'}</Badge>
+}
+
 function Status({ r }: { r: Run }) {
   const res = read(result)
-  const sum = r.summary
+  const list = passes(r)
+  const done = list.filter(({ e }) => finished(e)).length
+  const failures = list.filter(({ e }) => e?.status === 'failed')
+  const running = r.status === 'running'
+  const last = Math.max(r.startedAt, ...r.events.map((e) => e.ts))
   return (
     <Stack gap="sm">
-      <Row gap="xs" align="center">
-        <Text weight="semibold">
-          PR #{r.pr.number} · {r.runner}
-        </Text>
-        {r.status === 'running' ? (
-          <Badge tone="accent">running</Badge>
-        ) : r.status === 'failed' ? (
-          <Badge tone="danger">failed</Badge>
-        ) : r.status === 'cancelled' ? (
-          <Badge tone="neutral">cancelled</Badge>
-        ) : (
-          <Badge tone={r.exitCode === 0 ? 'success' : 'warning'}>
-            {sum?.gated ? `${sum.gated} gated` : 'no gated findings'}
-          </Badge>
-        )}
-        {sum?.degraded ? <Badge tone="warning">degraded</Badge> : null}
+      <Separator />
+      <Row gap="xs" align="center" wrap>
+        <Heading level={3}>{`PR #${r.pr.number} · ${r.runner === 'orca' ? 'orca terminals' : 'headless'}`}</Heading>
+        <StatusBadge r={r} />
+        {r.summary?.degraded ? <Badge tone="warning">degraded</Badge> : null}
       </Row>
+      {running ? <Progress label="Passes done" labelHidden value={Math.round((100 * done) / list.length)} /> : null}
+      {running ? (
+        <Text size="sm" muted>
+          {`${done} of ${list.length} passes done · elapsed `}
+          <RelativeTime at={r.startedAt} format="duration" />
+        </Text>
+      ) : (
+        <Text size="sm" muted>{`${done} of ${list.length} passes finished in ${duration(last - r.startedAt)}`}</Text>
+      )}
       <Table
         label="Passes"
         columns={[
-          { key: 'role', label: 'Pass' },
+          { key: 'pass', label: 'Pass' },
           { key: 'status', label: 'Status', width: 'sm' },
-          { key: 'agent', label: 'Agent', width: 'xs', hideBelow: 'sm' },
           { key: 'time', label: 'Time', width: 'xs', align: 'end' }
         ]}
         rows={passRows(r)}
       />
+      {failures.length ? (
+        <Callout tone="warning" title={`${failures.length} pass${failures.length === 1 ? '' : 'es'} failed`}>
+          {failures.map(({ role, e }) => (
+            <Text size="sm">
+              <Code>{`${role} (${e?.agent})`}</Code> {reason(e)}
+            </Text>
+          ))}
+          {res?.degraded ? <Text size="sm">The coordinator covered the failed lens, so the findings still stand.</Text> : null}
+        </Callout>
+      ) : null}
       {r.status === 'failed' ? (
         <Callout tone="danger" title="The review failed">
           <Text size="sm">{r.error ?? ''}</Text>
-          {r.runDir ? <Text size="xs" muted>Run dir: {r.runDir}</Text> : null}
+          <Text size="sm">Fix the cause, then press Run review again.</Text>
+          {r.runDir ? (
+            <Text size="xs" muted>
+              Run dir: <Code>{r.runDir}</Code>
+            </Text>
+          ) : null}
         </Callout>
       ) : null}
       {r.status === 'cancelled' ? (
         <Callout tone="neutral" title="The review was cancelled">
-          <Text size="sm">rreview stopped its reviewers and ran its cleanup before it exited.</Text>
-          {r.runDir ? <Text size="xs" muted>Run dir: {r.runDir}</Text> : null}
-        </Callout>
-      ) : null}
-      {res?.degraded ? (
-        <Callout tone="warning" title="Degraded">
-          <Text size="sm">
-            A panelist or the judge failed: {res.passes.filter((p) => p.status !== 'completed').map((p) => p.role).join(', ')}. The coordinator covered its lens.
-          </Text>
+          <Text size="sm">rreview stopped its reviewers and ran its cleanup before it exited. Run review starts a new run.</Text>
+          {r.runDir ? (
+            <Text size="xs" muted>
+              Run dir: <Code>{r.runDir}</Code>
+            </Text>
+          ) : null}
         </Callout>
       ) : null}
       {res ? (
-        <Text size="sm">
-          <Badge tone={res.overall_correctness === 'patch is correct' ? 'success' : 'warning'}>{res.overall_correctness}</Badge>{' '}
-          {res.overall_explanation}
-        </Text>
+        <Callout
+          tone={res.overall_correctness === 'patch is correct' ? 'success' : 'warning'}
+          icon={res.overall_correctness === 'patch is correct' ? 'check' : 'warning'}
+          title={res.overall_correctness.charAt(0).toUpperCase() + res.overall_correctness.slice(1)}
+        >
+          <Text size="sm">{res.overall_explanation}</Text>
+        </Callout>
       ) : null}
     </Stack>
+  )
+}
+
+/** The finding's lines on GitHub at the reviewed head, from the PR's URL. */
+function githubUrl(prUrl: string, head: string, f: Finding): string | null {
+  const repo = prUrl.match(/^(https:\/\/[^/]+\/[^/]+\/[^/]+)\/pull\/\d+/)?.[1]
+  if (!repo || !/^[0-9a-f]{40}$/.test(head)) return null
+  const path = f.file.split('/').map(encodeURIComponent).join('/')
+  return `${repo}/blob/${head}/${path}#L${f.start_line}${f.end_line > f.start_line ? `-L${f.end_line}` : ''}`
+}
+
+function Detail({ f, r, res }: { f: Finding; r: Run; res: Result }) {
+  const key = findingKey(f)
+  const url = githubUrl(r.pr.url, res.head, f)
+  return (
+    <Card>
+      <Stack gap="sm">
+        <Text weight="semibold">{f.title}</Text>
+        <KeyValue
+          label="Finding"
+          items={[
+            { label: 'Priority', value: `P${f.priority} (P0 most urgent)`, tone: f.priority <= 1 ? 'danger' : 'warning' },
+            { label: 'Confidence', value: f.confidence_score },
+            { label: 'Stage', value: f.stage }
+          ]}
+        />
+        <Input label="File and line (select to copy)" value={`${f.file}:${lines(f)}`} />
+        {url ? (
+          <Text size="sm">
+            <Link href={url}>Open on GitHub at the reviewed head</Link>
+          </Text>
+        ) : null}
+        <Markdown content={f.body} />
+        <Checkbox
+          label="Send to the author"
+          checked={read(picked).includes(key)}
+          onChange={(on) => update(picked, (k) => (on ? [...k, key] : k.filter((x) => x !== key)))}
+        />
+      </Stack>
+    </Card>
   )
 }
 
@@ -349,15 +441,26 @@ function Findings({ r }: { r: Run }) {
   const res = read(result)
   if (r.status !== 'done') return null
   if (!res) return <Text muted>The result is not available: its run dir is gone or was replaced by a later run.</Text>
-  const list = read(showAll) ? res.ungated_findings : res.findings
+  const all = read(showAll)
+  const list = all ? res.ungated_findings : res.findings
   const items = fileTree(list)
   const sel = list.find((f) => findingKey(f) === read(selected))
   const keys = read(picked)
+  const below = res.ungated_findings.length - res.findings.length
+  const s = read(sent)
+  const toggle = (v: boolean) => {
+    set(showAll, v)
+    const next = v ? res.ungated_findings : res.findings
+    if (!next.some((f) => findingKey(f) === read(selected))) set(selected, next[0] ? findingKey(next[0]) : null)
+  }
   return (
     <Stack gap="sm">
-      <Row justify="between" align="center">
-        <Heading level={3}>Findings</Heading>
-        <Switch label={`All ${res.ungated_findings.length}, below the gate too`} checked={read(showAll)} onChange={(v) => set(showAll, v)} />
+      <Separator />
+      <Row justify="between" align="center" wrap>
+        <Heading level={3}>
+          Findings <Badge>{`${list.length}`}</Badge>
+        </Heading>
+        <Switch label={`All ${res.ungated_findings.length}, below the gate too`} checked={all} onChange={toggle} />
       </Row>
       {res.omitted ? (
         <Text size="xs" muted>
@@ -374,22 +477,14 @@ function Findings({ r }: { r: Run }) {
           onSelect={({ key }) => set(selected, key)}
         />
       ) : (
-        <EmptyState title="No findings" icon="check" />
+        <EmptyState
+          title={all ? 'No findings' : 'No findings above the gate'}
+          icon="check"
+          description={!all && below ? `${below} below the gate: turn on the switch above to see them.` : 'The reviewers reported nothing to fix.'}
+        />
       )}
-      {sel ? (
-        <Stack gap="xs">
-          <Text weight="semibold">
-            {sel.file}:{sel.start_line} [P{sel.priority}] conf {sel.confidence_score} · {sel.stage}
-          </Text>
-          <Markdown content={sel.body} />
-          <Checkbox
-            label="Send to the author"
-            checked={keys.includes(findingKey(sel))}
-            onChange={(on) => update(picked, (k) => (on ? [...k, findingKey(sel)] : k.filter((x) => x !== findingKey(sel))))}
-          />
-        </Stack>
-      ) : null}
-      <Row gap="sm" align="center" wrap>
+      {sel ? <Detail f={sel} r={r} res={res} /> : null}
+      <Row gap="sm" align="end" wrap>
         <Select
           label="Author agent (in the reviewed workspace)"
           placeholder={read(agents).length ? 'Choose the author agent' : 'No agent in the reviewed workspace'}
@@ -401,6 +496,13 @@ function Findings({ r }: { r: Run }) {
           {`Send ${keys.length} to author`}
         </Button>
       </Row>
+      {s?.token === r.token ? (
+        <Callout tone="success" icon="check" title={`Sent ${s.sent} finding${s.sent === 1 ? '' : 's'} to ${s.to}`}>
+          <Text size="xs" muted>
+            The agent was asked to read <Code>{s.file}</Code>
+          </Text>
+        </Callout>
+      ) : null}
     </Stack>
   )
 }
@@ -413,7 +515,15 @@ export default function Panel() {
       <Header />
       <Controls />
       {n ? <Callout tone={n.tone}>{n.text}</Callout> : null}
-      {r ? <Status r={r} /> : null}
+      {r ? (
+        <Status r={r} />
+      ) : read(target)?.pr ? (
+        <EmptyState
+          icon="search"
+          title="No review yet"
+          description="Run review starts three lenses, a coordinator and, when it drops findings, a judge on this PR. Each pass shows here while it runs, then the findings by file."
+        />
+      ) : null}
       {r ? <Findings r={r} /> : null}
     </Stack>
   )
