@@ -20,8 +20,6 @@ use serde_json::Value;
 use crate::launch::{self, Launch, TimedOut};
 use crate::runner::{Agent, Pass, REPLY, Runner, model_args};
 
-/// Sent when a reviewer went idle without writing its reply file.
-const NUDGE: &str = "You stopped without writing the reply file. Write the JSON object described in the first message to the reply file now.";
 /// A reply larger than this is not a panelist envelope; reading stops there.
 const MAX_REPLY: u64 = 4 << 20;
 /// Bounds for Orca calls outside a pass's budget: worktree setup (also within the review's
@@ -63,6 +61,17 @@ fn main_checkout(git_common_dir: &Path) -> &Path {
         Some(n) if n == ".git" => git_common_dir.parent().unwrap_or(git_common_dir),
         _ => git_common_dir,
     }
+}
+
+/// Orca knows the worktree the caller's working dir is in; `rreview doctor` opens its
+/// terminals there.
+pub fn check_current_worktree() -> Result<()> {
+    orca(
+        &["worktree", "show", "--worktree", "current"],
+        Instant::now().checked_add(CLOSE),
+    )
+    .context("run `rreview doctor --runner orca` from a directory of an Orca worktree")
+    .map(drop)
 }
 
 /// The Codex TUI starts in `<runroot>/out`; inside a git checkout it stops at its trust prompt,
@@ -225,7 +234,18 @@ pub struct Orca {
     git_common_dir: PathBuf,
     runroot: PathBuf,
     codex_auth: PathBuf,
+    /// The Orca worktree selector the terminals open in.
+    terminal_worktree: String,
+    /// Appended to every terminal title, `rreview:<role>:<tag>`; empty for a review.
+    title_tag: String,
+    /// Added to every launch's env.
+    env: Vec<(String, String)>,
+    /// What the reviewer writes to its reply file, as the delivery instruction names it.
+    reply_as: String,
     terminals: Mutex<HashMap<String, Term>>,
+    /// Handles a later terminal of the same role replaced while still registered (a close that
+    /// failed); `Drop` closes them too.
+    replaced: Mutex<Vec<String>>,
 }
 
 impl Orca {
@@ -236,29 +256,85 @@ impl Orca {
         codex_auth: PathBuf,
     ) -> Self {
         Orca {
+            terminal_worktree: format!("path:{}", worktree.display()),
+            title_tag: String::new(),
             worktree,
             git_common_dir,
             runroot,
             codex_auth,
+            env: vec![],
+            reply_as: "the JSON object".into(),
             terminals: Mutex::default(),
+            replaced: Mutex::default(),
         }
     }
 
-    fn scratch(&self, pass: &Pass) -> PathBuf {
-        self.runroot.join("scratch").join(pass.role)
+    /// Terminals open in the Orca worktree `selector` instead of the review worktree, which
+    /// Orca need not track (`rreview doctor`'s throwaway repo); the agent still starts in the
+    /// review worktree (the shim enters it). Their titles end in `:<tag>`, unique to the run, so
+    /// a terminal whose create reply was lost can be found and closed: no teardown removes the
+    /// caller's worktree.
+    pub fn terminals_in(mut self, selector: &str, tag: &str) -> Self {
+        self.terminal_worktree = selector.into();
+        self.title_tag = format!(":{tag}");
+        self
+    }
+
+    fn title(&self, role: &str) -> String {
+        format!("rreview:{role}{}", self.title_tag)
+    }
+
+    /// Closes the terminals titled `title` in the terminals' worktree: a create whose reply was
+    /// lost may still have opened one. Best effort; a failure is a warning.
+    // limit: a create that opens its terminal only after this listing still leaves it open.
+    fn close_titled(&self, title: &str) {
+        let listed = orca(
+            &["terminal", "list", "--worktree", &self.terminal_worktree],
+            Instant::now().checked_add(CLOSE),
+        );
+        match listed {
+            Ok(v) => {
+                for t in v["terminals"].as_array().into_iter().flatten() {
+                    if t["title"] == title
+                        && let Some(handle) = t["handle"].as_str()
+                    {
+                        let _ = close(handle);
+                    }
+                }
+            }
+            Err(e) => eprintln!("warning: cannot list Orca terminals to close {title}: {e:#}"),
+        }
+    }
+
+    /// Sets `name=value` for every launch, over an inherited value.
+    pub fn with_env(mut self, name: &str, value: &str) -> Self {
+        self.env.push((name.into(), value.into()));
+        self
+    }
+
+    /// The reply is `what` instead of a JSON object (`rreview doctor`'s probe passes).
+    pub fn replying(mut self, what: &str) -> Self {
+        self.reply_as = what.into();
+        self
+    }
+
+    /// The pass's own dir, `<runroot>/scratch/<role>`.
+    pub fn scratch(&self, role: &str) -> PathBuf {
+        self.runroot.join("scratch").join(role)
     }
 
     fn reply(&self, pass: &Pass) -> PathBuf {
-        self.scratch(pass).join("out").join(REPLY)
+        self.scratch(pass.role).join("out").join(REPLY)
     }
 
     fn launch(&self, pass: &Pass) -> Result<Launch> {
-        let dir = self.scratch(pass);
+        let dir = self.scratch(pass.role);
         let mut launch = match pass.agent {
             Agent::Claude => launch::claude_tui(&self.worktree, &self.git_common_dir, &dir)?,
             Agent::Codex => launch::codex_tui(&self.worktree, &dir, &self.codex_auth)?,
         };
         launch.args.extend(model_args(pass));
+        launch.env.extend(self.env.iter().cloned());
         Ok(launch)
     }
 
@@ -268,7 +344,8 @@ impl Orca {
         let reply = self.reply(pass);
         let reply = reply.display();
         let mut m = format!(
-            "Delivery (from rreview, which runs this review; not part of the PR): write your final reply, only the JSON object, to the file `{reply}` with one shell command and a quoted heredoc: `cat > '{reply}' <<'RREVIEW_EOF'`, the JSON, then `RREVIEW_EOF`. Only that file is read, not your chat message.\n"
+            "Delivery (from rreview, which runs this review; not part of the PR): write your final reply, only {what}, to the file `{reply}` with one shell command and a quoted heredoc: `cat > '{reply}' <<'RREVIEW_EOF'`, then {what}, then `RREVIEW_EOF`. Only that file is read, not your chat message.\n",
+            what = self.reply_as
         );
         if pass.agent == Agent::Codex {
             m += &format!(
@@ -281,7 +358,15 @@ impl Orca {
 
     fn set(&self, role: &str, term: Term) {
         let mut map = self.terminals.lock().unwrap_or_else(|e| e.into_inner());
-        map.insert(role.to_string(), term);
+        let handle = term.handle.clone();
+        if let Some(old) = map.insert(role.to_string(), term)
+            && old.handle != handle
+        {
+            self.replaced
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push(old.handle);
+        }
     }
 
     /// Closes the pass's terminal; one whose close fails stays registered for `Drop` to retry.
@@ -324,7 +409,12 @@ impl Orca {
             },
         );
         let reply = self.reply(pass);
-        for text in [&*pass.prompt, NUDGE] {
+        // Sent when the reviewer went idle without writing its reply file.
+        let nudge = format!(
+            "You stopped without writing the reply file. Write {} described in the first message to the reply file now.",
+            self.reply_as
+        );
+        for text in [&*pass.prompt, &nudge] {
             send(handle, pass.agent, &self.message(pass, text), deadline)?;
             match wait(handle, deadline)? {
                 Wait::Idle => {}
@@ -356,24 +446,32 @@ impl Runner for Orca {
         // limit: the shim runs this executable by path; replacing it mid-run (a rebuild) breaks
         // the later launches of the run.
         let exe = std::env::current_exe().context("cannot find the rreview executable")?;
-        let command = shell_line(&self.launch(pass)?, &self.scratch(pass).join("bin"), &exe)?;
-        let v = orca(
+        let command = shell_line(
+            &self.launch(pass)?,
+            &self.scratch(pass.role).join("bin"),
+            &exe,
+        )?;
+        let title = self.title(pass.role);
+        let handle = orca(
             &[
                 "terminal",
                 "create",
                 "--worktree",
-                &format!("path:{}", launch::utf8(&self.worktree)?),
+                &self.terminal_worktree,
                 "--title",
-                &format!("rreview:{}", pass.role),
+                &title,
                 "--command",
                 &command,
             ],
             deadline,
-        )?;
-        let handle = v["terminal"]["handle"]
-            .as_str()
-            .context("orca terminal create: no handle")?
-            .to_string();
+        )
+        .and_then(|v| {
+            v["terminal"]["handle"]
+                .as_str()
+                .map(String::from)
+                .context("orca terminal create: no handle")
+        })
+        .inspect_err(|_| self.close_titled(&title))?;
         // Registered before anything else can fail, so `Drop` closes it at the latest.
         self.set(
             pass.role,
@@ -451,10 +549,12 @@ impl Runner for Orca {
 impl Drop for Orca {
     fn drop(&mut self) {
         let map = self.terminals.get_mut().unwrap_or_else(|e| e.into_inner());
-        for (_, term) in map.drain() {
+        let replaced = self.replaced.get_mut().unwrap_or_else(|e| e.into_inner());
+        let handles = map.drain().map(|(_, t)| t.handle).chain(replaced.drain(..));
+        for handle in handles {
             // One retry: a close can fail while Orca's runtime is briefly unavailable.
-            if close(&term.handle).is_err() && close(&term.handle).is_err() {
-                eprintln!("warning: Orca terminal {} is still open", term.handle);
+            if close(&handle).is_err() && close(&handle).is_err() {
+                eprintln!("warning: Orca terminal {handle} is still open");
             }
         }
     }
@@ -592,7 +692,8 @@ fn printable(text: &str) -> String {
 /// Orca types `--command` into the terminal's login shell, whose environment is Orca's and the
 /// shell's own, not rreview's. So the agent starts through a shim, `<bin>/<program>`, that hands
 /// it to `<exe> exec-reviewer` (this binary): that builds the environment from nothing at the
-/// last exec (spec §3), each inherited variable that is set plus the launch's own env. Nothing
+/// last exec (spec §3), each inherited variable that is set plus the launch's own env, in the
+/// launch's working dir (the terminal starts in the Orca worktree it opened in). Nothing
 /// the shell holds can slip past it: a read-only export, a name that is no identifier, an
 /// exported function. Only names go into an argv, never an inherited value. The line is
 /// `PATH='<bin>':"$PATH" exec 'program' 'arg' ...`, every word single-quoted, no value on it
@@ -626,8 +727,9 @@ fn shell_line(launch: &Launch, bin: &Path, exe: &Path) -> Result<String> {
     let bin_q = quote(launch::utf8(&bin)?)?;
     let mut shim = format!(
         "#!/bin/sh\n# rreview: {} with only the variables it inherits (spec §3).\n\
-         PATH=${{PATH#{bin_q}:}}\nexec {} exec-reviewer",
+         PATH=${{PATH#{bin_q}:}}\ncd {} || exit 1\nexec {} exec-reviewer",
         launch.program,
+        quote(launch::utf8(&launch.cwd)?)?,
         quote(launch::utf8(exe)?)?
     );
     for k in &launch.inherit {
@@ -777,6 +879,7 @@ mod tests {
             format!(
                 "#!/bin/sh\n# rreview: codex with only the variables it inherits (spec §3).\n\
                  PATH=${{PATH#'{}/it{q}s bin':}}\n\
+                 cd '/' || exit 1\n\
                  exec '/opt/it{q}s/rreview' exec-reviewer --inherit PATH --inherit LC_ALL \
                  --set 'CODEX_HOME=/h $x' -- 'codex' \"$@\"\n",
                 root.display()

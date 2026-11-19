@@ -28,10 +28,17 @@
 #   no-ok           `terminal create` exits 0 with "ok": false
 #   refused         `terminal send` of a prompt answers "accepted": false
 #   blocked         after the prompt the agent waits on a permission dialog
+#   lost-create     `terminal create` opens the terminal, then fails without JSON
+#   no-handle       `terminal create` opens the terminal, then answers ok without a handle
+#   play            the agent plays each prompt itself: the terminal's launch line runs again
+#                   with the prompt on stdin (through rreview's shim), and the fake agent writes
+#                   its own reply (`rreview doctor --runner orca`)
 # FAKE_ORCA_SEND_DELAY: seconds every prompt send takes; FAKE_ORCA_CREATE_DELAY: seconds before
 # `worktree create` starts; FAKE_ORCA_WAIT_DELAY: seconds every `terminal wait` after a prompt
 # takes before it answers. FAKE_ORCA_CLOSE=fail-once: the first `terminal close` fails with
-# runtime_unavailable. FAKE_ORCA_STATUS: `down` reports the app not running, `hang` never answers.
+# runtime_unavailable. FAKE_ORCA_HANDLES=numbered: each create of a title gets its own handle,
+# `term_<role>~<n>`, logged as `created <handle>`; every successful close is logged as
+# `closed <handle>`. FAKE_ORCA_STATUS: `down` reports the app not running, `hang` never answers.
 # FAKE_ORCA_REPO=missing: `repo show` answers repo_not_found, as a runtime without this checkout.
 line=orca; for a; do line="$line $a"; done
 printf '%s\n' "$line" >> "${FAKE_LOG:-/dev/null}"
@@ -46,10 +53,12 @@ timeout() {
   sleep "$(awk "BEGIN { print $(arg --timeout-ms "$@") / 1000 }")"
   echo '{"ok":false,"error":{"code":"timeout","message":"timeout"}}'; exit 1
 }
-role=$(arg --terminal "$@"); role=${role#term_}
+handle=$(arg --terminal "$@"); role=${handle#term_}; role=${role%~*}
 state="$FAKE_LOG.orca-$role"
 sent() { grep -c '^sent' "$state" 2> /dev/null || echo 0; }
 case "$1 $2" in
+"--version ") echo "orca 9.9.9"; exit 0 ;;
+"worktree show") ok "{\"worktree\":{\"path\":\"$PWD\"}}" ;;
 "status --json")
   case "$FAKE_ORCA_STATUS" in
   down) ok '{"app":{"running":false},"runtime":{"reachable":false}}' ;;
@@ -73,9 +82,11 @@ case "$1 $2" in
   ok '{"removed":true}' ;;
 "terminal create")
   [ "$scenario" = no-ok ] && { echo '{"ok":false,"error":{"code":"boom","message":"no terminal"}}'; exit 0; }
-  role=$(arg --title "$@"); role=${role#rreview:}
+  title=$(arg --title "$@"); role=${title#rreview:}
   echo open >> "$FAKE_LOG.orca-$role"
+  printf '%s' "$title" > "$FAKE_LOG.orca-$role.title"
   cmd=$(arg --command "$@")
+  printf '%s' "$cmd" > "$FAKE_LOG.orca-$role.cmd"
   case "$cmd" in *"'claude'"*) agent=claude ;; *) agent=codex ;; esac
   echo "agent $agent" >> "$FAKE_LOG.orca-$role"
   # Like Orca, paste to the agent only when it is exec's first word, not behind `env` or a path.
@@ -99,12 +110,26 @@ case "$1 $2" in
   else
     echo launched >> "$FAKE_LOG.orca-$role"
   fi
-  ok "{\"terminal\":{\"handle\":\"term_$role\"}}" ;;
+  [ "$scenario" = lost-create ] && { echo "transport closed" >&2; exit 1; }
+  [ "$scenario" = no-handle ] && ok '{"terminal":{}}'
+  handle=term_$role
+  [ "$FAKE_ORCA_HANDLES" = numbered ] && handle="$handle~$(grep -c '^open$' "$FAKE_LOG.orca-$role")"
+  echo "created $handle" >> "${FAKE_LOG:-/dev/null}"
+  ok "{\"terminal\":{\"handle\":\"$handle\"}}" ;;
+"terminal list")
+  rows=
+  for f in "$FAKE_LOG".orca-*.title; do
+    [ -f "$f" ] || continue
+    r=${f#"$FAKE_LOG.orca-"}; r=${r%.title}
+    [ "$(grep -E '^(open|closed)$' "$FAKE_LOG.orca-$r" | tail -n 1)" = closed ] && continue
+    rows="$rows${rows:+,}{\"handle\":\"term_$r\",\"title\":\"$(cat "$f")\"}"
+  done
+  ok "{\"terminals\":[$rows]}" ;;
 "terminal show")
   echo show >> "$state"
   # The agent is up once its launch line ran; give it up to 5 s.
   i=0; while ! grep -q '^launched' "$state" && [ $i -lt 100 ]; do sleep 0.05; i=$((i + 1)); done
-  agent=$(sed -n 's/^agent //p' "$state")
+  agent=$(sed -n 's/^agent //p' "$state" | tail -n 1)
   grep -q '^launched' "$state" || agent=
   case "$scenario" in
   no-agent) agent= ;;
@@ -118,6 +143,7 @@ case "$1 $2" in
     echo '{"ok":false,"error":{"code":"runtime_unavailable","message":"runtime_unavailable"}}'; exit 1
   fi
   echo closed >> "$state"
+  echo "closed $handle" >> "${FAKE_LOG:-/dev/null}"
   ok '{"close":{"ptyKilled":true}}' ;;
 "terminal send")
   text=$(arg --text "$@")
@@ -131,6 +157,11 @@ case "$1 $2" in
   printf '%s\n---\n' "$text" >> "$FAKE_LOG.prompt.$role"
   echo sent >> "$state"
   n=$(sent)
+  if [ "$scenario" = play ]; then
+    # From another dir, as the terminal opens in another worktree: the shim must enter its own.
+    (cd / && printf '%s' "$text" | sh -c "$(cat "$state.cmd")") > /dev/null \
+      2>> "$FAKE_LOG.orca-shell" || echo "turn failed: $?" >> "$FAKE_LOG.orca-shell"
+  fi
   write=no
   case "$scenario" in
   ok | trust | foreign-branch | slow-agent) write=yes ;;
@@ -144,7 +175,7 @@ case "$1 $2" in
     printf '%s' "$text" | grep -o '/[^`'"'"' ]*/reply\.txt' | head -n 1 > "$state.path"
   fi
   if grep -q agent-up "$state" && ! grep -q raw-launch "$state"; then
-    provider=$(sed -n 's/^agent //p' "$state")
+    provider=$(sed -n 's/^agent //p' "$state" | tail -n 1)
   else
     provider=unsupported
   fi

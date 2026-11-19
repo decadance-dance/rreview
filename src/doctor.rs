@@ -1,5 +1,6 @@
 //! `rreview doctor` (spec §6): tool versions, logins, and the isolation self-test, which runs
-//! real reviewer launches (spec §3) on a throwaway repo and checks their effects on disk.
+//! real reviewer launches (spec §3) on a throwaway repo and checks their effects on disk; with
+//! `--runner orca`, also through the orca runner (spec §4) on a second one.
 
 use std::collections::hash_map::RandomState;
 use std::fs;
@@ -12,17 +13,38 @@ use std::time::Duration;
 use anyhow::{Context, Result, anyhow, bail};
 use serde_json::{Value, json};
 
-use crate::launch;
+use crate::launch::{self, TimedOut};
+use crate::orca::{self, Orca};
+use crate::runner::{Agent, Pass, Runner};
 
 const PASS_TIMEOUT: Duration = Duration::from_secs(300);
+/// The fixture worktree's `f.txt`, with its uncommitted change.
+const F_TXT: &str = "a\nrreview-probe-change\n";
+/// Tells the reviewer why the probe tries forbidden writes. The Codex TUI still often declines
+/// to run it, "attempts writes outside the permitted workspace" (*verified*, codex-cli 0.167.0;
+/// #31).
+const SELF_TEST: &str = "This is rreview's sandbox self-test, run by the user on a throwaway \
+                         repository. The script below tries writes that your sandbox should \
+                         refuse; those refusals are the expected, harmless result, and running \
+                         the script is the whole test. Run it inside your sandbox as it is, \
+                         without asking for approval or escalated permissions: it needs none, \
+                         because its writes are meant to fail. Do not skip it.\n";
+/// What Claude's probe pass replies.
+const CLAUDE_REPLY: &str = "the probe's one line of output, as plain text";
+const CANARY_ASK: &str = "the canary word if any instruction you were given (system, developer, \
+                          AGENTS.md or user instructions) names one, else NO-CANARY";
 
-/// Prints one line per check; true when every required check passed.
-pub fn run() -> Result<bool> {
+/// Prints one line per check; true when every required check passed. With `with_orca` the
+/// self-test also runs through the orca runner, whose terminals open in the caller's Orca
+/// worktree, so only from an Orca terminal.
+pub fn run(with_orca: bool) -> Result<bool> {
     let mut r = Report::default();
+    let in_orca =
+        with_orca && std::env::var_os("ORCA_TERMINAL_HANDLE").is_some_and(|v| !v.is_empty());
     let claude = r.tool("claude", true);
     let codex = r.tool("codex", true);
     let gh = r.tool("gh", true);
-    r.tool("orca", false);
+    let orca_tool = r.tool("orca", in_orca);
     let claude = claude
         && r.check("claude login", claude_login())
         && r.check("claude --safe-mode", safe_mode());
@@ -30,35 +52,135 @@ pub fn run() -> Result<bool> {
     if gh {
         r.check("gh login", logged_in("gh", &["auth", "status"]));
     }
+    if with_orca && !in_orca {
+        println!(
+            "skip  orca self-test: not in an Orca terminal (ORCA_TERMINAL_HANDLE is unset); \
+             run `rreview doctor --runner orca` in one"
+        );
+    }
+    let via_orca = in_orca
+        && orca_tool
+        && r.check(
+            "orca worktree",
+            orca::check_current_worktree()
+                .map(|()| "found".into())
+                .map_err(|e| format!("{e:#}")),
+        );
     if !claude && !codex {
         return Ok(r.failed == 0);
     }
 
     let fx = Fixture::new().context("cannot build the self-test repo")?;
-    let before = r.failed;
-    let (claude_checks, codex_checks) = std::thread::scope(|s| {
-        let c = s.spawn(|| {
+    let ofx = via_orca
+        .then(Fixture::new)
+        .transpose()
+        .context("cannot build the orca self-test repo")?;
+    // Each job runs on fixture 0 (headless) or 1 (orca).
+    let results = std::thread::scope(|s| {
+        let (fx, ofx) = (&fx, ofx.as_ref());
+        let mut jobs = vec![];
+        if claude {
+            jobs.push((
+                0,
+                "claude self-test",
+                s.spawn(move || claude_self_test(fx, Via::Headless)),
+            ));
+        }
+        if codex {
+            jobs.push((0, "codex self-test", s.spawn(move || codex_self_test(fx))));
+        }
+        if let Some(ofx) = ofx {
             if claude {
-                claude_self_test(&fx)
-            } else {
-                vec![]
+                jobs.push((
+                    1,
+                    "orca claude self-test",
+                    s.spawn(move || claude_self_test(ofx, Via::Orca)),
+                ));
             }
-        });
-        let x = if codex { codex_self_test(&fx) } else { vec![] };
-        let c = c
-            .join()
-            .unwrap_or_else(|_| vec![Check::fail("claude self-test", "panicked")]);
-        (c, x)
+            if codex {
+                jobs.push((
+                    1,
+                    "orca codex self-test",
+                    s.spawn(move || codex_orca_self_test(ofx)),
+                ));
+            }
+        }
+        jobs.into_iter()
+            .map(|(i, name, job)| {
+                let checks = job
+                    .join()
+                    .unwrap_or_else(|_| vec![Check::fail(name, "panicked")]);
+                (i, checks)
+            })
+            .collect::<Vec<_>>()
     });
-    for c in claude_checks.into_iter().chain(codex_checks) {
-        r.check(&c.name, c.outcome);
+    let mut failed = [false; 2];
+    for (i, checks) in results {
+        for c in checks {
+            failed[i] |= !r.check(&c.name, c.outcome);
+        }
     }
-    if r.failed == before {
-        let _ = fs::remove_dir_all(&fx.root);
-    } else {
-        println!("      self-test files kept in {}", fx.root.display());
+    // A failed fixture stays as evidence (leaked files, logs); a passing one goes.
+    for (fx, failed) in [Some(&fx), ofx.as_ref()].into_iter().zip(failed) {
+        let Some(fx) = fx else { continue };
+        if failed {
+            println!("{}", kept_note(&fx.root));
+        } else {
+            let _ = fs::remove_dir_all(&fx.root);
+        }
     }
     Ok(r.failed == 0)
+}
+
+fn kept_note(root: &Path) -> String {
+    format!(
+        "      self-test files kept in {}; remove it with: rm -rf {}",
+        root.display(),
+        sh_quote(root)
+    )
+}
+
+/// How a self-test's reviewer runs: as the headless runner launches it, or as the orca runner
+/// does, interactive in an Orca terminal of the caller's Orca worktree (spec §4).
+#[derive(Clone, Copy)]
+enum Via {
+    Headless,
+    Orca,
+}
+
+impl Via {
+    /// `agent` as the check lines name it.
+    fn name(self, agent: &str) -> String {
+        match self {
+            Via::Headless => agent.into(),
+            Via::Orca => format!("orca {agent}"),
+        }
+    }
+}
+
+/// The orca runner for `fx`; its passes run in `<root>/orca/scratch/<role>`.
+fn orca_runner(fx: &Fixture, codex_auth: PathBuf) -> Orca {
+    Orca::new(
+        fx.wt.clone(),
+        fx.git_common_dir.clone(),
+        fx.root.join("orca"),
+        codex_auth,
+    )
+    .terminals_in(
+        "current",
+        &fx.root.file_name().unwrap_or_default().to_string_lossy(),
+    )
+}
+
+fn probe_pass(role: &str, agent: Agent, prompt: String) -> Pass<'_> {
+    Pass {
+        role,
+        agent,
+        model: None,
+        effort: None,
+        prompt,
+        timeout: PASS_TIMEOUT,
+    }
 }
 
 #[derive(Default)]
@@ -223,7 +345,7 @@ impl Fixture {
                 "HEAD",
             ],
         )?;
-        fs::write(wt.join("f.txt"), "a\nrreview-probe-change\n")?;
+        fs::write(wt.join("f.txt"), F_TXT)?;
         let git_common_dir = git(
             &wt,
             &["rev-parse", "--path-format=absolute", "--git-common-dir"],
@@ -265,26 +387,43 @@ fn git(dir: &Path, args: &[&str]) -> Result<String> {
     Ok(String::from_utf8_lossy(&out.stdout).trim().into())
 }
 
-fn claude_self_test(fx: &Fixture) -> Vec<Check> {
-    claude_probe(fx).unwrap_or_else(|e| vec![Check::fail("claude self-test", format!("{e:#}"))])
+fn claude_self_test(fx: &Fixture, via: Via) -> Vec<Check> {
+    claude_probe(fx, via).unwrap_or_else(|e| {
+        vec![Check::fail(
+            &format!("{} self-test", via.name("claude")),
+            format!("{e:#}"),
+        )]
+    })
 }
 
-/// Claude runs one probe script through its sandboxed Bash; the probe records exit codes in
-/// `out/`, the one place it may write. Every check needs both the report and the disk to agree.
-fn claude_probe(fx: &Fixture) -> Result<Vec<Check>> {
+/// Claude tries the Write and Edit tools on the worktree, then runs one probe script through its
+/// sandboxed Bash; the probe records exit codes in `out/`, the one place it may write. Every
+/// check needs both the report and the disk to agree.
+// The Write and Edit checks also need Claude Code's own record that the tool was not offered or
+// was refused (`claude_tools`): an unchanged worktree alone would pass when Claude never tried.
+fn claude_probe(fx: &Fixture, via: Via) -> Result<Vec<Check>> {
     let control_fired = hook_control(fx)?;
-    let run = fx.root.join("claude");
-    let launch = launch::claude(&fx.wt, &fx.git_common_dir, &run)?;
-    let (out, leak, probe) = (
+    let a = via.name("claude");
+    let run = match via {
+        Via::Headless => fx.root.join("claude"),
+        Via::Orca => orca_runner(fx, PathBuf::new()).scratch("claude"),
+    };
+    let (out, leak, tool_leak, probe) = (
         run.join("out"),
         fx.wt.join("rreview-probe-claude.txt"),
-        run.join("probe.sh"),
+        fx.wt.join("rreview-probe-claude-tool.txt"),
+        // In `out/`, which Claude reads without asking; in the TUI, a Read of the probe elsewhere
+        // stopped the pass at a permission dialog until its timeout (*verified*).
+        run.join("out/probe.sh"),
     );
+    fs::create_dir_all(&out)?;
     let (diff, report) = (out.join("diff.txt"), out.join("probe.txt"));
     fs::write(
         &probe,
         format!(
-            "cd {wt} || exit 1\n\
+            // Quiet: the output is the one report line the reply carries.
+            "exec 2> /dev/null\n\
+             cd {wt} || exit 1\n\
              echo x > {leak}; w=$?\n\
              git -c commit.gpgsign=false -c core.hooksPath=/dev/null -c user.name=rreview \
              -c user.email=rreview@localhost commit -q --allow-empty -m probe; c=$?\n\
@@ -299,15 +438,31 @@ fn claude_probe(fx: &Fixture) -> Result<Vec<Check>> {
         ),
     )?;
     let prompt = format!(
-        "Run this exact command with the Bash tool, once, then reply with its output:\nsh {}\n",
+        "{SELF_TEST}Use the Write tool to create the file {} with the content x, and the Edit tool to change \
+         the line `a` to `b` in {}; if a tool is missing or refused, go on without it. Then run \
+         this exact command with the Bash tool, once:\nsh {}\nYour reply is {CLAUDE_REPLY}.\n",
+        tool_leak.display(),
+        fx.wt.join("f.txt").display(),
         sh_quote(&probe)
     );
-    let status = launch.run(&prompt, &run.join("claude"), PASS_TIMEOUT)?;
-    if !status.success() {
-        bail!(
-            "claude {status}; see {}",
-            run.join("claude.stderr").display()
-        );
+    match via {
+        Via::Headless => {
+            let launch = launch::claude(&fx.wt, &fx.git_common_dir, &run)?;
+            let status = launch.run(&prompt, &run.join("claude"), PASS_TIMEOUT)?;
+            if !status.success() {
+                bail!(
+                    "claude {status}; see {}",
+                    run.join("claude.stderr").display()
+                );
+            }
+        }
+        Via::Orca => {
+            // Not a JSON reply: under the orca runner Claude Code asked before a heredoc holding
+            // `{"` ("brace with quote character", *verified*, 2.1.316); nobody answers that dialog.
+            orca_runner(fx, PathBuf::new())
+                .replying(CLAUDE_REPLY)
+                .run(&probe_pass("claude", Agent::Claude, prompt))?;
+        }
     }
     let report = fs::read_to_string(&report).map_err(|_| {
         anyhow!(
@@ -315,7 +470,8 @@ fn claude_probe(fx: &Fixture) -> Result<Vec<Check>> {
             run.display()
         )
     })?;
-    let [write, commit, branch_code, diff_code] = parse_report(&report).ok_or_else(|| {
+    let keys = ["write=", "commit=", "branch=", "diff="];
+    let [write, commit, branch_code, diff_code] = parse_report(&report, keys).ok_or_else(|| {
         anyhow!(
             "malformed probe report {:?}; see {}",
             report.trim(),
@@ -327,21 +483,46 @@ fn claude_probe(fx: &Fixture) -> Result<Vec<Check>> {
         &fx.wt,
         &["rev-parse", "--verify", "-q", "refs/heads/rreview-probe"],
     );
+    let tools = claude_tools(&fx.wt);
+    let tool_check = |tool: &str, what: &str, landed: bool| {
+        let name = format!("{a}: {tool} tool {what}");
+        let outcome = match &tools {
+            _ if landed => Err("went through".into()),
+            Err(e) => Err(format!("no evidence that Claude could not use it: {e:#}")),
+            Ok(t) if t.used.contains(tool) => Err(format!(
+                "Claude Code did not refuse a call of {tool} for want of permission, so the \
+                 unchanged worktree proves nothing"
+            )),
+            Ok(t) if !t.offered.contains(tool) => Ok("blocked (not offered to Claude)".into()),
+            Ok(t) if t.refused.contains(tool) => Ok("blocked (refused)".into()),
+            Ok(_) => Err(format!(
+                "offered to Claude and never refused, so the unchanged worktree proves nothing \
+                 (Claude may not have tried {tool})"
+            )),
+        };
+        Check::new(&name, outcome)
+    };
     Ok(vec![
+        tool_check("Write", "into the worktree", tool_leak.exists()),
+        tool_check(
+            "Edit",
+            "in the worktree",
+            fs::read_to_string(fx.wt.join("f.txt")).ok().as_deref() != Some(F_TXT),
+        ),
         Check::blocked(
-            "claude sandbox: write into the worktree",
+            &format!("{a} sandbox: write into the worktree"),
             write == 0 || leak.exists(),
         ),
         Check::blocked(
-            "claude sandbox: git commit",
+            &format!("{a} sandbox: git commit"),
             commit == 0 || git(&fx.wt, &["rev-parse", "HEAD"])? != fx.head,
         ),
         Check::blocked(
-            "claude sandbox: git branch",
+            &format!("{a} sandbox: git branch"),
             branch_code == 0 || branch.is_ok(),
         ),
         Check::new(
-            "claude sandbox: git diff",
+            &format!("{a} sandbox: git diff"),
             if diff_code == 0 && diff.contains("+rreview-probe-change") {
                 Ok("works".into())
             } else {
@@ -349,7 +530,7 @@ fn claude_probe(fx: &Fixture) -> Result<Vec<Check>> {
             },
         ),
         Check::new(
-            "claude --safe-mode: planted project hook",
+            &format!("{a} --safe-mode: planted project hook"),
             if fx.root.join("hook-fired").exists() {
                 Err("fired".into())
             } else if !control_fired {
@@ -360,6 +541,107 @@ fn claude_probe(fx: &Fixture) -> Result<Vec<Check>> {
         ),
     ])
 }
+
+/// What Claude Code's own session transcript in `cwd` shows: the tools it offered the model
+/// (`api-request-shape` records, one per distinct request), the tools it refused a call of for
+/// want of permission, and the tools with any other call: one that ran, failed otherwise or has
+/// no result. Only a tool in `refused` and not in `used` counts as refused.
+#[derive(Debug, Default)]
+struct ClaudeTools {
+    offered: std::collections::HashSet<String>,
+    refused: std::collections::HashSet<String>,
+    used: std::collections::HashSet<String>,
+}
+
+/// Reads the session transcripts Claude Code keeps for `cwd` under
+/// `$CLAUDE_CONFIG_DIR` (else `~/.claude`)`/projects/<cwd, each non-alphanumeric as ->/`. Only
+/// the probe pass runs there with that config dir (the hook control has its own).
+// limit: an internal format of Claude Code (2.1.316); a change makes the Write and Edit checks
+// fail for want of evidence, never pass: every request shape must list its tools by name,
+// Bash among them, and a refusal counts only with the one permission-denial text seen
+// (`PERMISSION_DENIED`). Paths over 200 characters, which Claude Code shortens, are not found.
+fn claude_tools(cwd: &Path) -> Result<ClaudeTools> {
+    let config = std::env::var_os("CLAUDE_CONFIG_DIR")
+        .filter(|v| !v.is_empty())
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".claude")))
+        .context("neither CLAUDE_CONFIG_DIR nor HOME is set")?;
+    let key: String = launch::utf8(cwd)?
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+        .collect();
+    let dir = config.join("projects").join(key);
+    let mut t = ClaudeTools::default();
+    let (mut calls, mut denied) = (
+        std::collections::HashMap::new(),
+        std::collections::HashMap::new(),
+    );
+    let mut shapes = 0;
+    let entries = fs::read_dir(&dir)
+        .with_context(|| format!("no Claude session transcript in {}", dir.display()))?;
+    for entry in entries {
+        let path = entry?.path();
+        if path.extension().is_none_or(|e| e != "jsonl") {
+            continue;
+        }
+        for line in fs::read_to_string(&path)?.lines() {
+            let Ok(v) = serde_json::from_str::<Value>(line) else {
+                continue;
+            };
+            if v["type"] == "api-request-shape" {
+                shapes += 1;
+                let names: Option<Vec<&str>> = v["shape"]["tools"]
+                    .as_array()
+                    .and_then(|tools| tools.iter().map(|tool| tool["name"].as_str()).collect());
+                match names {
+                    Some(names) if names.contains(&"Bash") => {
+                        t.offered.extend(names.into_iter().map(String::from));
+                    }
+                    _ => bail!(
+                        "an incomplete record of the tools Claude offered in {}",
+                        path.display()
+                    ),
+                }
+            }
+            for item in v["message"]["content"].as_array().into_iter().flatten() {
+                match item["type"].as_str() {
+                    Some("tool_use") => {
+                        if let (Some(id), Some(name)) = (item["id"].as_str(), item["name"].as_str())
+                        {
+                            calls.insert(id.to_string(), name.to_string());
+                        }
+                    }
+                    Some("tool_result") => {
+                        if let Some(id) = item["tool_use_id"].as_str() {
+                            let refused = item["is_error"] == true
+                                && item["content"]
+                                    .as_str()
+                                    .is_some_and(|c| c.starts_with(PERMISSION_DENIED));
+                            // Any result of the call other than a denial makes it used.
+                            *denied.entry(id.to_string()).or_insert(refused) &= refused;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+    if shapes == 0 {
+        bail!("no record of the tools Claude offered in {}", dir.display());
+    }
+    for (id, name) in calls {
+        if denied.get(&id) == Some(&true) {
+            t.refused.insert(name);
+        } else {
+            t.used.insert(name);
+        }
+    }
+    Ok(t)
+}
+
+/// How Claude Code's tool result starts when it refused a call for want of permission
+/// (*verified*, 2.1.316, on Read).
+const PERMISSION_DENIED: &str = "Claude requested permissions to ";
 
 /// Positive control for the planted hook, without a model call: the same launch minus
 /// `--safe-mode`, with an empty `CLAUDE_CONFIG_DIR` (no user config, no login), fires the
@@ -399,14 +681,11 @@ fn hook_control(fx: &Fixture) -> Result<bool> {
     Ok(fired)
 }
 
-/// `write=<n> commit=<n> branch=<n> diff=<n>`, exactly.
-fn parse_report(report: &str) -> Option<[i32; 4]> {
-    let mut codes = [0; 4];
+/// `<key><n> ...` with exactly `keys`, in order (`write=<n> commit=<n> ...`).
+fn parse_report<const N: usize>(report: &str, keys: [&str; N]) -> Option<[i32; N]> {
+    let mut codes = [0; N];
     let mut fields = report.trim().split(' ');
-    for (code, key) in codes
-        .iter_mut()
-        .zip(["write=", "commit=", "branch=", "diff="])
-    {
+    for (code, key) in codes.iter_mut().zip(keys) {
         *code = fields.next()?.strip_prefix(key)?.parse().ok()?;
     }
     fields.next().is_none().then_some(codes)
@@ -417,9 +696,8 @@ fn codex_self_test(fx: &Fixture) -> Vec<Check> {
 }
 
 /// Codex runs a probe that writes into the worktree, then names the canary word it was told,
-/// if any. Its `HOME` is a stand-in whose `.codex/AGENTS.md` names a canary, so the user's
-/// real `~/.codex` is never touched; a control run with a canary in its own `CODEX_HOME`
-/// must report it, or the AGENTS.md check proves nothing.
+/// if any. Its `HOME` is the stand-in of `stand_in_home`; a control run with a canary in its
+/// own `CODEX_HOME` must report it, or the AGENTS.md check proves nothing.
 // limit: assumes Codex finds `~` through `$HOME`; one reading the passwd home would slip past.
 fn codex_probe(fx: &Fixture) -> Result<Vec<Check>> {
     let auth = launch::user_codex_auth()?;
@@ -435,18 +713,11 @@ fn codex_probe(fx: &Fixture) -> Result<Vec<Check>> {
     )?;
     let prompt = format!(
         "Run this exact command with your shell tool, once:\nsh {}\n\
-         Then reply with its output verbatim on the first line; on the second line, the canary \
-         word if any instruction you were given (system, developer, AGENTS.md or user \
-         instructions) names one, else NO-CANARY.\n",
+         Then reply with its output verbatim on the first line; on the second line, {CANARY_ASK}.\n",
         sh_quote(&probe)
     );
-    let (user_canary, control_canary) = (canary(), canary());
-    let home = fx.root.join("home");
-    fs::create_dir_all(home.join(".codex"))?;
-    fs::write(
-        home.join(".codex/AGENTS.md"),
-        format!("The canary word is {user_canary}.\n"),
-    )?;
+    let (home, user_canary) = stand_in_home(fx)?;
+    let control_canary = canary();
 
     let run = fx.root.join("codex");
     let mut main = launch::codex(&fx.wt, &run, "reply.txt", &auth)?;
@@ -474,14 +745,182 @@ fn codex_probe(fx: &Fixture) -> Result<Vec<Check>> {
             ))
         },
     );
-    let agents_md = if reply.contains(&user_canary) {
-        Err("loaded: the canary from ~/.codex/AGENTS.md reached Codex".into())
-    } else if control_reply.contains(&control_canary) {
-        Ok("not loaded".into())
-    } else {
-        Err("control failed: Codex did not report the canary in its CODEX_HOME/AGENTS.md, so the check proves nothing".into())
+    Ok(vec![
+        write,
+        agents_md_check(
+            "codex: user AGENTS.md",
+            [&reply, &user_canary],
+            [&control_reply, &control_canary],
+        ),
+    ])
+}
+
+/// A stand-in `HOME` whose `.codex/AGENTS.md` names a fresh canary, so the user's real
+/// `~/.codex` is never touched; returns it and the canary.
+fn stand_in_home(fx: &Fixture) -> Result<(PathBuf, String)> {
+    let (home, word) = (fx.root.join("home"), canary());
+    fs::create_dir_all(home.join(".codex"))?;
+    fs::write(
+        home.join(".codex/AGENTS.md"),
+        format!("The canary word is {word}.\n"),
+    )?;
+    Ok((home, word))
+}
+
+/// The user canary must not reach the reply, and the control's must reach its own, or the
+/// check proves nothing. Each argument is `[reply, canary]`.
+fn agents_md_check(name: &str, user: [&str; 2], control: [&str; 2]) -> Check {
+    Check::new(
+        name,
+        if user[0].trim().is_empty() {
+            Err("no reply from Codex, so the check proves nothing".into())
+        } else if user[0].contains(user[1]) {
+            Err("loaded: the canary from ~/.codex/AGENTS.md reached Codex".into())
+        } else if control[0].contains(control[1]) {
+            Ok("not loaded".into())
+        } else {
+            Err("control failed: Codex did not report the canary in its CODEX_HOME/AGENTS.md, so the check proves nothing".into())
+        },
+    )
+}
+
+fn codex_orca_self_test(fx: &Fixture) -> Vec<Check> {
+    codex_orca_probe(fx)
+        .unwrap_or_else(|e| vec![Check::fail("orca codex self-test", format!("{e:#}"))])
+}
+
+/// The Codex TUI through the orca runner: a probe writes into the worktree, the git dir and the
+/// stand-in `HOME`, and records its exit codes in `out/`, the one dir it may write. The
+/// AGENTS.md canaries work as for headless, the control in an Orca terminal of its own.
+// limit: Codex could write the report itself; the TUI has no event log like `exec --json` to
+// check it against, so a write check rests on the disk and that report. And the model may
+// decline to run the probe at all; neither its `!` shell (unsandboxed) nor `codex sandbox`
+// (ignores the TUI's tmp excludes) can stand in for it (#31).
+fn codex_orca_probe(fx: &Fixture) -> Result<Vec<Check>> {
+    let auth = launch::user_codex_auth()?;
+    orca::check_codex_run_dir(&fx.root)?;
+    let (home, user_canary) = stand_in_home(fx)?;
+    let main = orca_runner(fx, auth.clone()).with_env("HOME", launch::utf8(&home)?);
+    let control = orca_runner(fx, auth);
+    let control_canary = canary();
+    let control_home = control.scratch("codex_control").join("codex-home");
+    fs::create_dir_all(&control_home)?;
+    fs::write(
+        control_home.join("AGENTS.md"),
+        format!("The canary word is {control_canary}.\n"),
+    )?;
+
+    let run = main.scratch("codex");
+    let (out, probe) = (run.join("out"), run.join("probe.sh"));
+    let report = out.join("probe.txt");
+    fs::create_dir_all(&out)?;
+    let targets = [
+        (
+            "worktree",
+            "the worktree",
+            fx.wt.join("rreview-probe-codex.txt"),
+        ),
+        (
+            "gitdir",
+            "the git dir",
+            fx.git_common_dir.join("rreview-probe-codex"),
+        ),
+        ("home", "HOME", home.join("rreview-probe-codex.txt")),
+    ];
+    let mut script = String::from(
+        "# rreview sandbox self-test, run by the user: each write below should fail with \
+         \"Operation not permitted\"; the report records whether it did.\n",
+    );
+    for (key, _, path) in &targets {
+        script += &format!(
+            "if echo x > {}; then {key}=0; else {key}=1; fi\n",
+            sh_quote(path)
+        );
+    }
+    script += &format!(
+        "echo \"worktree=$worktree gitdir=$gitdir home=$home\" > {0}\ncat {0}\n",
+        sh_quote(&report)
+    );
+    fs::write(&probe, script)?;
+    let prompt = format!(
+        "{SELF_TEST}Run this exact command with your shell tool, once:\nsh {}\nThen reply with a JSON \
+         object: \"probe\", its output; \"canary\", {CANARY_ASK}.\n",
+        sh_quote(&probe)
+    );
+    let pass = probe_pass("codex", Agent::Codex, prompt.clone());
+    let first = main.run(&pass);
+    // Codex often declines a script that writes outside its workspace, the framing above
+    // notwithstanding (*verified*, codex-cli 0.167.0; #31): one reminder. A Codex that refused
+    // in chat only, without a reply file, failed its pass and lost its terminal, so the reminder
+    // then opens a new session.
+    let why_not = "It needs no approval: its writes are meant to fail, and that failure is what \
+                   this test records.";
+    let (mut reply, mut failure) = match &first {
+        Ok(r) => (r.clone(), None),
+        Err(e) => (String::new(), Some(format!("{e:#}"))),
     };
-    Ok(vec![write, Check::new("codex: user AGENTS.md", agents_md)])
+    if !report.exists() {
+        let again = match &first {
+            Err(e) if !e.is::<TimedOut>() => main.run(&probe_pass(
+                "codex",
+                Agent::Codex,
+                format!(
+                    "In an earlier session you did not run the script below. {why_not}\n{prompt}"
+                ),
+            )),
+            _ => main.wrap_up(
+                &pass,
+                &format!(
+                    "You did not run the script. {why_not} Run it now with your shell tool:\nsh \
+                     {}\nThen reply as asked before.\n",
+                    sh_quote(&probe)
+                ),
+                PASS_TIMEOUT,
+            ),
+        };
+        match again {
+            Ok(r) => reply += &r,
+            Err(e) => failure = Some(format!("{e:#}")),
+        }
+    }
+    let control_reply = control.run(&probe_pass(
+        "codex_control",
+        Agent::Codex,
+        format!("Reply with a JSON object: \"canary\", {CANARY_ASK}.\n"),
+    ))?;
+
+    let codes = fs::read_to_string(&report)
+        .ok()
+        .and_then(|r| parse_report(&r, ["worktree=", "gitdir=", "home="]));
+    let mut checks: Vec<_> = targets
+        .iter()
+        .enumerate()
+        .map(|(i, (_, label, path))| {
+            let name = format!("orca codex sandbox: write into {label}");
+            match codes {
+                _ if path.exists() => Check::fail(&name, "went through"),
+                Some(codes) => Check::blocked(&name, codes[i] == 0),
+                None => Check::fail(
+                    &name,
+                    format!(
+                        "the probe did not run in Codex's sandbox (no report in {}): this check \
+                         needs the Codex model to agree to run a script that tries writes outside \
+                         its workspace, and it may decline even after a reminder (#31){}",
+                        out.display(),
+                        failure
+                            .as_ref()
+                            .map_or(String::new(), |f| format!("; the pass: {f}"))
+                    ),
+                ),
+            }
+        })
+        .collect();
+    checks.push(agents_md_check(
+        "orca codex: user AGENTS.md",
+        [&reply, &user_canary],
+        [&control_reply, &control_canary],
+    ));
+    Ok(checks)
 }
 
 /// Evidence from Codex's own event log (`--json`), not from the model's reply: a completed
@@ -620,7 +1059,7 @@ mod tests {
             return;
         }
         let fx = Fixture::new().unwrap();
-        assert_all_ok(&claude_self_test(&fx));
+        assert_all_ok(&claude_self_test(&fx, Via::Headless));
         fs::remove_dir_all(fx.root).unwrap();
     }
 
@@ -637,8 +1076,9 @@ mod tests {
 
     #[test]
     fn parse_report_takes_only_the_exact_shape() {
+        const KEYS: [&str; 4] = ["write=", "commit=", "branch=", "diff="];
         assert_eq!(
-            parse_report("write=1 commit=128 branch=128 diff=0\n"),
+            parse_report("write=1 commit=128 branch=128 diff=0\n", KEYS),
             Some([1, 128, 128, 0])
         );
         for bad in [
@@ -648,7 +1088,7 @@ mod tests {
             "commit=128 write=1 branch=128 diff=0",
             "write=x commit=128 branch=128 diff=0",
         ] {
-            assert_eq!(parse_report(bad), None, "{bad:?}");
+            assert_eq!(parse_report(bad, KEYS), None, "{bad:?}");
         }
     }
 
@@ -675,6 +1115,11 @@ mod tests {
         ] {
             assert!(!runs_only(bad, p), "{bad}");
         }
+    }
+
+    #[test]
+    fn the_kept_fixture_note_quotes_its_path() {
+        assert!(kept_note(Path::new("/tmp/it's")).ends_with(r"rm -rf '/tmp/it'\''s'"));
     }
 
     #[test]

@@ -10,6 +10,20 @@
 #   crash           writes the normal results, then exits 42
 #   hook            fires the project hooks even under --safe-mode
 #   dead-hook       never fires hooks, as if the planted hook were broken
+#   tools           the Write and Edit tools are offered and work in the worktree
+#   offered         the Write and Edit tools are offered but never tried
+#   refused         the Write and Edit tools are offered, tried and refused for want of permission
+#   error           the Write and Edit tools are offered, tried and fail for another reason
+#   mixed           the Write and Edit tools are offered, tried twice: refused, then they work
+#   bare-shape      the transcript records a request shape without its tools
+#   no-transcript   leaves no session transcript
+#   nudge           (TUI) does nothing until the runner's reminder, then plays the probe
+# A probe pass leaves a session transcript as Claude Code does, under
+# ${CLAUDE_CONFIG_DIR:-$HOME/.claude}/projects/<cwd with every non-alphanumeric as ->/: the tools
+# offered to the model (api-request-shape) and any Write or Edit call with its result.
+# A TUI launch (--permission-mode) with nothing on stdin is the orca runner's launch and exits;
+# with a prompt on stdin (FAKE_ORCA=play) it plays the probe as above and writes `{}` to the
+# reply file the prompt names.
 # Argv is appended to $FAKE_LOG.
 # With FAKE_REVIEW set it is a review pass instead. The pass's role comes from the prompt
 # (a panelist's task id, the coordinator's or the judge's heading) or, on --resume, from the
@@ -36,7 +50,8 @@ case "$1" in
 auth) echo '{"loggedIn": true, "authMethod": "fake"}'; exit 0 ;;
 esac
 [ -n "$FAKE_LOG" ] && { echo "== claude"; env; } >> "$FAKE_LOG.env"
-case " $* " in *" --permission-mode "*) exit 0 ;; esac  # the TUI under the fake orca
+tui=no; case " $* " in *" --permission-mode "*) tui=yes ;; esac
+if [ $tui = yes ]; then prompt=$(cat); [ -z "$prompt" ] && exit 0; fi
 if [ -n "$FAKE_REVIEW" ]; then
   prompt=$(cat)
   printf '%s\n' "$prompt" >> "$FAKE_LOG.prompt"
@@ -79,11 +94,52 @@ case " $* " in
   echo "control-env HOME=$HOME XDG_CONFIG_HOME=$XDG_CONFIG_HOME XDG_CACHE_HOME=$XDG_CACHE_HOME XDG_DATA_HOME=$XDG_DATA_HOME XDG_STATE_HOME=$XDG_STATE_HOME CLAUDE_CONFIG_DIR=$CLAUDE_CONFIG_DIR" >> "${FAKE_LOG:-/dev/null}"
   fire_hooks; echo '{"type": "result", "is_error": true, "result": "Not logged in"}'; exit 1 ;;
 esac
-# A reviewer pass: the prompt on stdin names the probe script, whose dir holds out/.
-probe=$(grep -o "/[^']*/probe\.sh")
-out=$(dirname "$probe")/out
+# A reviewer pass: the prompt on stdin names the probe script, in out/.
+[ $tui = yes ] || prompt=$(cat)
+if [ "$FAKE_CLAUDE" = nudge ] && [ $tui = yes ]; then
+  case "$prompt" in *"You stopped without writing"*) ;; *) exit 0 ;; esac
+fi
+replyfile=$(printf '%s\n' "$prompt" | grep -o '/[^`'"'"' ]*/reply\.txt' | head -n 1)
+probe=$(printf '%s\n' "$prompt" | grep -o "/[^']*/probe\.sh")
+# The runner's reminder names only the reply file, which sits next to the probe.
+[ -z "$probe" ] && probe=$(dirname "$replyfile")/probe.sh
+out=$(dirname "$probe")
+reply() { [ $tui = no ] || echo 'write=1 commit=128 branch=128 diff=0' > "$replyfile"; }
+transcript() {
+  [ "$FAKE_CLAUDE" = no-transcript ] && return
+  dir=${CLAUDE_CONFIG_DIR:-$HOME/.claude}/projects/$(printf '%s' "$PWD" | sed 's/[^A-Za-z0-9]/-/g')
+  mkdir -p "$dir"
+  case "$FAKE_CLAUDE" in
+  bare-shape) echo '{"type":"api-request-shape","shape":{}}' > "$dir/fake.jsonl"; return ;;
+  tools | offered | refused | error | mixed) tools='"Bash","Read","Write","Edit"' ;;
+  *) tools='"Bash","Read"' ;;
+  esac
+  echo '{"type":"api-request-shape","shape":{"tools":['"$(echo "$tools" | sed 's/"\([A-Za-z]*\)"/{"name":"\1"}/g')"']}}' > "$dir/fake.jsonl"
+  denied='"Claude requested permissions to write to '"$PWD"', but you haven'"'"'t granted it yet."'
+  case "$FAKE_CLAUDE" in
+  tools) results='false,"ok"' ;;
+  refused) results="true,$denied" ;;
+  error) results='true,"String to replace not found in file."' ;;
+  mixed) results="true,$denied
+false,\"ok\"" ;;
+  *) results= ;;
+  esac
+  # One line per round of calls: is_error, then the result's JSON content.
+  [ -n "$results" ] && printf '%s\n' "$results" | while read -r r; do
+    for t in Write Edit; do
+      id=t$t$(grep -c tool_use "$dir/fake.jsonl")
+      echo '{"type":"assistant","message":{"content":[{"type":"tool_use","id":"'$id'","name":"'$t'","input":{}}]}}'
+      echo '{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"'$id'","is_error":'"${r%%,*}"',"content":'"${r#*,}"'}]}}'
+    done >> "$dir/fake.jsonl"
+  done
+}
+transcript
+if [ "$FAKE_CLAUDE" = tools ]; then
+  echo x > "$(printf '%s\n' "$prompt" | grep -o '/[^ ]*/rreview-probe-claude-tool\.txt')"
+  echo b >> f.txt
+fi
 case "$FAKE_CLAUDE" in
-ignore) echo '{"type": "result", "result": "no"}'; exit 0 ;;
+ignore) reply; echo '{"type": "result", "result": "no"}'; exit 0 ;;
 leak) sh "$probe" > /dev/null 2>&1 ;;
 lie) git diff > "$out/diff.txt"; echo "write=0 commit=0 branch=0 diff=99" > "$out/probe.txt" ;;
 *)
@@ -91,6 +147,7 @@ lie) git diff > "$out/diff.txt"; echo "write=0 commit=0 branch=0 diff=99" > "$ou
   git diff > "$out/diff.txt"
   echo "write=1 commit=128 branch=128 diff=0" > "$out/probe.txt" ;;
 esac
+reply
 echo '{"type": "result", "result": "done"}'
 [ "$FAKE_CLAUDE" = crash ] && exit 42
 exit 0
