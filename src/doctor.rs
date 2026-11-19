@@ -20,8 +20,9 @@ use crate::runner::{Agent, Pass, Runner};
 const PASS_TIMEOUT: Duration = Duration::from_secs(300);
 /// The fixture worktree's `f.txt`, with its uncommitted change.
 const F_TXT: &str = "a\nrreview-probe-change\n";
-/// Without it the Codex TUI declined to run a probe that "attempts writes outside the permitted
-/// workspace" (*verified*, codex-cli 0.167.0).
+/// Tells the reviewer why the probe tries forbidden writes. The Codex TUI still often declines
+/// to run it, "attempts writes outside the permitted workspace" (*verified*, codex-cli 0.167.0;
+/// #31).
 const SELF_TEST: &str = "This is rreview's sandbox self-test, run by the user on a throwaway \
                          repository. The script below tries writes that your sandbox should \
                          refuse; those refusals are the expected, harmless result, and running \
