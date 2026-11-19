@@ -2,11 +2,13 @@
 //! `codex` (tests/fixtures/bin) on a fixture repository built in a temp dir.
 
 use std::fs;
+use std::io::{Read, Write};
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicU32, Ordering};
+use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
@@ -28,22 +30,30 @@ struct Fixture {
 
 impl Drop for Fixture {
     fn drop(&mut self) {
-        // A failed test leaves nothing running: rreview started by `spawn` and the fake
-        // reviewers lead their own groups; the other recorded pids are single processes.
+        // A failed test leaves nothing running: rreview (started by `start`), the fake
+        // reviewers and the cleanup git lead their own groups; the other recorded pids are
+        // single processes.
         if std::thread::panicking() {
             let read = |name: &str| fs::read_to_string(self.root.join(name)).unwrap_or_default();
-            for pid in read("log.rreview").split_whitespace() {
-                kill("-KILL", &format!("-{pid}"));
+            for name in ["log.rreview", "log.reviewer", "log.cleanup"] {
+                for pid in read(name).split_whitespace() {
+                    kill("-KILL", &format!("-{pid}"));
+                }
             }
-            for pid in read("log.reviewer").split_whitespace() {
-                kill("-KILL", &format!("-{pid}"));
-            }
-            for pid in read("log.grandchild").split_whitespace() {
-                kill("-KILL", pid);
+            for name in ["log.grandchild", "log.gh"] {
+                for pid in read(name).split_whitespace() {
+                    kill("-KILL", pid);
+                }
             }
         }
         let _ = fs::remove_dir_all(&self.root);
     }
+}
+
+/// Writes an executable shell script.
+fn script(path: &Path, body: &str) {
+    fs::write(path, format!("#!/bin/sh\n{body}\n")).unwrap();
+    fs::set_permissions(path, fs::Permissions::from_mode(0o755)).unwrap();
 }
 
 /// `kill <signal> -- <target>`; whether it reached a process.
@@ -182,13 +192,26 @@ impl Fixture {
             for fake in ["gh", "claude", "codex", "orca"] {
                 std::os::unix::fs::symlink(fixtures.join(fake), bin.join(fake)).unwrap();
             }
+            // The real git, but a `git worktree remove` (rreview's cleanup, in its own group)
+            // records its pid in $FAKE_LOG.cleanup and first stalls $FAKE_GIT_STALL seconds,
+            // a window to signal rreview during its cleanup.
+            let out = Command::new("sh")
+                .args(["-c", "command -v git"])
+                .output()
+                .unwrap();
+            let real = String::from_utf8(out.stdout).unwrap().trim().to_string();
+            script(
+                &bin.join("git"),
+                &format!(
+                    "case \"$*\" in *\"worktree remove\"*) echo $$ >> \"$FAKE_LOG.cleanup\"; sleep \"${{FAKE_GIT_STALL:-0}}\";; esac\nexec '{real}' \"$@\""
+                ),
+            );
         }
         (bin, codex_home)
     }
 
     fn rreview(&self, pr: &Value, args: &[&str], scenario: &[(&str, String)]) -> Run {
-        let out = self.command(pr, args, scenario).output().unwrap();
-        self.ran(out)
+        self.finish(self.start(pr, args, scenario))
     }
 
     /// `rreview <args>` against the fakes, not yet started.
@@ -221,28 +244,60 @@ impl Fixture {
         cmd
     }
 
-    /// `rreview <args>` started in its own process group, as a shell starts a job; its pid is
-    /// recorded so a failed test can kill the group.
+    /// `rreview <args>` for the fixture's PR.
     fn spawn(&self, args: &[&str], scenario: &[(&str, String)]) -> std::process::Child {
+        self.start(&self.pr(), args, scenario)
+    }
+
+    /// `rreview <args>` started in its own process group, as a shell starts a job (a test
+    /// signals the group as the terminal's Ctrl-C would); its pid is recorded so a failed test
+    /// can kill the group.
+    fn start(&self, pr: &Value, args: &[&str], scenario: &[(&str, String)]) -> std::process::Child {
         let child = self
-            .command(&self.pr(), args, scenario)
+            .command(pr, args, scenario)
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
             .process_group(0)
             .spawn()
             .unwrap();
-        fs::write(self.root.join("log.rreview"), child.id().to_string()).unwrap();
+        let mut log = fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(self.root.join("log.rreview"))
+            .unwrap();
+        writeln!(log, "{}", child.id()).unwrap();
         child
     }
 
-    /// Waits at most 30 s for a spawned rreview to exit, else fails (its group is killed).
+    /// Waits at most 60 s for rreview to exit and its output to drain, else fails (and the
+    /// fixture kills what is left).
     fn finish(&self, mut child: std::process::Child) -> Run {
-        let deadline = Instant::now() + Duration::from_secs(30);
-        while child.try_wait().unwrap().is_none() {
+        fn drain(pipe: Option<impl Read + Send + 'static>) -> JoinHandle<Vec<u8>> {
+            std::thread::spawn(move || {
+                let mut buf = vec![];
+                if let Some(mut pipe) = pipe {
+                    let _ = pipe.read_to_end(&mut buf);
+                }
+                buf
+            })
+        }
+        let (stdout, stderr) = (drain(child.stdout.take()), drain(child.stderr.take()));
+        let deadline = Instant::now() + Duration::from_secs(60);
+        let status = loop {
+            if let Some(status) = child.try_wait().unwrap()
+                && stdout.is_finished()
+                && stderr.is_finished()
+            {
+                break status;
+            }
             assert!(Instant::now() < deadline, "rreview did not exit");
             std::thread::sleep(Duration::from_millis(20));
-        }
-        self.ran(child.wait_with_output().unwrap())
+        };
+        self.ran(std::process::Output {
+            status,
+            stdout: stdout.join().unwrap(),
+            stderr: stderr.join().unwrap(),
+        })
     }
 
     /// The count of lines in `<root>/<name>`.
@@ -251,26 +306,6 @@ impl Fixture {
             .unwrap_or_default()
             .lines()
             .count()
-    }
-
-    /// Puts a `git` before the real one that marks `$FAKE_LOG.cleanup` and stalls 2 s before a
-    /// `git worktree remove`: a window to signal rreview during its cleanup.
-    fn slow_cleanup(&self) {
-        let (bin, _) = self.install_fakes();
-        let out = Command::new("sh")
-            .args(["-c", "command -v git"])
-            .output()
-            .unwrap();
-        let real = String::from_utf8(out.stdout).unwrap().trim().to_string();
-        let wrapper = bin.join("git");
-        fs::write(
-            &wrapper,
-            format!(
-                "#!/bin/sh\ncase \"$*\" in *\"worktree remove\"*) : > \"$FAKE_LOG.cleanup\"; sleep 2;; esac\nexec '{real}' \"$@\"\n"
-            ),
-        )
-        .unwrap();
-        fs::set_permissions(&wrapper, fs::Permissions::from_mode(0o755)).unwrap();
     }
 
     fn ran(&self, out: std::process::Output) -> Run {
@@ -850,8 +885,13 @@ fn a_pass_that_never_replies_times_out_after_a_wrap_up() {
 fn an_interrupt_kills_every_reviewer_and_removes_the_worktree() {
     for signal in ["-INT", "-TERM"] {
         let fx = fixture();
-        fx.slow_cleanup();
-        let child = fx.spawn(&["7"], &[("FAKE_REVIEW", "hang".into())]);
+        let child = fx.spawn(
+            &["7"],
+            &[
+                ("FAKE_REVIEW", "hang".into()),
+                ("FAKE_GIT_STALL", "2".into()),
+            ],
+        );
         let pid = child.id().to_string();
         // Mid-pass: all three panelists have started their grandchild.
         wait_for("three passes", || fx.lines("log.grandchild") == 3);
@@ -911,10 +951,12 @@ fn an_interrupt_during_the_checkout_leaves_no_worktree() {
 fn ctrl_c_during_the_cleanup_finishes_it_and_fails_the_run() {
     let env = envelope("src/lib.rs");
     let fx = fixture();
-    fx.slow_cleanup();
     let child = fx.spawn(
         &["7", "--only", "reliability"],
-        &claude_says(&env.to_string()),
+        &with(
+            claude_says(&env.to_string()),
+            &[("FAKE_GIT_STALL", "2".into())],
+        ),
     );
     wait_for("the cleanup", || fx.root.join("log.cleanup").exists());
     assert!(kill("-INT", &format!("-{}", child.id())));
@@ -922,6 +964,81 @@ fn ctrl_c_during_the_cleanup_finishes_it_and_fails_the_run() {
     assert_eq!(run.code, Some(2), "{run:?}");
     assert!(run.stderr.contains("interrupted by SIGINT"), "{run:?}");
     fx.assert_worktree_removed();
+}
+
+/// A second Ctrl-C (SIGINT to rreview's whole group) while rreview kills the reviewers cannot
+/// stop it: the signal goes straight to each group, through no helper in rreview's group, which
+/// a `kill` that stalls 1 s before it signals would show.
+#[test]
+fn a_second_ctrl_c_while_the_reviewers_are_killed_leaves_none_running() {
+    let fx = fixture();
+    let (bin, _) = fx.install_fakes();
+    script(&bin.join("kill"), "sleep 1; exec /bin/kill \"$@\"");
+    let child = fx.spawn(&["7"], &[("FAKE_REVIEW", "hang".into())]);
+    let group = format!("-{}", child.id());
+    wait_for("three passes", || fx.lines("log.grandchild") == 3);
+    assert!(kill("-INT", &group));
+    std::thread::sleep(Duration::from_millis(500));
+    kill("-INT", &group);
+    let run = fx.finish(child);
+    assert_eq!(run.code, Some(2), "{run:?}");
+    assert_dead(&fx, 3);
+    assert_all_dead(
+        &fs::read_to_string(fx.root.join("log.reviewer")).unwrap(),
+        3,
+    );
+    fx.assert_worktree_removed();
+}
+
+/// A worktree git already registers at the review path, even one whose directory is gone and
+/// which is locked, is not this run's: the run stops and leaves it registered.
+#[test]
+fn a_registration_left_at_the_review_path_is_kept() {
+    let fx = fixture();
+    let wt = fx.runroot().join("wt");
+    fs::create_dir_all(fx.runroot()).unwrap();
+    let wt_str = wt.to_str().unwrap();
+    git(
+        &fx.clone,
+        &["worktree", "add", "--detach", wt_str, &fx.main],
+    );
+    git(
+        &fx.clone,
+        &["worktree", "lock", "--reason", "offline", wt_str],
+    );
+    fs::rename(&wt, fx.root.join("moved")).unwrap();
+    let run = fx.run(&[], &claude_says("{}"));
+    assert_eq!(run.code, Some(2), "{run:?}");
+    assert!(
+        run.stderr
+            .contains(&format!("git still registers a worktree at {wt_str}")),
+        "{run:?}"
+    );
+    let list = git(&fx.clone, &["worktree", "list", "--porcelain"]);
+    assert!(
+        list.contains(&format!("worktree {wt_str}\n")) && list.contains("locked offline"),
+        "{list}"
+    );
+    assert_eq!(fx.prompt_of("reliability"), "", "{run:?}");
+}
+
+/// `rreview show` catches no signal: the terminal's Ctrl-C still ends its `gh`.
+#[test]
+fn ctrl_c_ends_the_gh_of_show() {
+    let fx = fixture();
+    let child = fx.spawn(&["show", "7"], &[("FAKE_GH_DELAY", "60".into())]);
+    wait_for("gh", || fx.lines("log.gh") == 1);
+    assert!(kill("-INT", &format!("-{}", child.id())));
+    let run = fx.finish(child);
+    assert_eq!(run.code, None, "{run:?}");
+    assert_all_dead(&fs::read_to_string(fx.root.join("log.gh")).unwrap(), 1);
+    // gh's background sleep ignores SIGINT, as a non-interactive shell sets it up.
+    for pid in fs::read_to_string(fx.root.join("log.grandchild"))
+        .unwrap()
+        .split_whitespace()
+    {
+        kill("-KILL", pid);
+    }
 }
 
 /// A reviewer's descendant that outlives its turn dies with the reviewer's group.

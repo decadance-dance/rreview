@@ -198,6 +198,13 @@ pub fn run(args: &Args) -> Result<u8> {
             wt_path.display()
         );
     }
+    // A registration with no directory (moved, offline, locked) is not this run's either; the
+    // guard below would force-remove whatever git registers at this path.
+    if let Some(reg) = registered_at(&wt_path, deadline)? {
+        bail!(
+            "git still registers a worktree at {reg} (moved or locked?); this run will not remove it; see `git worktree list`, then `git worktree remove --force --force {reg}` or `git worktree prune`"
+        );
+    }
     if runroot.exists() {
         fs::remove_dir_all(&runroot).with_context(|| format!("{}", runroot.display()))?;
     }
@@ -501,6 +508,36 @@ pub fn run(args: &Args) -> Result<u8> {
     )?;
     eprintln!("run dir: {}", runroot.display());
     print_result(&result, args.json)
+}
+
+/// The path of a worktree git registers at `path`, whether or not its directory is there.
+fn registered_at(path: &Path, deadline: Option<Instant>) -> Result<Option<String>> {
+    let want = resolved(path);
+    let list = git_raw(&["worktree", "list", "--porcelain", "-z"], deadline)?;
+    Ok(list
+        .split(|b| *b == 0)
+        .filter_map(|line| line.strip_prefix(b"worktree "))
+        .map(|p| String::from_utf8_lossy(p).into_owned())
+        .find(|p| resolved(Path::new(p)) == want))
+}
+
+/// `path` with its longest existing prefix resolved (macOS `/var` is `/private/var`); the rest,
+/// which may not exist, as it is.
+fn resolved(path: &Path) -> PathBuf {
+    let mut rest = vec![];
+    let mut head = path;
+    loop {
+        if let Ok(real) = fs::canonicalize(head) {
+            return rest.iter().rev().fold(real, |p, c| p.join(c));
+        }
+        match (head.parent(), head.file_name()) {
+            (Some(parent), Some(name)) => {
+                rest.push(name);
+                head = parent;
+            }
+            _ => return path.to_path_buf(),
+        }
+    }
 }
 
 /// Locks `<runroot>.lock`, beside the run dir, which a rerun removes and recreates: two runs of
@@ -914,6 +951,8 @@ fn git_raw(args: &[&str], deadline: Option<Instant>) -> Result<Vec<u8>> {
 
 /// Git for a cleanup step: in its own process group, so the terminal's Ctrl-C does not cut it
 /// short, and run to its end whatever the interrupt flag says.
+// limit: no deadline; a cleanup git that hangs (a stuck filesystem) holds rreview until it ends,
+// and a SIGKILL to rreview leaves that git running in its own group.
 fn cleanup_git(args: &[&str]) -> Result<()> {
     let out = Command::new("git")
         .args(args)
@@ -931,8 +970,9 @@ fn cleanup_git(args: &[&str]) -> Result<()> {
     Ok(())
 }
 
-/// Runs `cmd` to its end with no stdin, in its own process group, which is killed at the
-/// deadline (the review's budget; None: none) or on an interrupt; past either it does not start.
+/// Runs `cmd` to its end with no stdin, in its own process group (when rreview catches
+/// interrupts; else in rreview's, as `rreview show` does), which is killed at the deadline (the
+/// review's budget; None: none) or on an interrupt; past either it does not start.
 fn output(cmd: &mut Command, deadline: Option<Instant>) -> Result<Output> {
     cmd.stdin(Stdio::null());
     let program = cmd.get_program().to_string_lossy().into_owned();
@@ -942,11 +982,10 @@ fn output(cmd: &mut Command, deadline: Option<Instant>) -> Result<Output> {
     if past() {
         return Err(spent());
     }
-    let mut child = cmd
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .process_group(0)
-        .spawn()?;
+    if launch::catching() {
+        cmd.process_group(0);
+    }
+    let mut child = cmd.stdout(Stdio::piped()).stderr(Stdio::piped()).spawn()?;
     // Reader threads, so a full pipe cannot stall the child while we wait on it.
     fn read(pipe: Option<impl Read + Send + 'static>) -> JoinHandle<Vec<u8>> {
         std::thread::spawn(move || {
