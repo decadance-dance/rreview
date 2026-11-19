@@ -12,6 +12,7 @@ focused workspace's pull request, shows each pass while it runs, and lists the f
   lines on stderr and tails `<runroot>/progress.jsonl`, one row per pass: one bounded read at a
   time, and only while the dir's `meta.json` names this run's id (another rreview run for the same
   PR head replaces the dir, possibly with the same path and inode).
+- **Cancel** (while a run is running) sends rreview SIGTERM; see Limits.
 - **Result**: from rreview's exit code and its JSON on stdout (`result.json`). Exit 2, a crash or
   output that is not a valid result shows as a failed review with rreview's `error:` lines and the
   run dir; a review where a panelist or the judge failed shows as degraded.
@@ -55,10 +56,14 @@ Settings (Settings > Plugins > rreview):
 - A worker restart (Orca stops an idle worker; a save in dev mode) loses the child it was watching:
   that run shows as failed, with its run dir. `rreview show <run dir>` prints its result once it
   finishes.
-- No Cancel ([#27](https://github.com/decadance-dance/rreview/issues/27)): closing the panel does not stop a run. rreview has no signal handler yet, so a
-  SIGTERM would skip its cleanup as a kill does (an Orca review worktree or terminal could stay).
-  The worker stops a run still going 70 minutes after it started (rreview's default budget is 60);
-  that kill skips the cleanup too.
+- Closing the panel does not stop a run; **Cancel** does. It sends rreview SIGTERM, on which rreview
+  stops its reviewers, removes its review worktree (with the orca runner also its branch and the
+  reviewers' terminals) and exits 2; the run shows as cancelled once rreview reports that stop (a
+  run that failed on its own meanwhile shows its error). Cancel names the run the panel shows by a
+  token unique to it, so a late one never stops a later run. The worker sends the same SIGTERM to a run still going 70
+  minutes after it started (rreview's default budget is 60), which then shows as failed, unless a
+  Cancel came first. An rreview still running 10 minutes after a SIGTERM is killed, and that
+  kill skips what is left of its cleanup.
 
 ## Develop
 

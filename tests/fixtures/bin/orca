@@ -5,8 +5,8 @@
 # handle `term_<role>` and plays the agent: a prompt (`terminal send --enter`) names the reply
 # file, and the next `terminal wait` that finds the agent idle writes the reply there: the first
 # turn $FAKE_OUT_<role> (default $FAKE_REPLY), later turns $FAKE_RESUME_<role> (default the same).
-# A wait that times out first sleeps its --timeout-ms. Per-terminal state is in
-# $FAKE_LOG.orca-<role>: `open`, `sent`, `closed`, ...
+# A wait that times out first records its pid in $FAKE_LOG.orcawait, then sleeps its --timeout-ms.
+# Per-terminal state is in $FAKE_LOG.orca-<role>: `open`, `sent`, `closed`, ...
 # FAKE_ORCA:
 #   ok (default)    replies to every turn
 #   trust           the agent waits on its trust dialog until it gets Enter, then as ok
@@ -29,12 +29,18 @@
 #   refused         `terminal send` of a prompt answers "accepted": false
 #   blocked         after the prompt the agent waits on a permission dialog
 #   lost-create     `terminal create` opens the terminal, then fails without JSON
+#   late-worktree   `worktree create` never answers; 1 s after rreview killed it, the app makes
+#                   the worktree anyway and writes $FAKE_LOG.late
+#   late-terminal   `terminal create` likewise: the terminal opens 1 s after its CLI was killed
+#                   (with FAKE_ORCA_LATE=runtime-timeout both instead answer at once with Orca's
+#                   runtime_timeout error, and what they asked for is made 1 s after they exit)
 #   no-handle       `terminal create` opens the terminal, then answers ok without a handle
 #   play            the agent plays each prompt itself: the terminal's launch line runs again
 #                   with the prompt on stdin (through rreview's shim), and the fake agent writes
 #                   its own reply (`rreview doctor --runner orca`)
 # FAKE_ORCA_SEND_DELAY: seconds every prompt send takes; FAKE_ORCA_CREATE_DELAY: seconds before
-# `worktree create` starts; FAKE_ORCA_WAIT_DELAY: seconds every `terminal wait` after a prompt
+# `worktree create` starts; FAKE_ORCA_LIST_DELAY: seconds every `terminal list` takes;
+# FAKE_ORCA_WAIT_DELAY: seconds every `terminal wait` after a prompt
 # takes before it answers. FAKE_ORCA_CLOSE=fail-once: the first `terminal close` fails with
 # runtime_unavailable. FAKE_ORCA_HANDLES=numbered: each create of a title gets its own handle,
 # `term_<role>~<n>`, logged as `created <handle>`; every successful close is logged as
@@ -50,8 +56,23 @@ arg() { # the value of option $1 in the remaining args
 ok() { printf '{"ok":true,"result":%s}\n' "$1"; exit 0; }
 blocked() { printf '{"ok":true,"result":{"wait":{"satisfied":false,"status":"running","blockedReason":"%s"}}}\n' "$1"; exit 1; }
 timeout() {
+  [ -n "$FAKE_LOG" ] && echo $$ >> "$FAKE_LOG.orcawait"
   sleep "$(awk "BEGIN { print $(arg --timeout-ms "$@") / 1000 }")"
   echo '{"ok":false,"error":{"code":"timeout","message":"timeout"}}'; exit 1
+}
+# The app finishing a request whose CLI never answers: once this CLI is dead (rreview killed it),
+# `sh -c "$1" _ <args>` runs 1 s later in a process group of its own; this CLI waits to be killed.
+late() {
+  script=$1; shift
+  cli=$$
+  perl -e 'setpgrp; exec @ARGV' sh -c \
+    'cli=$1; shift; while kill -0 "$cli" 2> /dev/null; do sleep 0.1; done; sleep 1; '"$script"' && echo made > "$FAKE_LOG.late"' \
+    _ "$cli" _ "$@" < /dev/null > /dev/null 2>&1 &
+  # Orca's CLI gives up on a create after its transport timeout, which proves nothing about it.
+  [ "$FAKE_ORCA_LATE" = runtime-timeout ] && {
+    echo '{"ok":false,"error":{"code":"runtime_timeout","message":"Timed out waiting for the Orca runtime"}}'; exit 1
+  }
+  sleep 60; exit 1
 }
 handle=$(arg --terminal "$@"); role=${handle#term_}; role=${role%~*}
 state="$FAKE_LOG.orca-$role"
@@ -73,6 +94,9 @@ case "$1 $2" in
   name=$(arg --name "$@"); branch=$(arg --branch "$@"); base=$(arg --base-branch "$@")
   [ "$scenario" = wrong-head ] && base="$base^"
   path="$TMPDIR/orca-wt/$name"
+  if [ "$scenario" = late-worktree ]; then
+    late 'git worktree add -q -b "$2" "$3" "$4"' "$branch" "$path" "$base"
+  fi
   git worktree add -q -b "$branch" "$path" "$base" >&2 || exit 1
   [ "$scenario" = lost-reply ] && { echo "transport closed" >&2; exit 1; }
   [ "$scenario" = foreign-branch ] && branch=victim
@@ -83,6 +107,9 @@ case "$1 $2" in
 "terminal create")
   [ "$scenario" = no-ok ] && { echo '{"ok":false,"error":{"code":"boom","message":"no terminal"}}'; exit 0; }
   title=$(arg --title "$@"); role=${title#rreview:}
+  if [ "$scenario" = late-terminal ]; then
+    late 'echo open >> "$2" && printf %s "$3" > "$2.title"' "$FAKE_LOG.orca-$role" "$title"
+  fi
   echo open >> "$FAKE_LOG.orca-$role"
   printf '%s' "$title" > "$FAKE_LOG.orca-$role.title"
   cmd=$(arg --command "$@")
@@ -117,14 +144,22 @@ case "$1 $2" in
   echo "created $handle" >> "${FAKE_LOG:-/dev/null}"
   ok "{\"terminal\":{\"handle\":\"$handle\"}}" ;;
 "terminal list")
-  rows=
+  [ -n "$FAKE_ORCA_LIST_DELAY" ] && sleep "$FAKE_ORCA_LIST_DELAY"
+  # As Orca's: a row's title is the one the running program set; the title `create --title` gave
+  # is the tab's, in the visual layout.
+  rows= tabs=
   for f in "$FAKE_LOG".orca-*.title; do
     [ -f "$f" ] || continue
     r=${f#"$FAKE_LOG.orca-"}; r=${r%.title}
     [ "$(grep -E '^(open|closed)$' "$FAKE_LOG.orca-$r" | tail -n 1)" = closed ] && continue
-    rows="$rows${rows:+,}{\"handle\":\"term_$r\",\"title\":\"$(cat "$f")\"}"
+    rows="$rows${rows:+,}{\"handle\":\"term_$r\",\"tabId\":\"tab_$r\",\"title\":\"Claude\"}"
+    tabs="$tabs${tabs:+,}{\"tabId\":\"tab_$r\",\"title\":\"$(cat "$f")\",\"panes\":{\"type\":\"terminal\",\"handle\":\"term_$r\",\"tabId\":\"tab_$r\",\"title\":\"Claude\"}}"
   done
-  ok "{\"terminals\":[$rows]}" ;;
+  layouts=
+  case " $* " in *" --include-visual-layouts "*)
+    layouts=",\"visualLayouts\":[{\"root\":{\"type\":\"group\",\"tabs\":[$tabs]}}]" ;;
+  esac
+  ok "{\"terminals\":[$rows]$layouts}" ;;
 "terminal show")
   echo show >> "$state"
   # The agent is up once its launch line ran; give it up to 5 s.

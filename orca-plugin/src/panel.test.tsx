@@ -1,6 +1,6 @@
 // The panel over a mock host whose requests stand in for src/worker.ts.
 import { assert, mockHost, mount, test } from 'orca/testing'
-import { done, doneResult, failed, running, target } from './fixtures'
+import { cancelled, done, doneResult, failed, running, target } from './fixtures'
 import * as panel from './panel'
 import type { Run } from './protocol'
 
@@ -24,6 +24,7 @@ function setup(run: Run | null = null) {
       'review.get': () => run,
       'review.result': () => (calls.push({ name: 'review.result', input: null }), doneResult),
       'review.start': (input) => (calls.push({ name: 'review.start', input }), running),
+      'review.cancel': (input) => (calls.push({ name: 'review.cancel', input }), running),
       'findings.send': (input) => (calls.push({ name: 'findings.send', input }), { sent: input.keys.length, file: '/state/x/author-1.md' })
     }
   })
@@ -112,6 +113,24 @@ test('a failed review is shown as failed with its error', async () => {
   assert.match(s, /The review failed/)
   assert.match(JSON.stringify(view.tree()), /the reply is not JSON/)
   assert.equal(view.find({ label: 'Findings by file' }), null)
+  await view.unmount()
+})
+
+test('cancel stops the running review, which then shows as cancelled', async () => {
+  const { host, calls } = setup(running)
+  const view = await mount(panel, { host })
+  await view.press({ text: 'Cancel' })
+  // The run it shows, so a stale Cancel cannot stop a later one.
+  assert.deepEqual(calls.at(-1), { name: 'review.cancel', input: { token: running.token } })
+  assert.match(JSON.stringify(view.tree()), /Cancelling: rreview is stopping its reviewers/)
+  await view.post('review.changed', cancelled)
+  const s = view.summary().join('\n') + JSON.stringify(view.tree())
+  assert.match(s, /The review was cancelled/)
+  assert.ok(!/Cancelling/.test(s), 'the notice goes with the run')
+  assert.equal(view.find({ text: 'Cancel' }), null)
+  // The stop line is no pass.
+  assert.deepEqual(view.rowsOf({ label: 'Passes' }), ['intent_contracts', 'reliability', 'security', 'coordinator'])
+  assert.deepEqual(view.errors, [])
   await view.unmount()
 })
 

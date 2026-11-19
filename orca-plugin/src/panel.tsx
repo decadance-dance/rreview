@@ -85,7 +85,8 @@ async function loadAgents(): Promise<void> {
 async function showRun(r: Run | null): Promise<void> {
   const was = read(run)
   set(run, r)
-  const fresh = !was || !r || was.startedAt !== r.startedAt
+  if (was?.status === 'running' && r?.status !== 'running') set(notice, null)
+  const fresh = !was || !r || was.token !== r.token
   if (fresh) {
     set(result, null)
     set(author, null)
@@ -94,7 +95,7 @@ async function showRun(r: Run | null): Promise<void> {
   // A newly finished review: fetch its result, with its gated findings picked.
   if (r?.status === 'done' && (fresh || was?.status !== 'done')) {
     const res = await plugin.request('review.result')
-    if (read(run)?.startedAt !== r.startedAt) return
+    if (read(run)?.token !== r.token) return
     set(result, res)
     set(picked, res ? res.findings.map(findingKey) : [])
     set(selected, null)
@@ -107,6 +108,17 @@ async function startReview(): Promise<void> {
   set(notice, null)
   try {
     showRun(await plugin.request('review.start', { workspaceId: t.workspaceId, pr: read(prArg), runner: read(runner) }, { timeoutMs: 60_000 }))
+  } catch (e) {
+    set(notice, { tone: 'danger', text: errorText(e) })
+  }
+}
+
+async function cancelReview(): Promise<void> {
+  const r = read(run)
+  if (!r) return
+  try {
+    await plugin.request('review.cancel', { token: r.token })
+    set(notice, { tone: 'neutral', text: 'Cancelling: rreview is stopping its reviewers and cleaning up.' })
   } catch (e) {
     set(notice, { tone: 'danger', text: errorText(e) })
   }
@@ -193,7 +205,8 @@ const allKeys = (items: readonly TreeItem[]): string[] =>
   items.flatMap((i) => (i.children ? [i.key, ...allKeys(i.children)] : []))
 
 function passRows(r: Run): TableRow[] {
-  const last = new Map(r.events.map((e) => [e.role, e]))
+  // The `run` line records a stop; it is no pass.
+  const last = new Map(r.events.filter((e) => e.role !== 'run').map((e) => [e.role, e]))
   const roles = [...ROLES.filter((x) => x !== 'judge' || last.has('judge')), ...[...last.keys()].filter((x) => !ROLES.includes(x))]
   return roles.map((role) => {
     const e = last.get(role)
@@ -262,6 +275,11 @@ function Controls() {
       <Button icon="play" tone="accent" disabled={running || !read(target)?.pr} onPress={startReview}>
         {running ? 'Running…' : 'Run review'}
       </Button>
+      {running ? (
+        <Button icon="stop" onPress={cancelReview}>
+          Cancel
+        </Button>
+      ) : null}
     </Row>
   )
 }
@@ -279,6 +297,8 @@ function Status({ r }: { r: Run }) {
           <Badge tone="accent">running</Badge>
         ) : r.status === 'failed' ? (
           <Badge tone="danger">failed</Badge>
+        ) : r.status === 'cancelled' ? (
+          <Badge tone="neutral">cancelled</Badge>
         ) : (
           <Badge tone={r.exitCode === 0 ? 'success' : 'warning'}>
             {sum?.gated ? `${sum.gated} gated` : 'no gated findings'}
@@ -299,6 +319,12 @@ function Status({ r }: { r: Run }) {
       {r.status === 'failed' ? (
         <Callout tone="danger" title="The review failed">
           <Text size="sm">{r.error ?? ''}</Text>
+          {r.runDir ? <Text size="xs" muted>Run dir: {r.runDir}</Text> : null}
+        </Callout>
+      ) : null}
+      {r.status === 'cancelled' ? (
+        <Callout tone="neutral" title="The review was cancelled">
+          <Text size="sm">rreview stopped its reviewers and ran its cleanup before it exited.</Text>
           {r.runDir ? <Text size="xs" muted>Run dir: {r.runDir}</Text> : null}
         </Callout>
       ) : null}

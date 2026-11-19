@@ -9,9 +9,10 @@ use std::collections::HashMap;
 use std::fs::{self, File};
 use std::io::{ErrorKind, Read, Write};
 use std::os::unix::fs::OpenOptionsExt;
+use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::{Mutex, mpsc};
+use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
@@ -26,6 +27,11 @@ const MAX_REPLY: u64 = 4 << 20;
 /// budget) and cleanup.
 const SETUP: Duration = Duration::from_secs(300);
 const CLOSE: Duration = Duration::from_secs(30);
+/// How long the cleanup waits for what a create Orca did not confirm may still make: the app can
+/// finish such a create on its own. Any failure leaves it unconfirmed: its CLI killed at its
+/// deadline, no JSON reply, or an error such as `runtime_timeout` (the CLI's own transport
+/// timeout), none of which proves the create was refused.
+const SETTLE: Duration = Duration::from_secs(30);
 
 /// The runner drives Orca through its CLI, which needs the app running with its runtime
 /// reachable and this repository registered (spec §4); `orca status` and `orca repo show` prove
@@ -100,16 +106,25 @@ pub fn branch_for(name: &str) -> String {
 
 /// Refuses a name whose branch exists: a review worktree's branch must be new, so whatever
 /// carries it after `create_worktree` is ours, and `remove_worktree` may delete it by name.
-pub fn check_branch_free(name: &str) -> Result<()> {
+/// A preparation step: within `deadline` (the review's budget) and stopped by an interrupt.
+pub fn check_branch_free(name: &str, deadline: Option<Instant>) -> Result<()> {
     let branch = branch_for(name);
-    if git(&[
-        "rev-parse",
-        "--verify",
-        "--quiet",
-        &format!("refs/heads/{branch}"),
-    ])
-    .is_ok()
-    {
+    let probe = launch::output(
+        Command::new("git")
+            .args(["rev-parse", "--verify", "--quiet"])
+            .arg(format!("refs/heads/{branch}"))
+            .process_group(0),
+        deadline,
+        true,
+    )
+    .map_err(|e| {
+        if e.is::<TimedOut>() {
+            anyhow::anyhow!("the review's budget ran out while preparing (git)")
+        } else {
+            e
+        }
+    })?;
+    if probe.status.success() {
         bail!(
             "branch {branch} is left from an earlier run (--keep-worktree?); remove its worktree with `orca worktree rm`, then `git branch -D {branch}`"
         );
@@ -121,7 +136,9 @@ pub fn check_branch_free(name: &str) -> Result<()> {
 /// `check_branch_free`), in the repository of `git_common_dir`, so Orca tracks the reviewers'
 /// terminals in it (spec §4). Repo setup hooks are skipped: they would run the reviewed PR's
 /// code. Returns the worktree path.
-/// `deadline` is the review's budget; it is capped at `SETUP`.
+/// `deadline` is the review's budget; it is capped at `SETUP`. An interrupt does not cut it short:
+/// the app may finish a create whose CLI was killed. One that failed is unconfirmed (see
+/// `SETTLE`), and the cleanup waits for what it may still make.
 pub fn create_worktree(
     git_common_dir: &Path,
     name: &str,
@@ -130,7 +147,7 @@ pub fn create_worktree(
 ) -> Result<PathBuf> {
     let branch = branch_for(name);
     let repo = main_checkout(git_common_dir);
-    let v = orca(
+    let v = orca_to_end(
         &[
             "worktree",
             "create",
@@ -163,19 +180,35 @@ pub fn create_worktree(
 }
 
 /// Removes the worktree on `branch_for(name)` and that branch, found through git rather than
-/// Orca's reply, so a create whose reply was lost is cleaned up as well.
-pub fn remove_worktree(name: &str) -> Result<()> {
+/// Orca's reply, so a create whose reply was lost is cleaned up as well. After an `unconfirmed`
+/// create it waits up to `SETTLE` for the worktree to appear. A cleanup step: every call runs to
+/// its end in its own process group, whatever the interrupt flag says.
+// limit: a worktree the app makes more than `SETTLE` after its create failed stays behind.
+pub fn remove_worktree(name: &str, unconfirmed: bool) -> Result<()> {
     let branch = branch_for(name);
-    let list = git(&["worktree", "list", "--porcelain"])?;
-    let path = list.split("\n\n").find_map(|entry| {
-        let mut lines = entry.lines();
-        let path = lines.next()?.strip_prefix("worktree ")?;
-        lines
-            .any(|l| l == format!("branch refs/heads/{branch}"))
-            .then_some(path)
-    });
-    if let Some(path) = path {
-        let removed = orca(
+    let settle = Instant::now() + if unconfirmed { SETTLE } else { Duration::ZERO };
+    let path = loop {
+        let list = git(&["worktree", "list", "--porcelain"])?;
+        let path = list.split("\n\n").find_map(|entry| {
+            let mut lines = entry.lines();
+            let path = lines.next()?.strip_prefix("worktree ")?;
+            lines
+                .any(|l| l == format!("branch refs/heads/{branch}"))
+                .then(|| path.to_string())
+        });
+        if path.is_some() || Instant::now() >= settle {
+            break path;
+        }
+        std::thread::sleep(Duration::from_millis(250));
+    };
+    if path.is_none() && unconfirmed {
+        eprintln!(
+            "warning: a failed `orca worktree create` may still make the worktree on branch {branch}: none appeared within {}s; if it appears, remove it with `orca worktree rm` and `git branch -D {branch}`",
+            SETTLE.as_secs()
+        );
+    }
+    if let Some(path) = &path {
+        let removed = orca_to_end(
             &[
                 "worktree",
                 "rm",
@@ -187,7 +220,7 @@ pub fn remove_worktree(name: &str) -> Result<()> {
         );
         // A worktree Orca never registered (its reply was lost) is git's to remove.
         if let Err(e) = removed {
-            git(&["worktree", "remove", "--force", path])
+            git(&["worktree", "remove", "--force", path.as_str()])
                 .with_context(|| format!("{e:#}; git worktree remove"))?;
         }
     }
@@ -204,11 +237,14 @@ pub fn remove_worktree(name: &str) -> Result<()> {
     Ok(())
 }
 
-/// Git in the current repository; its stdout.
+/// Git in the current repository; its stdout. In its own process group, so the terminal's Ctrl-C
+/// does not cut a cleanup step short, and run to its end.
+// limit: no deadline, as the headless runner's cleanup git.
 fn git(args: &[&str]) -> Result<String> {
     let out = Command::new("git")
         .args(args)
         .stdin(Stdio::null())
+        .process_group(0)
         .output()
         .context("cannot run git")?;
     if !out.status.success() {
@@ -284,26 +320,46 @@ impl Orca {
         format!("rreview:{role}{}", self.title_tag)
     }
 
-    /// Closes the terminals titled `title` in the terminals' worktree: a create whose reply was
-    /// lost may still have opened one. Best effort; a failure is a warning.
-    // limit: a create that opens its terminal only after this listing still leaves it open.
+    /// Closes the terminals titled `title` in the terminals' worktree: a create that failed may
+    /// still have opened one, so it waits up to `SETTLE` for one to appear. Best effort; what it
+    /// could not close is named in a warning.
+    // limit: a terminal the app opens more than `SETTLE` after its create failed stays open.
     fn close_titled(&self, title: &str) {
-        let listed = orca(
-            &["terminal", "list", "--worktree", &self.terminal_worktree],
-            Instant::now().checked_add(CLOSE),
-        );
-        match listed {
-            Ok(v) => {
-                for t in v["terminals"].as_array().into_iter().flatten() {
-                    if t["title"] == title
-                        && let Some(handle) = t["handle"].as_str()
-                    {
+        let settle = Instant::now() + SETTLE;
+        let missed = loop {
+            let listed = orca_to_end(
+                &[
+                    "terminal",
+                    "list",
+                    "--worktree",
+                    &self.terminal_worktree,
+                    "--include-visual-layouts",
+                ],
+                // Each call gets only what is left of the wait, so the wait stays within it.
+                Some(settle),
+            );
+            match listed {
+                Ok(v) => {
+                    let handles = titled(&v, title);
+                    for handle in &handles {
                         let _ = close(handle);
                     }
+                    if !handles.is_empty() {
+                        return;
+                    }
                 }
+                Err(e) if !e.is::<TimedOut>() => break format!("{e:#}"),
+                Err(_) => {}
             }
-            Err(e) => eprintln!("warning: cannot list Orca terminals to close {title}: {e:#}"),
-        }
+            if Instant::now() >= settle {
+                break format!("none appeared within {}s", SETTLE.as_secs());
+            }
+            std::thread::sleep(Duration::from_millis(250));
+        };
+        eprintln!(
+            "warning: a failed create may still open the Orca terminal {title} in {}: {missed}; close it if it appears",
+            self.terminal_worktree
+        );
     }
 
     /// Sets `name=value` for every launch, over an inherited value.
@@ -452,7 +508,10 @@ impl Runner for Orca {
             &exe,
         )?;
         let title = self.title(pass.role);
-        let handle = orca(
+        // No terminal opens after an interrupt; one being created is waited for, as Orca may
+        // open it after its CLI was killed.
+        launch::interrupted()?;
+        let handle = orca_to_end(
             &[
                 "terminal",
                 "create",
@@ -590,6 +649,7 @@ fn wait(handle: &str, deadline: Option<Instant>) -> Result<Wait> {
             &ms.to_string(),
         ],
         backstop,
+        true,
     )?;
     // An answer that arrives past the deadline (inside the backstop) is not accepted.
     if left(deadline).is_zero() {
@@ -656,6 +716,33 @@ fn agent_up(handle: &str, agent: Agent, deadline: Option<Instant>) -> Result<boo
     }
 }
 
+/// The listed terminals in tabs titled `title`, from a `terminal list --include-visual-layouts`
+/// reply. `terminal create --title` names the tab; a list row's own title can be the one the
+/// running program set (`Claude`).
+fn titled(list: &Value, title: &str) -> Vec<String> {
+    fn panes(v: &Value, title: &str, in_tab: bool, out: &mut Vec<String>) {
+        match v {
+            Value::Array(a) => a.iter().for_each(|x| panes(x, title, in_tab, out)),
+            Value::Object(o) => {
+                let in_tab =
+                    in_tab || (o.contains_key("panes") && o.get("title") == Some(&title.into()));
+                if in_tab && let Some(h) = o.get("handle").and_then(Value::as_str) {
+                    out.push(h.into());
+                }
+                o.values().for_each(|x| panes(x, title, in_tab, out));
+            }
+            _ => {}
+        }
+    }
+    let mut found = vec![];
+    panes(&list["visualLayouts"], title, false, &mut found);
+    // Only rows of the terminals' worktree: a layout of another worktree may hold the same title.
+    let listed = list["terminals"].as_array().into_iter().flatten();
+    let listed: Vec<_> = listed.filter_map(|t| t["handle"].as_str()).collect();
+    found.retain(|h| listed.contains(&h.as_str()));
+    found
+}
+
 /// Raw key bytes, as typed.
 fn send_keys(handle: &str, keys: &str, deadline: Option<Instant>) -> Result<()> {
     orca(
@@ -666,7 +753,7 @@ fn send_keys(handle: &str, keys: &str, deadline: Option<Instant>) -> Result<()> 
 }
 
 fn close(handle: &str) -> Result<()> {
-    orca(
+    orca_to_end(
         &["terminal", "close", "--terminal", handle],
         Instant::now().checked_add(CLOSE),
     )
@@ -784,9 +871,20 @@ fn read_reply(path: &Path) -> Result<Option<String>> {
     }
 }
 
-/// `orca <args> --json` within `deadline`; the `result` of a successful call.
+/// `orca <args> --json` within `deadline`, stopped by an interrupt; the `result` of a successful
+/// call.
 fn orca(args: &[&str], deadline: Option<Instant>) -> Result<Value> {
-    let (mut out, success) = run_orca(args, deadline)?;
+    call(args, deadline, true)
+}
+
+/// As [`orca`], but run to its end whatever the interrupt flag says: a cleanup step, or a create
+/// whose effect the app may finish without its CLI.
+fn orca_to_end(args: &[&str], deadline: Option<Instant>) -> Result<Value> {
+    call(args, deadline, false)
+}
+
+fn call(args: &[&str], deadline: Option<Instant>, interruptible: bool) -> Result<Value> {
+    let (mut out, success) = run_orca(args, deadline, interruptible)?;
     if out["ok"] != true || !success {
         bail!(
             "orca {}: {}",
@@ -798,41 +896,33 @@ fn orca(args: &[&str], deadline: Option<Instant>) -> Result<Value> {
 }
 
 /// `orca <args> --json`: its JSON whether the call succeeded or not, and whether it exited 0.
-/// (`terminal wait` exits 1 with `"ok": true` when the agent is blocked on a dialog.) A call
-/// still running at `deadline` is killed with its process group and returns `TimedOut`.
-fn run_orca(args: &[&str], deadline: Option<Instant>) -> Result<(Value, bool)> {
-    use std::os::unix::process::CommandExt;
-    let child = Command::new("orca")
-        .args(args)
-        .arg("--json")
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .process_group(0)
-        .spawn()
-        .context("cannot run orca")?;
-    let pid = child.id();
-    let (tx, rx) = mpsc::channel();
-    // The output is read on a thread, so a full pipe cannot stall the deadline below.
-    std::thread::spawn(move || tx.send(child.wait_with_output()));
-    let out = match rx.recv_timeout(left(deadline)) {
-        Ok(out) => out.context("cannot run orca")?,
-        Err(_) => {
-            let _ = Command::new("kill")
-                .args(["-KILL", "--", &format!("-{pid}")])
-                .stderr(Stdio::null())
-                .status();
-            return Err(TimedOut(format!(
-                "orca {} did not answer in time",
-                args[..args.len().min(2)].join(" ")
-            ))
-            .into());
+/// (`terminal wait` exits 1 with `"ok": true` when the agent is blocked on a dialog.) The call
+/// runs in its own process group, which is killed at `deadline` (the call returns `TimedOut`)
+/// and, when `interruptible`, on an interrupt (see [`launch::output`]).
+fn run_orca(
+    args: &[&str],
+    deadline: Option<Instant>,
+    interruptible: bool,
+) -> Result<(Value, bool)> {
+    let name = args[..args.len().min(2)].join(" ");
+    let out = launch::output(
+        Command::new("orca")
+            .args(args)
+            .arg("--json")
+            .process_group(0),
+        deadline,
+        interruptible,
+    )
+    .map_err(|e| {
+        if e.is::<TimedOut>() {
+            TimedOut(format!("orca {name} did not answer in time")).into()
+        } else {
+            e
         }
-    };
-    let v = serde_json::from_slice(&out.stdout).with_context(|| {
-        format!(
-            "orca {}: no JSON reply ({}): {}",
-            args[..args.len().min(2)].join(" "),
+    })?;
+    let v = serde_json::from_slice(&out.stdout).map_err(|_| {
+        anyhow::anyhow!(
+            "orca {name}: no JSON reply ({}): {}",
             out.status,
             String::from_utf8_lossy(&out.stderr).trim()
         )
@@ -922,6 +1012,29 @@ mod tests {
             "{err:#}"
         );
         fs::remove_dir_all(root).unwrap();
+    }
+
+    /// Review of PR #34, round 2, finding 2: the tab's title counts, not the row's, and only
+    /// for the worktree's own terminals; a split tab's panes are all found.
+    #[test]
+    fn titled_finds_the_panes_of_the_tab_by_its_title() {
+        let list = serde_json::json!({
+            "terminals": [
+                {"handle": "t1", "title": "Claude"},
+                {"handle": "t2", "title": "rreview:a"},
+                {"handle": "t3", "title": "Claude"},
+            ],
+            "visualLayouts": [{"root": {"type": "group", "tabs": [
+                {"title": "rreview:a", "panes": {"type": "split", "children": [
+                    {"type": "terminal", "handle": "t1", "title": "Claude"},
+                    {"type": "terminal", "handle": "t3", "title": "Claude"},
+                ]}},
+                {"title": "zsh", "panes": {"type": "terminal", "handle": "t2", "title": "rreview:a"}},
+                {"title": "rreview:a", "panes": {"type": "terminal", "handle": "other-worktree"}},
+            ]}}],
+        });
+        assert_eq!(titled(&list, "rreview:a"), ["t1", "t3"]);
+        assert!(titled(&list, "rreview:b").is_empty());
     }
 
     #[test]

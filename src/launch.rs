@@ -2,10 +2,10 @@
 //! both launch reviewers through these, so the doctor's self-test checks the real flags.
 
 use std::fs::{self, File};
-use std::io::{ErrorKind, Write};
+use std::io::{ErrorKind, Read, Write};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, ExitStatus, Stdio};
+use std::process::{Child, Command, ExitStatus, Output, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 use std::time::{Duration, Instant};
 
@@ -117,6 +117,63 @@ impl Launch {
     }
 }
 
+/// Runs `cmd` to its end with no stdin, its output captured. When the caller put it in its own
+/// process group, that group is killed at `deadline` ([`TimedOut`]; past it, `cmd` does not
+/// start) and, if `interruptible`, on an interrupt ([`Interrupted`]; after one, it does not
+/// start). A cleanup step is not interruptible: it runs to its end whatever the flag says.
+pub fn output(cmd: &mut Command, deadline: Option<Instant>, interruptible: bool) -> Result<Output> {
+    let program = cmd.get_program().to_string_lossy().into_owned();
+    let timed_out = || TimedOut(format!("{program} did not finish in time"));
+    let past = || deadline.is_some_and(|d| Instant::now() >= d);
+    if interruptible {
+        interrupted()?;
+    }
+    if past() {
+        return Err(timed_out().into());
+    }
+    let mut child = cmd
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .with_context(|| format!("cannot run {program}"))?;
+    // Reader threads, so a full pipe cannot stall the child while we wait on it.
+    fn read(pipe: Option<impl Read + Send + 'static>) -> std::thread::JoinHandle<Vec<u8>> {
+        std::thread::spawn(move || {
+            let mut buf = vec![];
+            if let Some(mut pipe) = pipe {
+                let _ = pipe.read_to_end(&mut buf);
+            }
+            buf
+        })
+    }
+    let (stdout, stderr) = (read(child.stdout.take()), read(child.stderr.take()));
+    // From 1 ms up: a quick call (most Orca calls) returns at once, a long wait polls at 20 ms.
+    let mut nap = Duration::from_millis(1);
+    loop {
+        // A descendant can hold the pipes after the leader exits, so the drain is under the
+        // deadline too: done only when the leader has exited and both pipes reached EOF. The
+        // leader stays unreaped until then, so its group id is not reused before a kill.
+        if exited(&child)? && stdout.is_finished() && stderr.is_finished() {
+            return Ok(Output {
+                status: child.wait()?,
+                stdout: stdout.join().unwrap_or_default(),
+                stderr: stderr.join().unwrap_or_default(),
+            });
+        }
+        if interruptible && let Err(e) = interrupted() {
+            kill_group(&mut child);
+            return Err(e);
+        }
+        if past() {
+            kill_group(&mut child);
+            return Err(timed_out().into());
+        }
+        std::thread::sleep(nap);
+        nap = (nap * 2).min(Duration::from_millis(20));
+    }
+}
+
 /// `rreview exec-reviewer` (the orca runner's shim, spec §3): replaces this process with
 /// `command`, given only the `inherit` variables of this environment that are set plus `set`.
 /// Values stay in the environment across the exec, out of every argv. Returns only on failure.
@@ -203,15 +260,16 @@ unsafe extern "C" {
     fn waitid(idtype: u32, id: u32, infop: *mut u64, options: i32) -> i32;
 }
 
-/// Only stores the signal, so a second one cannot cut the cleanup short; SIGKILL still can.
+/// Only stores the first signal, so a second one cannot cut the cleanup short (SIGKILL still
+/// can) nor change what the run reports.
 extern "C" fn on_signal(signum: i32) {
-    SIGNAL.store(signum, Ordering::SeqCst);
+    let _ = SIGNAL.compare_exchange(0, signum, Ordering::SeqCst, Ordering::SeqCst);
 }
 
-/// SIGINT and SIGTERM only set a flag: the waits that poll it ([`Launch::run`], the review's
-/// prepare steps) kill their process group and return [`Interrupted`], which unwinds through
-/// the run's cleanup guards (spec §4). Every reviewer and every cleanup step leads its own
-/// process group, so the terminal's Ctrl-C reaches rreview alone.
+/// SIGINT and SIGTERM only set a flag: the waits that poll it ([`Launch::run`], [`output`]) kill
+/// their process group and return [`Interrupted`], which unwinds through the run's cleanup
+/// guards (spec §4). Every reviewer and every cleanup step leads its own process group, so the
+/// terminal's Ctrl-C reaches rreview alone.
 pub fn catch_interrupts() {
     CATCHING.store(true, Ordering::SeqCst);
     for s in [SIGINT, SIGTERM] {
