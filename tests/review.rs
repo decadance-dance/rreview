@@ -2530,6 +2530,40 @@ fn orca_fails_a_pass_stuck_on_a_dialog_and_types_nothing_into_it() {
 }
 
 #[test]
+fn orca_a_dialog_opened_in_the_wrap_up_or_retry_fails_the_pass_as_a_dialog() {
+    let env = envelope("src/lib.rs");
+    // The first turn times out; the dialog opens after the wrap-up prompt, and the wrap-up's
+    // last wait ends at its deadline (what is left of the budget).
+    let fx = fixture();
+    let run = orca_run(
+        &fx,
+        &["--timeout", "2", "--budget", "8"],
+        "dialog-wrapup",
+        &env,
+    );
+    assert_eq!(run.code, Some(2), "{run:?}");
+    assert_eq!(fx.statuses(), ["started", "wrapup", "failed"], "{run:?}");
+    assert!(run.stderr.contains("waiting on a dialog"), "{run:?}");
+    assert!(!run.stderr.contains("the wrap-up timed out"), "{run:?}");
+    assert_eq!(run.prompt.matches("\n---\n").count(), 2, "{}", run.prompt);
+    fx.assert_orca_worktree_removed();
+
+    // The retry turn after an invalid reply takes the same path.
+    let fx = fixture();
+    let run = orca_run_with(
+        &fx,
+        &["--budget", "8"],
+        "dialog-retry",
+        &[("FAKE_REPLY", "not json".into())],
+    );
+    assert_eq!(run.code, Some(2), "{run:?}");
+    assert_eq!(fx.statuses(), ["started", "retry", "failed"], "{run:?}");
+    assert!(run.stderr.contains("waiting on a dialog"), "{run:?}");
+    assert_eq!(run.prompt.matches("\n---\n").count(), 2, "{}", run.prompt);
+    fx.assert_orca_worktree_removed();
+}
+
+#[test]
 fn orca_a_slow_wait_ends_the_pass_only_at_its_deadline() {
     // Every wait after the prompt answers after 16 s: past its 10 s slice and the 5 s backstop,
     // well inside the pass's 40 s.

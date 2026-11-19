@@ -635,12 +635,22 @@ enum Wait {
 }
 
 /// `orca terminal wait --for tui-idle` until `deadline`: the agent finished its turn and waits
-/// for input. Between slices, a dialog left open counts as blocked.
+/// for input. Between slices, and once more at the deadline, a dialog left open counts as
+/// blocked.
 fn wait(handle: &str, deadline: Option<Instant>) -> Result<Wait> {
     loop {
         let slice = left(deadline).min(WAIT_SLICE);
         match wait_slice(handle, slice, deadline)? {
             Wait::TimedOut if !left(deadline).is_zero() => {}
+            Wait::TimedOut => {
+                // One bounded look, within the backstop a wait may take anyway: a dialog open
+                // at the deadline is reported as one, not as a timeout.
+                let probe = deadline.and_then(|d| d.checked_add(BACKSTOP));
+                return Ok(match dialog(handle, probe)? {
+                    Some(d) => Wait::Blocked(format!("waiting on {d}")),
+                    None => Wait::TimedOut,
+                });
+            }
             w => return Ok(w),
         }
         if let Some(d) = dialog(handle, deadline)? {
@@ -697,8 +707,14 @@ fn wait_slice(handle: &str, slice: Duration, deadline: Option<Instant>) -> Resul
 /// `deadline` comes first; none when there is none or the agent cleared it meanwhile.
 fn dialog(handle: &str, deadline: Option<Instant>) -> Result<Option<String>> {
     let first = Instant::now();
+    let mut seen = None;
     loop {
-        let v = orca(&["terminal", "show", "--terminal", handle], deadline)?;
+        let v = match orca(&["terminal", "show", "--terminal", handle], deadline) {
+            Ok(v) => v,
+            // A look the deadline cut short: the dialog the last one saw is the answer.
+            Err(e) if seen.is_some() && e.is::<TimedOut>() => return Ok(seen),
+            Err(e) => return Err(e),
+        };
         let w = &v["terminal"]["agentWait"];
         if w.is_null() {
             return Ok(None);
@@ -715,9 +731,10 @@ fn dialog(handle: &str, deadline: Option<Instant>) -> Result<Option<String>> {
             "a dialog ({what}, open {}s; Orca's agentWait {w})",
             open.as_secs()
         );
-        if open >= DIALOG || left(deadline) < Duration::from_secs(1) {
+        if open >= DIALOG || left(deadline) < Duration::from_secs(2) {
             return Ok(Some(d));
         }
+        seen = Some(d);
         std::thread::sleep(Duration::from_secs(1));
     }
 }
