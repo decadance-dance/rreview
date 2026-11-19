@@ -331,6 +331,8 @@ impl Runner for Orca {
             }
             _ => {}
         }
+        // limit: the shim runs this executable by path; replacing it mid-run (a rebuild) breaks
+        // the later launches of the run.
         let exe = std::env::current_exe().context("cannot find the rreview executable")?;
         let command = shell_line(&self.launch(pass)?, &self.scratch(pass).join("bin"), &exe)?;
         let v = orca(
