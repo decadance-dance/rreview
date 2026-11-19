@@ -2603,6 +2603,20 @@ fn orca_an_orca_transport_timeout_in_a_wait_is_a_slice_timeout() {
 }
 
 #[test]
+fn orca_a_dialog_look_cut_off_by_the_deadline_is_a_timeout_not_a_dialog() {
+    // The first look after the prompt sees a dialog that just opened; the next one is still
+    // running at the 15 s deadline (the dialog has gone). The pass times out, and the wrap-up
+    // looks again and finds no dialog.
+    let env = envelope("src/lib.rs");
+    let fx = fixture();
+    let run = orca_run(&fx, &["--timeout", "15"], "dialog-clears", &env);
+    assert_eq!(run.code, Some(0), "{run:?}");
+    assert_eq!(fx.statuses(), ["started", "wrapup", "completed"], "{run:?}");
+    assert_eq!(fx.out(), Some(env));
+    assert!(run.prompt.contains("Time is up."), "{}", run.prompt);
+}
+
+#[test]
 fn orca_waits_out_a_dialog_the_agent_clears_itself() {
     let env = envelope("src/lib.rs");
     let fx = fixture();

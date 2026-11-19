@@ -709,14 +709,10 @@ fn wait_slice(handle: &str, slice: Duration, deadline: Option<Instant>) -> Resul
 /// `deadline` comes first; none when there is none or the agent cleared it meanwhile.
 fn dialog(handle: &str, deadline: Option<Instant>) -> Result<Option<String>> {
     let first = Instant::now();
-    let mut seen = None;
     loop {
-        let v = match orca(&["terminal", "show", "--terminal", handle], deadline) {
-            Ok(v) => v,
-            // A look the deadline cut short: the dialog the last one saw is the answer.
-            Err(e) if seen.is_some() && e.is::<TimedOut>() => return Ok(seen),
-            Err(e) => return Err(e),
-        };
+        // A look the deadline cuts short is a timeout, whatever an earlier look saw: the
+        // dialog may be gone, and the next turn looks again before it types.
+        let v = orca(&["terminal", "show", "--terminal", handle], deadline)?;
         let w = &v["terminal"]["agentWait"];
         if w.is_null() {
             return Ok(None);
@@ -736,7 +732,6 @@ fn dialog(handle: &str, deadline: Option<Instant>) -> Result<Option<String>> {
         if open >= DIALOG || left(deadline) < Duration::from_secs(2) {
             return Ok(Some(d));
         }
-        seen = Some(d);
         std::thread::sleep(Duration::from_secs(1));
     }
 }
