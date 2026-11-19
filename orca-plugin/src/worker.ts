@@ -9,9 +9,12 @@ import { findingKey, TEXT_CAP, type Finding, type PassEvent, type Pr, type Resul
 
 const GH_TIMEOUT_MS = 30_000
 // rreview bounds itself by its --budget (default 3600 s) and its bounded cleanup; this only stops a
-// CLI that hangs past both.
-// limit: a kill here skips rreview's cleanup, so an Orca review worktree or terminal may stay behind.
+// CLI that hangs past both, with SIGTERM, so rreview still cleans up.
 const RUN_LIMIT_MS = 70 * 60_000
+// A SIGTERM'd rreview that is still running this much later (its Orca cleanup calls are bounded at
+// 5 minutes each) is killed.
+// limit: that kill skips what is left of rreview's cleanup.
+const STOP_GRACE_MS = 10 * 60_000
 const TAIL_MS = 1000
 const STDOUT_CAP = 16 << 20
 const STDERR_KEEP = 16 << 10
@@ -151,6 +154,8 @@ export default function activate(orca: OrcaWorkerApi): void {
   let run: Run | null = null
   /** The finished run's full result, from stdout; after a worker restart it is read back from disk. */
   let full: Result | null = null
+  /** Stops the running rreview (SIGTERM); null when none runs. */
+  let cancel: (() => void) | null = null
 
   /** The env of gh and rreview: with the GitHub account setting, that account's token, which is
    * fetched for each call and never stored. */
@@ -240,6 +245,13 @@ export default function activate(orca: OrcaWorkerApi): void {
     return r && boundResult(r)
   })
 
+  orca.panels.handle('review.cancel', async () => {
+    await loaded
+    if (!run || run.status !== 'running' || !cancel) throw fail('not_running', 'no review is running')
+    cancel()
+    return run
+  })
+
   // Set before the first await, so a second start during the lookups is refused too.
   let starting = false
 
@@ -313,15 +325,29 @@ export default function activate(orca: OrcaWorkerApi): void {
       }
     }
     const timer = setInterval(() => void tail(), TAIL_MS)
+    let killer: ReturnType<typeof setTimeout> | undefined
+    /** SIGTERM: rreview kills its reviewers, cleans up and exits 2; SIGKILL only if it outlasts the grace. */
+    const stop = () => {
+      if (killer) return
+      child.kill('SIGTERM')
+      killer = setTimeout(() => child.kill('SIGKILL'), STOP_GRACE_MS)
+    }
+    let cancelled = false
+    cancel = () => {
+      cancelled = true
+      stop()
+    }
     const limit = setTimeout(() => {
       r.error = `rreview ran past ${RUN_LIMIT_MS / 60_000} minutes and was stopped`
-      child.kill('SIGKILL')
+      stop()
     }, RUN_LIMIT_MS)
     const finish = async (code: number | null, error: string | null) => {
       if (ended) return
       ended = true
+      cancel = null
       clearInterval(timer)
       clearTimeout(limit)
+      clearTimeout(killer)
       while (reading) await new Promise((res) => setTimeout(res, 10))
       await tail()
       r.exitCode = code
@@ -337,6 +363,9 @@ export default function activate(orca: OrcaWorkerApi): void {
           r.status = 'failed'
           r.error = `rreview exited ${code} without a valid result: ${(e as Error).message}`
         }
+      } else if (cancelled) {
+        // A run that finished before the signal reached it stays done (above).
+        r.status = 'cancelled'
       } else {
         r.status = 'failed'
         r.error = cut(errorOf(stderr))

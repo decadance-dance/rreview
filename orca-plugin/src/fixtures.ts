@@ -58,6 +58,15 @@ export const done: Run = {
   summary: { gated: 2, all: 3, degraded: true }
 }
 
+export const cancelled: Run = {
+  ...base, status: 'cancelled', exitCode: 2, summary: null, error: null,
+  events: [
+    ...running.events,
+    ev('reliability', 'failed', 'claude', 70_000),
+    { ts: 1_700_000_071_000, role: 'run', status: 'interrupted', agent: '', model: '', duration_ms: 0, error: 'interrupted by SIGTERM' }
+  ]
+}
+
 export const failed: Run = {
   ...base, status: 'failed', exitCode: 2, summary: null,
   error: 'error: coordinator: the reply is not JSON',

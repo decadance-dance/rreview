@@ -13,6 +13,8 @@
 #   replaced      as ok, but 1.5 s after the panelists start another run replaces the run dir
 #                 with its own meta.json and progress (role `foreign`); the dir keeps its inode, as
 #                 Linux gives a dir made right after one removed
+#   hang          once the panelists have started, waits (30 s at most) for a SIGTERM; then, as
+#                 rreview, logs `rreview got TERM`, ends progress.jsonl with the stop and exits 2
 printf 'rreview %s | %s\n' "$PWD" "$*" >> "${FAKE_LOG:-/dev/null}"
 [ -n "$GH_TOKEN" ] && echo "rreview token $GH_TOKEN" >> "${FAKE_LOG:-/dev/null}"
 dir="$FAKE_STATE/run-$$"
@@ -29,6 +31,13 @@ p="$dir/progress.jsonl"
 ev() { printf '{"ts":%s000,"role":"%s","status":"%s","agent":"%s","model":"default","duration_ms":%s%s}\n' "$(date +%s)" "$1" "$2" "$3" "$4" "$5" >> "$p"; }
 for r in intent_contracts reliability security; do ev $r started claude 0; done
 [ "$FAKE_RREVIEW" = slow ] && sleep 2
+if [ "$FAKE_RREVIEW" = hang ]; then
+  trap 'echo "rreview got TERM" >> "${FAKE_LOG:-/dev/null}"
+    printf '"'"'{"ts":%s000,"role":"run","status":"interrupted","error":"interrupted by SIGTERM"}\n'"'"' "$(date +%s)" >> "$p"
+    echo "error: interrupted by SIGTERM" >&2; exit 2' TERM
+  i=0; while [ $i -lt 300 ]; do sleep 0.1; i=$((i + 1)); done
+  exit 2
+fi
 if [ "$FAKE_RREVIEW" = replaced ]; then
   sleep 1.5; rm -rf "$dir"/*; echo '{"run_id":"foreign"}' > "$dir/meta.json"
   for r in foreign foreign foreign foreign foreign foreign foreign foreign; do ev $r started codex 0; done

@@ -222,6 +222,25 @@ test('one run at a time', async () => {
   assert.equal(log().match(/^rreview \//gm)?.length, 1)
 })
 
+test('cancel sends rreview SIGTERM and shows the run as cancelled once it has cleaned up', async () => {
+  const worker = await mountWorker(main, { host: host() })
+  await assert.rejects(worker.request('review.cancel'), /no review is running/)
+  process.env.FAKE_RREVIEW = 'hang'
+  await worker.request('review.start', { workspaceId: 'ws1', runner: 'orca' })
+  for (let i = 0; i < 100 && !(worker.posts.at(-1)?.payload as Run).events.length; i++) {
+    await new Promise((r) => setTimeout(r, 20))
+  }
+  // Still running until rreview exits: its cleanup takes a while.
+  assert.equal((await worker.request('review.cancel')).status, 'running')
+  const run = await ended(worker)
+  assert.equal(run.status, 'cancelled')
+  assert.equal(run.exitCode, 2)
+  assert.equal(run.error, null)
+  assert.match(log(), /^rreview got TERM$/m)
+  assert.deepEqual([run.events.at(-1)?.role, run.events.at(-1)?.status], ['run', 'interrupted'])
+  await assert.rejects(worker.request('review.cancel'), /no review is running/)
+})
+
 test('a run the worker lost on restart is reported failed, not running', async () => {
   const stored = { status: 'running', runDir: '/tmp/x', pr: { number: 11 }, events: [] }
   const worker = await mountWorker(main, { host: host({ storage: { run: stored } }) })

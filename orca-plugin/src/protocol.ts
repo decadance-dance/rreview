@@ -15,7 +15,8 @@ export type Target = {
   error: string | null
 }
 
-/** One line of `<runroot>/progress.jsonl`. */
+/** One line of `<runroot>/progress.jsonl`. A run stopped by a signal ends with
+ * `{ts, role: "run", status: "interrupted", error}`, which has no agent, model or duration. */
 export type PassEvent = {
   ts: number
   role: string
@@ -57,7 +58,8 @@ export type Result = {
 export type Summary = { gated: number; all: number; degraded: boolean }
 
 export type Run = {
-  status: 'running' | 'done' | 'failed'
+  /** `cancelled`: stopped with `review.cancel`; rreview cleaned up and exited 2. */
+  status: 'running' | 'done' | 'failed' | 'cancelled'
   pr: Pr
   workspaceId: string
   runner: Runner
@@ -82,6 +84,10 @@ declare module 'orca' {
     'review.start': { input: { workspaceId: string; pr?: string; runner: Runner }; output: Run }
     /** The current or last run. */
     'review.get': { output: Run | null }
+    /** Sends the running rreview SIGTERM: it stops its reviewers, removes its worktree (and the
+     * orca runner's terminals and branch) and exits 2, and the run shows as cancelled. Refused
+     * when no run is running. */
+    'review.cancel': { output: Run }
     /** The finished run's result, bodies and length cut to Orca's limits (the full text stays in
      * result.json); null when no finished run or its run dir is gone or replaced. */
     'review.result': { output: Result | null }

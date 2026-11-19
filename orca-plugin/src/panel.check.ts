@@ -1,7 +1,7 @@
 // `orca plugin check` renders the panel once per scenario. The requests stand in for the worker,
 // which would run gh and rreview.
 import { defineCheck } from 'orca/testing'
-import { done, doneResult, failed, running, target } from './fixtures'
+import { cancelled, done, doneResult, failed, running, target } from './fixtures'
 import type { Run } from './protocol'
 
 const agents = { agents: [{ terminalId: 't1', title: 'claude', agent: 'claude', state: 'waiting', stateStartedAt: 0 }] }
@@ -15,6 +15,7 @@ export default defineCheck({
   running: scenario(running),
   done: scenario(done),
   failed: scenario(failed),
+  cancelled: scenario(cancelled),
   noPr: {
     requests: { 'target.get': () => ({ ...target, pr: null, error: 'no pull requests found for branch "topic"' }), 'review.get': () => null }
   }
