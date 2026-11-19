@@ -32,6 +32,13 @@ const CLOSE: Duration = Duration::from_secs(30);
 /// deadline, no JSON reply, or an error such as `runtime_timeout` (the CLI's own transport
 /// timeout), none of which proves the create was refused.
 const SETTLE: Duration = Duration::from_secs(30);
+/// `tui-idle` does not report Claude's permission dialog, only `terminal show`'s `agentWait`
+/// does, so a wait returns this often to look. A dialog open for `DIALOG` is one nobody will
+/// answer: Claude also shows some and clears them itself seconds later (*verified*, #28).
+const WAIT_SLICE: Duration = Duration::from_secs(10);
+const DIALOG: Duration = Duration::from_secs(30);
+/// How long past a turn's deadline an Orca wait may still answer before it is killed.
+const BACKSTOP: Duration = Duration::from_secs(5);
 
 /// The runner drives Orca through its CLI, which needs the app running with its runtime
 /// reachable and this repository registered (spec §4); `orca status` and `orca repo show` prove
@@ -628,15 +635,40 @@ enum Wait {
 }
 
 /// `orca terminal wait --for tui-idle` until `deadline`: the agent finished its turn and waits
-/// for input.
+/// for input. Between slices, and once more at the deadline, a dialog left open counts as
+/// blocked.
 fn wait(handle: &str, deadline: Option<Instant>) -> Result<Wait> {
+    loop {
+        let slice = left(deadline).min(WAIT_SLICE);
+        match wait_slice(handle, slice, deadline)? {
+            Wait::TimedOut if !left(deadline).is_zero() => {}
+            Wait::TimedOut => {
+                // One bounded look, within the backstop a wait may take anyway: a dialog open
+                // at the deadline is reported as one, not as a timeout.
+                let probe = deadline.and_then(|d| d.checked_add(BACKSTOP));
+                return Ok(match dialog(handle, probe)? {
+                    Some(d) => Wait::Blocked(format!("waiting on {d}")),
+                    None => Wait::TimedOut,
+                });
+            }
+            w => return Ok(w),
+        }
+        if let Some(d) = dialog(handle, deadline)? {
+            return Ok(Wait::Blocked(format!("waiting on {d}")));
+        }
+    }
+}
+
+/// One `tui-idle` wait of Orca's `slice`. Only the turn's `deadline` bounds the call itself: a
+/// slow CLI that answers after its slice still answers within the turn.
+fn wait_slice(handle: &str, slice: Duration, deadline: Option<Instant>) -> Result<Wait> {
     // limit: Node timers overflow above 2^31-1 ms (~24 days); a longer wait ends there as a timeout.
-    let ms = left(deadline).as_millis().min(i32::MAX as u128);
+    let ms = slice.as_millis().min(i32::MAX as u128);
     if ms == 0 {
         return Ok(Wait::TimedOut);
     }
     // Orca's own timeout answers first; the kill is the backstop for an orca that hangs.
-    let backstop = deadline.and_then(|d| d.checked_add(Duration::from_secs(5)));
+    let backstop = deadline.and_then(|d| d.checked_add(BACKSTOP));
     let (out, success) = run_orca(
         &[
             "terminal",
@@ -657,7 +689,9 @@ fn wait(handle: &str, deadline: Option<Instant>) -> Result<Wait> {
     }
     if out["ok"] != true {
         return match out["error"]["code"].as_str() {
-            Some("timeout") => Ok(Wait::TimedOut),
+            // `runtime_timeout`: the CLI's own transport timeout (`--timeout-ms` + 5 s) on a
+            // runtime briefly too slow; the turn goes on until its deadline.
+            Some("timeout" | "runtime_timeout") => Ok(Wait::TimedOut),
             _ => bail!("orca terminal wait: {}", error(&out)),
         };
     }
@@ -671,9 +705,44 @@ fn wait(handle: &str, deadline: Option<Instant>) -> Result<Wait> {
     )))
 }
 
+/// The dialog the agent waits on (Orca's `agentWait`), once it has been open for `DIALOG` or
+/// `deadline` comes first; none when there is none or the agent cleared it meanwhile.
+fn dialog(handle: &str, deadline: Option<Instant>) -> Result<Option<String>> {
+    let first = Instant::now();
+    loop {
+        // A look the deadline cuts short is a timeout, whatever an earlier look saw: the
+        // dialog may be gone, and the next turn looks again before it types.
+        let v = orca(&["terminal", "show", "--terminal", handle], deadline)?;
+        let w = &v["terminal"]["agentWait"];
+        if w.is_null() {
+            return Ok(None);
+        }
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_millis() as u64);
+        let since = w["since"].as_u64().map(|ms| now_ms.saturating_sub(ms));
+        let open = first
+            .elapsed()
+            .max(Duration::from_millis(since.unwrap_or(0)));
+        let what = w["reason"].as_str().unwrap_or("an interactive prompt");
+        let d = format!(
+            "a dialog ({what}, open {}s; Orca's agentWait {w})",
+            open.as_secs()
+        );
+        if open >= DIALOG || left(deadline) < Duration::from_secs(2) {
+            return Ok(Some(d));
+        }
+        std::thread::sleep(Duration::from_secs(1));
+    }
+}
+
 /// A prompt to the agent; Orca bracket-pastes it and submits it with Enter. Watching for the
-/// turn to start takes at most 10 s and never past `deadline`.
+/// turn to start takes at most 10 s and never past `deadline`. Nothing is typed into a dialog:
+/// Enter would answer it.
 fn send(handle: &str, agent: Agent, text: &str, deadline: Option<Instant>) -> Result<()> {
+    if let Some(d) = dialog(handle, deadline)? {
+        bail!("the agent waits on {d}; nothing was typed into it");
+    }
     let watch = left(deadline).as_secs().min(10).to_string();
     let text = printable(text);
     let mut args = vec![
