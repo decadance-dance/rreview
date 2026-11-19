@@ -6,8 +6,8 @@ the findings (spec §7, `docs/VISION-AND-SPEC.md`). The PR line, the runner and 
 rows at the top.
 
 - **PR**: the focused workspace's (`gh pr view` in its folder), or a PR number or URL typed under
-  **Other PR…** (folded, open on its own when the workspace has no PR), reviewed in that
-  workspace's repository.
+  **Other PR…** (folded, open on its own when the workspace has no PR, and below **Passes** once a
+  run ended), reviewed in that workspace's repository.
 - **Run review** (**Run again** once the PR was reviewed) starts `rreview <pr-url> --runner headless|orca --json` as a child process of the
   plugin's worker. One run at a time.
 - **Progress**: the worker learns the run id and dir from rreview's first `run id:` and `run dir:`
@@ -17,17 +17,18 @@ rows at the top.
   The panel shows how many passes are done, the time since the run started and a progress bar,
   each pass with its agent, a status that reads without color (`✓ done`, `✗ failed`,
   `● running`, `○ waiting`) and its time, and each failed pass with its reason (a long one
-  folded). Once the run ends they fold into **Passes** at the bottom, open when a pass failed.
-- **Cancel** (the stop button beside the running badge) sends rreview SIGTERM; see Limits.
+  folded). Once the run ends they fold into **Passes** at the bottom, folded by default; its title
+  counts the passes done and failed.
+- **Cancel** (the stop button beside **Running…**) sends rreview SIGTERM; see Limits.
 - **Result**: from rreview's exit code and its JSON on stdout (`result.json`). Exit 2, a crash or
   output that is not a valid result shows as a failed review with rreview's `error:` lines and the
   run dir; a review where a panelist or the judge failed shows as degraded.
-- **Findings**: the verdict with one line of counts (gated, below the gate, passes done, the
+- **Findings**: the verdict's first sentence (the rest under **More**) with one line of counts (gated, below the gate, passes done, the
   run's time, degraded), then a list, most urgent first: each finding's full title, and under it
   its priority as text, `P0`-`P3`, with an icon per severity, its file and lines, and the
-  confidence. The most urgent finding opens with its detail: its body, the `file:line` in a
-  read-only field to copy, a link to those lines on GitHub at the reviewed head, and the send
-  checkbox. Gated findings by default, all with **Below the gate too**; with none above the gate the panel says how many are
+  confidence. The most urgent finding opens with its detail: its body's first sentence (the rest
+  under **More**), the `file:lines` as code, a link to those lines on GitHub at the reviewed head,
+  and the send checkbox. Gated findings by default, all with the **below gate** switch; with none above the gate the panel says how many are
   below it. Posts
   and stored state carry only the run's status and counts; the panel fetches the result itself,
   with long texts cut and findings past about 200 KB left out (it says how many), so a large

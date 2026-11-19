@@ -34,9 +34,9 @@ config, and kept from changing your repo **by the OS sandbox**, not by the promp
 cleared the gate, so a script or an agent can act on it.
 
 <p align="center">
-  <img alt="The Rreview Orca plugin while a review runs: PR #1 on one line, the runner and Running on the next, then 2 of 4 passes with the running badge and a stop button, a progress bar, the two codex lenses done, the reliability lens running and the coordinator waiting" src="docs/screenshots/orca-plugin-running.png" width="32%">
+  <img alt="The Rreview Orca plugin while a review runs: PR #1 on one line, the runner, Running and a stop button on the next, then 2 of 4 passes with the running badge, a progress bar, the two codex lenses done, the reliability lens running and the coordinator waiting" src="docs/screenshots/orca-plugin-running.png" width="32%">
   &nbsp;
-  <img alt="The Rreview Orca plugin after the review: the verdict patch is correct with one line of counts (0 gated, 2 below gate, 4 of 5 passes, 17 minutes, degraded), then two P3 findings in docs/workflow/git-flow.md with full titles, the first one open with its body, its file and line to copy, a link to GitHub and the send checkbox" src="docs/screenshots/orca-plugin-findings.png" width="32%">
+  <img alt="The Rreview Orca plugin after the review: the verdict patch is correct with one line of counts (0 gated, 2 below gate, 4 of 5 passes, 17 minutes, degraded), then two P3 findings in docs/workflow/git-flow.md with full titles, the first one open with its body, its file and lines, a link to GitHub and the send checkbox" src="docs/screenshots/orca-plugin-findings.png" width="32%">
   <br>
   <sub>The Rreview Orca plugin on a real review: each pass while it runs, then the verdict and the findings.</sub>
 </p>
