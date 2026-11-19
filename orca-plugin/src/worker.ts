@@ -38,8 +38,9 @@ function fail(code: string, message: string): Error {
 /** A PR named by number or GitHub URL; anything else (a flag, say) is refused. */
 export function checkPrArg(pr: string): string {
   const s = pr.trim()
-  if (/^\d+$/.test(s) || /^https:\/\/github\.com\/[\w.-]+\/[\w.-]+\/pull\/\d+\/?$/.test(s)) return s
-  throw fail('invalid_pr', `not a PR number or GitHub PR URL: ${pr}`)
+  // Any host, GitHub Enterprise too (rreview reads owner and repo from the path); never a flag.
+  if (/^\d+$/.test(s) || /^https:\/\/[\w.-]+(:\d+)?\/[\w.-]+\/[\w.-]+\/pull\/\d+\/?$/.test(s)) return s
+  throw fail('invalid_pr', `not a PR number or PR URL (https://<host>/<owner>/<repo>/pull/<n>): ${pr}`)
 }
 
 /** Reviewer text typed into a terminal: control bytes would act as keys, so only \n stays. */
