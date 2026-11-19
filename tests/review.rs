@@ -502,6 +502,20 @@ fn reviewers_inherit_only_what_the_cli_needs() {
         .concat(),
     );
     assert_eq!(claude.code, Some(0), "{claude:?}");
+    // Claude's shell snapshot of the user's `.zshrc` sits in its config dir; no command reads it.
+    let settings = fs::read_to_string(
+        fx.runroot()
+            .join("scratch/reliability/claude-settings.json"),
+    )
+    .unwrap();
+    assert!(
+        settings.contains(
+            r#""denyRead": [
+        "/claude-config/shell-snapshots"
+      ]"#
+        ),
+        "{settings}"
+    );
     let codex = fx.run(
         &["--role-agent", "reliability=codex"],
         &[
@@ -561,6 +575,21 @@ fn assert_inherited_only_what_the_cli_needs(fx: &Fixture) {
         codex.iter().any(|l| l.starts_with("CODEX_HOME=")),
         "{codex:?}"
     );
+    // Claude runs its commands in zsh, whose fallback login reads only the empty ZDOTDIR.
+    assert!(
+        claude
+            .iter()
+            .any(|l| l.starts_with("CLAUDE_CODE_SHELL=/") && l.ends_with("/zsh")),
+        "{claude:?}"
+    );
+    // The user's zsh startup files stay out of the reviewer's commands (spec §3).
+    for env in [&claude, &codex] {
+        assert!(
+            env.iter()
+                .any(|l| l.starts_with("ZDOTDIR=/") && l.ends_with("/zdotdir")),
+            "{env:?}"
+        );
+    }
 }
 
 #[test]
@@ -585,7 +614,7 @@ fn codex_pass_with_repo_and_kept_worktree() {
     let runroot = fx.runroot();
     assert!(
         run.log.contains(&format!(
-            "codex exec --json -s read-only -C {} -o {} - CODEX_HOME={}",
+            "codex exec --json -s read-only -C {} -o {} -c allow_login_shell=false -c features.shell_snapshot=false - CODEX_HOME={}",
             runroot.join("wt").display(),
             runroot
                 .join("scratch/reliability/replies/reply.txt")
@@ -1135,7 +1164,7 @@ fn a_timed_out_pass_is_resumed_for_its_wrap_up() {
             )
         } else {
             format!(
-                "codex exec --json -s read-only -C {} -o {} resume fake-thread - CODEX_HOME={}\n",
+                "codex exec --json -s read-only -C {} -o {} -c allow_login_shell=false -c features.shell_snapshot=false resume fake-thread - CODEX_HOME={}\n",
                 fx.runroot().join("wt").display(),
                 fx.runroot()
                     .join("scratch/reliability/replies/reply.txt")
@@ -1905,7 +1934,7 @@ fn passes_get_their_own_scratch_and_cannot_reach_published_replies() {
         let dir = runroot.join("scratch").join(role);
         assert!(
             run.log.contains(&format!(
-                "-o {} - CODEX_HOME={}",
+                "-o {} -c allow_login_shell=false -c features.shell_snapshot=false - CODEX_HOME={}",
                 dir.join("replies/reply.txt").display(),
                 dir.join("codex-home").display()
             )),
@@ -2261,7 +2290,7 @@ fn orca_pass_end_to_end() {
             )
         } else {
             format!(
-                "'-C' '{}' '-s' 'workspace-write' '-a' 'never' '-c' 'sandbox_workspace_write.exclude_slash_tmp=true' '-c' 'sandbox_workspace_write.exclude_tmpdir_env_var=true' '-c' 'check_for_update_on_startup=false' '-c' 'shell_environment_policy.include_only=[\"PATH\",\"HOME\",\"USER\",\"LOGNAME\",\"SHELL\",\"TMPDIR\",\"LANG\",\"LC_ALL\",\"LC_CTYPE\",\"LC_COLLATE\",\"LC_MESSAGES\",\"LC_MONETARY\",\"LC_NUMERIC\",\"LC_TIME\",\"TZ\",\"TERM\",\"COLORTERM\",\"HTTPS_PROXY\",\"https_proxy\",\"NO_PROXY\",\"no_proxy\",\"NODE_EXTRA_CA_CERTS\",\"SSL_CERT_FILE\"]'",
+                "'-C' '{}' '-s' 'workspace-write' '-a' 'never' '-c' 'sandbox_workspace_write.exclude_slash_tmp=true' '-c' 'sandbox_workspace_write.exclude_tmpdir_env_var=true' '-c' 'check_for_update_on_startup=false' '-c' 'shell_environment_policy.include_only=[\"PATH\",\"HOME\",\"USER\",\"LOGNAME\",\"SHELL\",\"TMPDIR\",\"LANG\",\"LC_ALL\",\"LC_CTYPE\",\"LC_COLLATE\",\"LC_MESSAGES\",\"LC_MONETARY\",\"LC_NUMERIC\",\"LC_TIME\",\"TZ\",\"TERM\",\"COLORTERM\",\"HTTPS_PROXY\",\"https_proxy\",\"NO_PROXY\",\"no_proxy\",\"NODE_EXTRA_CA_CERTS\",\"SSL_CERT_FILE\",\"ZDOTDIR\"]' '-c' 'allow_login_shell=false' '-c' 'features.shell_snapshot=false'",
                 out.display()
             )
         };
@@ -2290,6 +2319,13 @@ fn orca_pass_end_to_end() {
             agent == "codex",
             "{shim}"
         );
+        // An empty ZDOTDIR keeps the user's zsh startup files out of the reviewer's commands.
+        let zdotdir = runroot.join("scratch/reliability/zdotdir");
+        assert!(
+            shim.contains(&format!("'ZDOTDIR={}'", zdotdir.display())),
+            "{shim}"
+        );
+        assert_eq!(fs::read_dir(&zdotdir).unwrap().count(), 0);
         // Each wait is a slice of at most 10 s, between which rreview looks for a dialog.
         let ms: Vec<u64> = run
             .log
@@ -2375,6 +2411,70 @@ fn orca_reviewers_inherit_only_what_the_cli_needs() {
         let shell_log = fs::read_to_string(fx.root.join("log.orca-shell")).unwrap_or_default();
         assert!(!shell_log.contains("launch failed"), "{shell}: {shell_log}");
         assert_inherited_only_what_the_cli_needs(&fx);
+    }
+}
+
+/// An Orca terminal's startup may set its own `CLAUDE_CONFIG_DIR` and `HOME`; Claude must get
+/// rreview's, which name the config dir whose shell snapshots its settings deny, whether
+/// rreview has a `CLAUDE_CONFIG_DIR` or not (review of PR #39, round 2).
+#[test]
+fn orca_claude_gets_rreviews_config_dir_not_the_terminals() {
+    let env = envelope("src/lib.rs");
+    for ours in ["/claude-config", ""] {
+        let fx = fixture();
+        let run = orca_run_with(
+            &fx,
+            &["--role-agent", "reliability=claude"],
+            "ok",
+            &[
+                ("FAKE_REPLY", env.to_string()),
+                ("FAKE_ORCA_SHELL", "sh".into()),
+                (
+                    "FAKE_ORCA_TERMINAL_ENV",
+                    "CLAUDE_CONFIG_DIR=/terminal-config HOME=/terminal-home".into(),
+                ),
+                ("CLAUDE_CONFIG_DIR", ours.into()),
+            ],
+        );
+        assert_eq!(run.code, Some(0), "{ours:?}: {run:?}");
+        let seen = fs::read_to_string(fx.root.join("log.env")).unwrap();
+        let claude: Vec<_> = seen
+            .split("== claude\n")
+            .nth(1)
+            .unwrap_or_else(|| panic!("no claude env in {seen}"))
+            .lines()
+            .take_while(|l| !l.starts_with("== "))
+            .collect();
+        assert!(
+            claude.contains(&format!("HOME={}", fx.root.display()).as_str()),
+            "{claude:?}"
+        );
+        let dir: Vec<_> = claude
+            .iter()
+            .filter(|l| l.starts_with("CLAUDE_CONFIG_DIR="))
+            .collect();
+        if ours.is_empty() {
+            assert!(dir.is_empty(), "{claude:?}");
+        } else {
+            assert_eq!(dir, [&"CLAUDE_CONFIG_DIR=/claude-config"], "{claude:?}");
+        }
+        let settings: Value = serde_json::from_str(
+            &fs::read_to_string(
+                fx.runroot()
+                    .join("scratch/reliability/claude-settings.json"),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let denied = if ours.is_empty() {
+            fx.root.join(".claude/shell-snapshots")
+        } else {
+            PathBuf::from("/claude-config/shell-snapshots")
+        };
+        assert_eq!(
+            settings["sandbox"]["filesystem"]["denyRead"],
+            json!([denied])
+        );
     }
 }
 

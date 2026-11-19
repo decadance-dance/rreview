@@ -37,6 +37,8 @@ fn doctor_with(args: &[&str], fakes: &[&str], scenario: &[(&str, &str)]) -> Run 
     let (bin, codex_home) = (root.join("bin"), root.join("codex"));
     fs::create_dir_all(&bin).unwrap();
     fs::create_dir_all(&codex_home).unwrap();
+    // The user's Claude config dir, which doctor's stand-in HOME for Claude links to.
+    fs::create_dir_all(root.join(".claude")).unwrap();
     fs::write(codex_home.join("auth.json"), "{}").unwrap();
     let fixtures = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/bin");
     for fake in fakes {
@@ -101,7 +103,9 @@ fn passes_with_working_isolation_and_launches_through_the_builders() {
         "ok    claude sandbox: git branch: blocked",
         "ok    claude sandbox: git diff: works",
         "ok    claude --safe-mode: planted project hook: did not fire",
+        "ok    claude: shell startup files: not read",
         "ok    codex sandbox: write into the worktree: blocked",
+        "ok    codex: shell startup files: not read",
         "ok    codex: user AGENTS.md: not loaded",
     ] {
         assert!(
@@ -182,6 +186,32 @@ fn fails_when_a_codex_write_goes_through() {
     );
 }
 
+/// A canary exported by the stand-in HOME's shell startup files must not reach a reviewer's
+/// command, and the control must see it.
+#[test]
+fn fails_when_the_shell_startup_files_reach_a_reviewer() {
+    let run = doctor(
+        ALL,
+        &[("FAKE_CLAUDE", "startup"), ("FAKE_CODEX", "startup")],
+    );
+    assert!(!run.passed);
+    assert_lines(
+        &run,
+        &[
+            "FAIL  claude: shell startup files: read: the export, function or alias",
+            "FAIL  codex: shell startup files: read: the export, function or alias",
+        ],
+    );
+    // A Claude whose command sources the snapshot of the stand-in .zshrc, checked by the real
+    // probe: the planted function and alias give it away.
+    let run = doctor(ALL, &[("FAKE_CLAUDE", "snapshot-leak")]);
+    assert!(!run.passed);
+    assert_lines(&run, &["FAIL  claude: shell startup files: read"]);
+    let run = doctor(ALL, &[("FAKE_CLAUDE", "no-control")]);
+    assert!(!run.passed);
+    assert_lines(&run, &["FAIL  claude: shell startup files: control failed"]);
+}
+
 #[test]
 fn fails_when_codex_loads_the_user_agents_md() {
     let run = doctor(ALL, &[("FAKE_CODEX", "user-agents")]);
@@ -250,6 +280,15 @@ fn fails_when_the_claude_pass_exits_non_zero() {
         "{}",
         run.stdout
     );
+}
+
+/// Where the sandbox cannot start, Claude must refuse to run rather than run Bash unsandboxed.
+#[test]
+fn fails_closed_when_the_claude_sandbox_cannot_start() {
+    let run = doctor(ALL, &[("FAKE_CLAUDE", "no-sandbox")]);
+    assert!(!run.passed, "{}", run.stdout);
+    assert_lines(&run, &["FAIL  claude self-test: claude exit status: 1"]);
+    assert!(!run.stdout.contains("went through"), "{}", run.stdout);
 }
 
 #[test]
@@ -372,6 +411,8 @@ fn orca_runner_passes_through_the_orca_launch_builders() {
             "ok    orca codex sandbox: write into the git dir: blocked",
             "ok    orca codex sandbox: write into HOME: blocked",
             "ok    orca codex: user AGENTS.md: not loaded",
+            "ok    orca claude: shell startup files: not read",
+            "ok    orca codex: shell startup files: not read",
         ],
     );
     for title in ["claude", "codex", "codex_control"] {
@@ -466,9 +507,18 @@ fn orca_runner_fails_each_check_on_broken_isolation() {
             &["FAIL  orca codex: user AGENTS.md: loaded"],
         ),
         (
+            ("FAKE_CLAUDE", "startup"),
+            &["FAIL  orca claude: shell startup files: read"],
+        ),
+        (
+            ("FAKE_CODEX", "startup"),
+            &["FAIL  orca codex: shell startup files: read"],
+        ),
+        (
             ("FAKE_CODEX", "ignore"),
             &[
                 "FAIL  orca codex sandbox: write into the worktree: the probe did not run",
+                "FAIL  orca codex: shell startup files: the probe did not run",
                 "FAIL  orca codex: user AGENTS.md: control failed",
             ],
         ),

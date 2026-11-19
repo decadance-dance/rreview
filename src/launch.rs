@@ -44,11 +44,11 @@ const INHERIT: &[&str] = &[
     "SSL_CERT_FILE",
 ];
 
-/// Claude's own subscription login: its config dir (an Orca account home, say) or a
-/// `claude setup-token` OAuth token, which then reaches the reviewer. Not `ANTHROPIC_API_KEY`:
+/// Claude's own subscription login: a `claude setup-token` OAuth token, which then reaches the
+/// reviewer; its config dir is pinned instead ([`claude_env`]). Not `ANTHROPIC_API_KEY`:
 /// it would move the review to API billing (spec §1: subscriptions, not API keys). Codex needs
 /// none: its login is the `auth.json` in its run-scoped home.
-const CLAUDE_INHERIT: &[&str] = &["CLAUDE_CONFIG_DIR", "CLAUDE_CODE_OAUTH_TOKEN"];
+const CLAUDE_INHERIT: &[&str] = &["CLAUDE_CODE_OAUTH_TOKEN"];
 
 /// One reviewer process: program, argument vector, the variables it inherits (see [`INHERIT`]),
 /// extra env and working directory.
@@ -326,8 +326,8 @@ pub fn claude(worktree: &Path, git_common_dir: &Path, runroot: &Path) -> Result<
         ]
         .map(String::from)
         .into(),
-        inherit: [INHERIT, CLAUDE_INHERIT].concat(),
-        env: vec![],
+        inherit: claude_inherit(),
+        env: claude_env(runroot)?,
         cwd,
     })
 }
@@ -354,8 +354,8 @@ pub fn claude_tui(worktree: &Path, git_common_dir: &Path, runroot: &Path) -> Res
         ]
         .map(String::from)
         .into(),
-        inherit: [INHERIT, CLAUDE_INHERIT].concat(),
-        env: vec![],
+        inherit: claude_inherit(),
+        env: claude_env(runroot)?,
         cwd,
     })
 }
@@ -371,6 +371,7 @@ fn claude_settings(
     fs::create_dir_all(runroot.join("out")).with_context(|| format!("{}", runroot.display()))?;
     let runroot = absolute(runroot)?;
     let out = runroot.join("out");
+    let snapshots = user_claude_config_dir()?.join("shell-snapshots");
     let settings_path = runroot.join("claude-settings.json");
     let settings = json!({
         "permissions": { "deny": [
@@ -382,18 +383,165 @@ fn claude_settings(
         ] },
         "sandbox": {
             "enabled": true,
+            // Without it, a sandbox that cannot start (Linux without bubblewrap) only warns
+            // and Bash runs unsandboxed.
+            "failIfUnavailable": true,
             "autoAllowBashIfSandboxed": true,
             "allowUnsandboxedCommands": false,
             "filesystem": {
                 "denyWrite": [utf8(&worktree)?, utf8(&git_common_dir)?],
-                "allowWrite": [utf8(&out)?]
+                "allowWrite": [utf8(&out)?],
+                // Claude Code builds a snapshot of the shell setup from the real home's
+                // `.zshrc` or `.bashrc` (functions, aliases, options, PATH) and sources it before
+                // each Bash command; unreadable, it is skipped (spec §3).
+                "denyRead": [utf8(&snapshots)?]
             }
         },
         "disableBundledSkills": true
     });
+    refuse_weakened_sandbox(&claude_settings_sources(&worktree)?)?;
     fs::write(&settings_path, serde_json::to_string_pretty(&settings)?)
         .with_context(|| format!("{}", settings_path.display()))?;
     Ok((utf8(&settings_path)?.into(), worktree))
+}
+
+/// What a Claude reviewer inherits: [`INHERIT`] but `HOME`, which [`claude_env`] pins.
+fn claude_inherit() -> Vec<&'static str> {
+    INHERIT
+        .iter()
+        .chain(CLAUDE_INHERIT)
+        .filter(|&&n| n != "HOME")
+        .copied()
+        .collect()
+}
+
+/// A Claude reviewer's own env: [`zdotdir`], [`claude_shell`], and rreview's own `HOME` and
+/// `CLAUDE_CONFIG_DIR` (when set), which name the config dir whose `shell-snapshots` the
+/// settings deny. Pinned, not inherited: an Orca terminal's startup may set its own, and Claude
+/// would then replay a snapshot from a dir the rule does not name. `CLAUDE_CONFIG_DIR` is not
+/// set when rreview has none: Claude names its keychain login after whether it is set.
+fn claude_env(runroot: &Path) -> Result<Vec<(String, String)>> {
+    let mut env = vec![
+        zdotdir(runroot)?,
+        ("CLAUDE_CODE_SHELL".into(), claude_shell()?),
+    ];
+    for name in ["HOME", "CLAUDE_CONFIG_DIR"] {
+        if let Some(v) = std::env::var_os(name).filter(|v| !v.is_empty()) {
+            let v = v
+                .into_string()
+                .map_err(|v| anyhow::anyhow!("{name} is not UTF-8: {}", v.display()))?;
+            env.push((name.into(), v));
+        }
+    }
+    Ok(env)
+}
+
+/// The zsh Claude Code runs Bash commands in (`CLAUDE_CODE_SHELL`, honored when it names bash
+/// or zsh). When its shell snapshot cannot be made, Claude runs each command as a login shell:
+/// a bash login reads `~/.bash_profile` whatever `ZDOTDIR` says, zsh only the empty
+/// `$ZDOTDIR`'s files (spec §3). No zsh: the launch fails closed.
+fn claude_shell() -> Result<String> {
+    use std::os::unix::fs::PermissionsExt;
+    let dirs = ["/bin", "/usr/bin", "/usr/local/bin", "/opt/homebrew/bin"];
+    dirs.iter()
+        .map(|d| Path::new(d).join("zsh"))
+        .find(|p| fs::metadata(p).is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0))
+        .map(|p| p.to_string_lossy().into_owned())
+        .with_context(|| {
+            format!(
+                "a Claude reviewer needs zsh, found in none of {}: without it Claude Code may run \
+                 commands as a bash login shell, which reads ~/.bash_profile (spec §3); install zsh",
+                dirs.join(", ")
+            )
+        })
+}
+
+/// The settings files Claude Code merges with rreview's `--settings`, each with whether it is
+/// a managed one (which outranks `--settings`): the machine's `managed-settings.json` and
+/// `managed-settings.d/*.json`, the user's `settings.json`, and the worktree's `.claude/`
+/// `settings.json` and `settings.local.json`, which the reviewed PR controls.
+// limit: managed settings from an MDM profile or the server are not read; the sandbox they
+// could turn off is still required to start (`failIfUnavailable`).
+fn claude_settings_sources(worktree: &Path) -> Result<Vec<(PathBuf, bool)>> {
+    let managed = Path::new(if cfg!(target_os = "macos") {
+        "/Library/Application Support/ClaudeCode"
+    } else {
+        "/etc/claude-code"
+    });
+    let mut sources = vec![(managed.join("managed-settings.json"), true)];
+    if let Ok(dir) = fs::read_dir(managed.join("managed-settings.d")) {
+        let mut drop_ins: Vec<_> = dir
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| p.extension().is_some_and(|e| e == "json"))
+            .collect();
+        drop_ins.sort();
+        sources.extend(drop_ins.into_iter().map(|p| (p, true)));
+    }
+    sources.push((user_claude_config_dir()?.join("settings.json"), false));
+    sources.push((worktree.join(".claude/settings.json"), false));
+    sources.push((worktree.join(".claude/settings.local.json"), false));
+    Ok(sources)
+}
+
+/// Refuses a launch whose merged settings would weaken the sandbox rreview asks for: a managed
+/// file that turns it off, lets it fail open, allows unsandboxed commands or leaves this
+/// platform out; or any file that runs commands outside it (`excludedCommands`) or reopens a
+/// denied read (`allowRead`, which beats `denyRead`). Arrays merge across files, so even the
+/// user's or the PR's own can do the latter.
+fn refuse_weakened_sandbox(sources: &[(PathBuf, bool)]) -> Result<()> {
+    let platform = if cfg!(target_os = "macos") {
+        "macos"
+    } else {
+        "linux"
+    };
+    for (path, managed) in sources {
+        let text = match fs::read_to_string(path) {
+            Ok(text) => text,
+            Err(e) if e.kind() == ErrorKind::NotFound => continue,
+            Err(e) => return Err(e).with_context(|| format!("{}", path.display())),
+        };
+        let s: serde_json::Value = serde_json::from_str(&text).with_context(|| {
+            format!(
+                "{} is not JSON; rreview cannot tell whether it weakens a Claude reviewer's sandbox",
+                path.display()
+            )
+        })?;
+        let sb = &s["sandbox"];
+        let non_empty = |v: &serde_json::Value| v.as_array().is_some_and(|a| !a.is_empty());
+        let mut weak = Vec::new();
+        if *managed {
+            if sb["enabled"] == false {
+                weak.push("sandbox.enabled is false".to_string());
+            }
+            if sb["failIfUnavailable"] == false {
+                weak.push("sandbox.failIfUnavailable is false".into());
+            }
+            if sb["allowUnsandboxedCommands"] == true {
+                weak.push("sandbox.allowUnsandboxedCommands is true".into());
+            }
+            if sb["enabledPlatforms"]
+                .as_array()
+                .is_some_and(|p| !p.iter().any(|p| p == platform))
+            {
+                weak.push(format!("sandbox.enabledPlatforms leaves out {platform}"));
+            }
+        }
+        if non_empty(&sb["excludedCommands"]) {
+            weak.push("sandbox.excludedCommands runs commands outside the sandbox".into());
+        }
+        if non_empty(&sb["filesystem"]["allowRead"]) {
+            weak.push("sandbox.filesystem.allowRead can reopen a denied read".into());
+        }
+        if !weak.is_empty() {
+            bail!(
+                "{}: {}; a Claude reviewer would not be confined to rreview's sandbox (spec §3)",
+                path.display(),
+                weak.join(", ")
+            );
+        }
+    }
+    Ok(())
 }
 
 /// `codex exec --json -s read-only -C <worktree> -o <runroot>/replies/<out_name> -` with
@@ -408,21 +556,12 @@ pub fn codex(worktree: &Path, runroot: &Path, out_name: &str, user_auth: &Path) 
     fs::create_dir_all(runroot.join("replies"))
         .with_context(|| format!("{}", runroot.display()))?;
     let (runroot, env) = codex_home(runroot, user_auth)?;
+    let reply = runroot.join("replies").join(out_name);
+    let args = ["exec", "--json", "-s", "read-only", "-C", utf8(&worktree)?];
+    let args = [&args[..], &["-o", utf8(&reply)?], &CODEX_NO_STARTUP, &["-"]].concat();
     Ok(Launch {
         program: "codex".into(),
-        args: [
-            "exec",
-            "--json",
-            "-s",
-            "read-only",
-            "-C",
-            utf8(&worktree)?,
-            "-o",
-            utf8(&runroot.join("replies").join(out_name))?,
-            "-",
-        ]
-        .map(String::from)
-        .into(),
+        args: args.into_iter().map(String::from).collect(),
         inherit: INHERIT.into(),
         env,
         cwd: worktree,
@@ -435,10 +574,15 @@ pub fn codex(worktree: &Path, runroot: &Path, out_name: &str, user_auth: &Path) 
 /// `-a never` returns a refused command to the model instead of asking the user.
 /// Orca's `codex` shell function prepends `-c shell_environment_policy.set.ORCA_*=...` (its
 /// terminal and workspace ids, its data dir); Codex applies `include_only` after `set`, so the
-/// reviewer's commands get only the allowlist, whichever `-c` comes first (spec §3).
+/// reviewer's commands get only the allowlist and the run's `ZDOTDIR` ([`zdotdir`]), whichever
+/// `-c` comes first (spec §3).
 pub fn codex_tui(worktree: &Path, runroot: &Path, user_auth: &Path) -> Result<Launch> {
     let worktree = absolute(worktree)?;
-    let names: Vec<_> = INHERIT.iter().map(|n| format!("\"{n}\"")).collect();
+    let names: Vec<_> = INHERIT
+        .iter()
+        .chain(&["ZDOTDIR"])
+        .map(|n| format!("\"{n}\""))
+        .collect();
     let include_only = format!(
         "shell_environment_policy.include_only=[{}]",
         names.join(",")
@@ -463,16 +607,38 @@ pub fn codex_tui(worktree: &Path, runroot: &Path, user_auth: &Path) -> Result<La
             "-c",
             &include_only,
         ]
+        .into_iter()
+        .chain(CODEX_NO_STARTUP)
         .map(String::from)
-        .into(),
+        .collect(),
         inherit: INHERIT.into(),
         env,
         cwd: worktree,
     })
 }
 
+/// `ZDOTDIR=<runroot>/zdotdir`, an empty dir no pass can write: zsh reads its startup files
+/// (`.zshenv`, and `.zprofile` and `.zshrc` for Codex's login shell and shell snapshot) from
+/// there instead of `$HOME`, so nothing the user's own ones export reaches a reviewer's commands
+/// (spec §3, *verified* for Claude's Bash and Codex's shell tool).
+fn zdotdir(runroot: &Path) -> Result<(String, String)> {
+    let dir = runroot.join("zdotdir");
+    fs::create_dir_all(&dir).with_context(|| format!("{}", dir.display()))?;
+    Ok(("ZDOTDIR".into(), utf8(&absolute(&dir)?)?.into()))
+}
+
+/// Codex runs commands through the account's login shell (from the passwd entry, not
+/// `$SHELL`) and its own shell snapshot of `.zshrc` or `.bashrc`; without both, `bash -c`
+/// reads no startup file and `zsh -c` only `$ZDOTDIR/.zshenv` (spec §3).
+const CODEX_NO_STARTUP: [&str; 4] = [
+    "-c",
+    "allow_login_shell=false",
+    "-c",
+    "features.shell_snapshot=false",
+];
+
 /// Creates `<runroot>/codex-home` with only the auth symlink; returns the resolved run root and
-/// the `CODEX_HOME` env.
+/// the `CODEX_HOME` and [`zdotdir`] env.
 fn codex_home(runroot: &Path, user_auth: &Path) -> Result<(PathBuf, Vec<(String, String)>)> {
     let user_auth = absolute(user_auth).context("Codex login (auth.json) not found")?;
     fs::create_dir_all(runroot).with_context(|| format!("{}", runroot.display()))?;
@@ -493,7 +659,21 @@ fn codex_home(runroot: &Path, user_auth: &Path) -> Result<(PathBuf, Vec<(String,
             .with_context(|| format!("{}", link.display()))?,
         Err(e) => return Err(e).with_context(|| format!("{} is not a symlink", link.display())),
     }
-    Ok((runroot, vec![("CODEX_HOME".into(), utf8(&home)?.into())]))
+    let env = vec![
+        ("CODEX_HOME".into(), utf8(&home)?.into()),
+        zdotdir(&runroot)?,
+    ];
+    Ok((runroot, env))
+}
+
+/// The user's Claude Code config dir, as Claude finds it: `$CLAUDE_CONFIG_DIR`, else
+/// `~/.claude`; absolute, symlink-free when it exists.
+pub fn user_claude_config_dir() -> Result<PathBuf> {
+    let dir = match std::env::var_os("CLAUDE_CONFIG_DIR").filter(|v| !v.is_empty()) {
+        Some(dir) => PathBuf::from(dir),
+        None => PathBuf::from(std::env::var_os("HOME").context("HOME is not set")?).join(".claude"),
+    };
+    Ok(fs::canonicalize(&dir).or_else(|_| std::path::absolute(&dir))?)
 }
 
 /// The user's Codex login: `$CODEX_HOME/auth.json`, else `~/.codex/auth.json`.
@@ -545,7 +725,26 @@ mod tests {
                 "json"
             ]
         );
-        assert!(launch.env.is_empty());
+        // rreview's own HOME and config dir, never the terminal's, name the dir the rule denies.
+        let pinned = ["HOME", "CLAUDE_CONFIG_DIR"].into_iter().filter_map(|n| {
+            let v = std::env::var(n).ok().filter(|v| !v.is_empty())?;
+            Some((n.to_string(), v))
+        });
+        let expected: Vec<_> = [
+            (
+                "ZDOTDIR".to_string(),
+                root.join("run/zdotdir").to_str().unwrap().to_string(),
+            ),
+            ("CLAUDE_CODE_SHELL".to_string(), claude_shell().unwrap()),
+        ]
+        .into_iter()
+        .chain(pinned)
+        .collect();
+        assert_eq!(launch.env, expected);
+        assert!(claude_shell().unwrap().ends_with("/zsh"));
+        assert!(!launch.inherits("HOME") && !launch.inherits("CLAUDE_CONFIG_DIR"));
+        assert!(launch.inherits("PATH") && launch.inherits("CLAUDE_CODE_OAUTH_TOKEN"));
+        assert_eq!(fs::read_dir(root.join("run/zdotdir")).unwrap().count(), 0);
         assert_eq!(launch.cwd, wt);
         let s: Value = serde_json::from_str(&fs::read_to_string(&settings_path).unwrap()).unwrap();
         assert_eq!(
@@ -565,12 +764,18 @@ mod tests {
         );
         let sandbox = &s["sandbox"];
         assert_eq!(sandbox["enabled"], true);
+        assert_eq!(sandbox["failIfUnavailable"], true);
         assert_eq!(sandbox["autoAllowBashIfSandboxed"], true);
         assert_eq!(sandbox["allowUnsandboxedCommands"], false);
         assert_eq!(sandbox["filesystem"]["denyWrite"], json!([wt, git]));
         assert_eq!(
             sandbox["filesystem"]["allowWrite"],
             json!([root.join("run/out")])
+        );
+        // Claude's shell snapshot, built from the user's `.zshrc`, never reaches a command.
+        assert_eq!(
+            sandbox["filesystem"]["denyRead"],
+            json!([user_claude_config_dir().unwrap().join("shell-snapshots")])
         );
         assert_eq!(s["disableBundledSkills"], true);
         assert!(root.join("run/out").is_dir());
@@ -590,6 +795,96 @@ mod tests {
         .unwrap();
         assert_eq!(s["sandbox"]["filesystem"]["denyWrite"][0], json!(wt));
         assert_eq!(launch.cwd, wt);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    /// Settings Claude merges with rreview's: only what would weaken the sandbox is refused,
+    /// and a managed file's scalars count, a user's or the PR's do not (`--settings` beats them).
+    #[test]
+    fn a_settings_file_that_weakens_the_sandbox_refuses_the_launch() {
+        let root = fresh_temp_dir("rreview-test").unwrap();
+        let check = |json: &str, managed: bool| {
+            let path = root.join("settings.json");
+            fs::write(&path, json).unwrap();
+            refuse_weakened_sandbox(&[(path, managed)]).map_err(|e| e.to_string())
+        };
+        let platform = if cfg!(target_os = "macos") {
+            "macos"
+        } else {
+            "linux"
+        };
+        let other = if platform == "macos" {
+            "linux"
+        } else {
+            "macos"
+        };
+        for (json, managed, why) in [
+            (
+                r#"{"sandbox":{"enabled":false}}"#,
+                true,
+                "sandbox.enabled is false",
+            ),
+            (
+                r#"{"sandbox":{"failIfUnavailable":false}}"#,
+                true,
+                "failIfUnavailable is false",
+            ),
+            (
+                r#"{"sandbox":{"allowUnsandboxedCommands":true}}"#,
+                true,
+                "allowUnsandboxedCommands",
+            ),
+            (
+                &format!(r#"{{"sandbox":{{"enabledPlatforms":["{other}"]}}}}"#),
+                true,
+                "enabledPlatforms leaves out",
+            ),
+            (
+                r#"{"sandbox":{"excludedCommands":["sh"]}}"#,
+                false,
+                "excludedCommands",
+            ),
+            (
+                r#"{"sandbox":{"filesystem":{"allowRead":["~"]}}}"#,
+                false,
+                "allowRead",
+            ),
+            ("{not json", false, "is not JSON"),
+        ] {
+            let err = check(json, managed).unwrap_err();
+            assert!(err.contains(why), "{json}: {err}");
+        }
+        for (json, managed) in [
+            (
+                r#"{"sandbox":{"enabled":false,"failIfUnavailable":false}}"#,
+                false,
+            ),
+            (
+                r#"{"sandbox":{"enabled":true,"excludedCommands":[]}}"#,
+                true,
+            ),
+            (
+                &format!(r#"{{"sandbox":{{"enabledPlatforms":["{platform}"]}}}}"#),
+                true,
+            ),
+            (r#"{"model":"opus"}"#, false),
+        ] {
+            assert_eq!(check(json, managed), Ok(()), "{json}");
+        }
+        assert!(refuse_weakened_sandbox(&[(root.join("missing.json"), true)]).is_ok());
+        // The reviewed PR's own `.claude/settings.json` is one of the files read.
+        let wt = root.join("wt");
+        fs::create_dir_all(wt.join(".claude")).unwrap();
+        fs::write(
+            wt.join(".claude/settings.json"),
+            r#"{"sandbox":{"excludedCommands":["git"]}}"#,
+        )
+        .unwrap();
+        let err = claude(&wt, &wt, &root.join("run")).unwrap_err().to_string();
+        assert!(
+            err.contains("wt/.claude/settings.json: sandbox.excludedCommands"),
+            "{err}"
+        );
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -622,12 +917,22 @@ mod tests {
                 wt.to_str().unwrap(),
                 "-o",
                 root.join("run/replies/security.json").to_str().unwrap(),
+                "-c",
+                "allow_login_shell=false",
+                "-c",
+                "features.shell_snapshot=false",
                 "-"
             ]
         );
         assert_eq!(
             launch.env,
-            [("CODEX_HOME".to_string(), home.to_str().unwrap().to_string())]
+            [
+                ("CODEX_HOME".to_string(), home.to_str().unwrap().to_string()),
+                (
+                    "ZDOTDIR".to_string(),
+                    root.join("run/zdotdir").to_str().unwrap().to_string()
+                )
+            ]
         );
         let entries: Vec<_> = fs::read_dir(&home)
             .unwrap()
@@ -641,6 +946,51 @@ mod tests {
                 .is_symlink()
         );
         assert_eq!(fs::read_link(home.join("auth.json")).unwrap(), auth);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    /// A `.zshenv` in `HOME` exports a canary; zsh run with a reviewer's env must not see it,
+    /// while the same env without `ZDOTDIR` does, or the check proves nothing.
+    #[test]
+    fn a_reviewer_shell_skips_the_user_zsh_startup_files() {
+        let Some(zsh) = ["/bin/zsh", "/usr/bin/zsh"]
+            .into_iter()
+            .find(|p| Path::new(p).exists())
+        else {
+            eprintln!("skipped: no zsh");
+            return;
+        };
+        let root = fresh_temp_dir("rreview-test").unwrap();
+        let (wt, home, auth) = (root.join("wt"), root.join("home"), root.join("auth.json"));
+        fs::create_dir_all(&wt).unwrap();
+        fs::create_dir_all(&home).unwrap();
+        fs::write(&auth, "{}").unwrap();
+        for f in [".zshenv", ".zprofile", ".zshrc"] {
+            fs::write(home.join(f), format!("export RREVIEW_STARTUP={f}\n")).unwrap();
+        }
+        let launches = [
+            claude(&wt, &wt, &root.join("c")).unwrap(),
+            claude_tui(&wt, &wt, &root.join("ct")).unwrap(),
+            codex(&wt, &root.join("x"), "r.json", &auth).unwrap(),
+            codex_tui(&wt, &root.join("xt"), &auth).unwrap(),
+        ];
+        for (i, mut launch) in launches.into_iter().enumerate() {
+            launch.program = zsh.into();
+            launch.args = ["-lic", "echo \"<$RREVIEW_STARTUP>\""]
+                .map(String::from)
+                .into();
+            launch
+                .env
+                .push(("HOME".into(), home.to_str().unwrap().into()));
+            let seen = |launch: &Launch, log: &str| {
+                let log = root.join(log);
+                launch.run("", &log, Duration::from_secs(20)).unwrap();
+                fs::read_to_string(log.with_extension("stdout")).unwrap()
+            };
+            assert_eq!(seen(&launch, &format!("l{i}")), "<>\n", "{launch:?}");
+            launch.env.retain(|(k, _)| k != "ZDOTDIR");
+            assert_eq!(seen(&launch, &format!("c{i}")), "<.zshrc>\n", "control");
+        }
         fs::remove_dir_all(root).unwrap();
     }
 
