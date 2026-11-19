@@ -1,0 +1,101 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="400" viewBox="0 0 1200 400" role="img" aria-labelledby="title desc">
+  <title id="title">rreview: isolated, cross-model panel review of a pull request</title>
+  <desc id="desc">The command rreview 42 &amp;&amp; gh pr ready 42: the PR is marked ready only when the review exits 0. Beside it, a pull request diff. Three lenses, intent on Codex, reliability on Claude and security on Codex, converge on one added line; the coordinator on Claude and the judge on Codex keep a real finding from rreview's calibration on its own PR 9: publishing follows a reviewer-planted out/ symlink, P2, confidence 0.70, gated. Exit codes: 0 clean, 1 gated, 2 failed.</desc>
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="0.35">
+      <stop offset="0" stop-color="#1c1107"/><stop offset="0.48" stop-color="#0b0b10"/><stop offset="1" stop-color="#07111f"/>
+    </linearGradient>
+    <linearGradient id="word" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0" stop-color="#fb923c"/><stop offset="1" stop-color="#60a5fa"/>
+    </linearGradient>
+    <pattern id="dots" width="24" height="24" patternUnits="userSpaceOnUse"><circle cx="2" cy="2" r="1" fill="#ffffff" opacity="0.05"/></pattern>
+    <filter id="shadow" x="-10%" y="-20%" width="120%" height="160%"><feDropShadow dx="0" dy="8" stdDeviation="10" flood-color="#000000" flood-opacity="0.6"/></filter>
+  </defs>
+
+  <rect width="1200" height="400" rx="24" fill="url(#bg)"/>
+  <rect width="1200" height="400" rx="24" fill="url(#dots)"/>
+  <rect x="0.5" y="0.5" width="1199" height="399" rx="24" fill="none" stroke="#26262f"/>
+
+  <g id="title-block">
+    <rect x="64" y="72" width="344" height="36" rx="10" fill="#14141c" stroke="#2a2a36" stroke-width="1.5"/>
+    <text x="82" y="96" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="16" fill="#e5e5e5"><tspan fill="#22c55e">$</tspan> rreview 42 <tspan fill="#8b8b9a">&amp;&amp;</tspan> gh pr ready 42</text>
+    <rect x="384" y="82" width="9" height="17" rx="1" fill="#e5e5e5" opacity="0.8"/>
+    <text x="58" y="194" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="84" font-weight="700" letter-spacing="-3" fill="url(#word)">rreview</text>
+    <text x="64" y="238" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="23" fill="#c4c4cc">Three lenses, two model families,</text>
+    <text x="64" y="270" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="23" fill="#c4c4cc">one verdict a script can read.</text>
+    <g font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="14">
+      <rect x="108" y="312" width="104" height="28" rx="14" fill="none" stroke="#22c55e" stroke-width="1.5"/>
+      <text x="160" y="331" text-anchor="middle" fill="#e5e5e5"><tspan fill="#22c55e" font-weight="700">0</tspan> <tspan fill="#8b8b9a">·</tspan> clean</text>
+      <rect x="224" y="312" width="104" height="28" rx="14" fill="none" stroke="#f59e0b" stroke-width="1.5"/>
+      <text x="276" y="331" text-anchor="middle" fill="#e5e5e5"><tspan fill="#f59e0b" font-weight="700">1</tspan> <tspan fill="#8b8b9a">·</tspan> gated</text>
+      <rect x="340" y="312" width="104" height="28" rx="14" fill="none" stroke="#ef4444" stroke-width="1.5"/>
+      <text x="392" y="331" text-anchor="middle" fill="#e5e5e5"><tspan fill="#ef4444" font-weight="700">2</tspan> <tspan fill="#8b8b9a">·</tspan> failed</text>
+      <text x="64" y="331" fill="#8b8b9a" font-size="14">exit</text>
+    </g>
+  </g>
+
+  <g id="diff">
+    <rect x="600" y="52" width="380" height="292" rx="14" fill="#0d0d14" stroke="#2a2a36" stroke-width="1.5"/>
+    <path d="M600 88 H980" stroke="#2a2a36" stroke-width="1.5"/>
+    <text x="620" y="76" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="13" fill="#8b8b9a">PR #9 <tspan fill="#5b5b68">· head</tspan> 1664fd9</text>
+    <text x="960" y="76" text-anchor="end" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="13"><tspan fill="#22c55e">+1626</tspan> <tspan fill="#ef4444">−20</tspan></text>
+    <text x="616" y="115" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="13" fill="#5b5b68"> </text>
+    <rect x="636" y="106" width="120" height="9" rx="4.5" fill="#3a3a48" opacity="1"/>
+    <rect x="766" y="106" width="60" height="9" rx="4.5" fill="#3a3a48" opacity="1"/>
+    <text x="616" y="135" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="13" fill="#5b5b68"> </text>
+    <rect x="652" y="126" width="90" height="9" rx="4.5" fill="#3a3a48" opacity="1"/>
+    <rect x="752" y="126" width="140" height="9" rx="4.5" fill="#3a3a48" opacity="1"/>
+    <text x="616" y="155" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="13" fill="#ef4444">−</text>
+    <rect x="652" y="146" width="160" height="9" rx="4.5" fill="#ef4444" opacity="0.45"/>
+    <text x="616" y="175" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="13" fill="#22c55e">+</text>
+    <rect x="652" y="166" width="110" height="9" rx="4.5" fill="#22c55e" opacity="0.5"/>
+    <rect x="772" y="166" width="70" height="9" rx="4.5" fill="#22c55e" opacity="0.5"/>
+    <text x="616" y="195" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="13" fill="#22c55e">+</text>
+    <rect x="668" y="186" width="180" height="9" rx="4.5" fill="#22c55e" opacity="0.5"/>
+    <rect x="601" y="201" width="378" height="20" fill="#f59e0b" opacity="0.13"/>
+    <rect x="601" y="201" width="3" height="20" fill="#f59e0b"/>
+    <text x="616" y="215" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="13" fill="#22c55e">+</text>
+    <rect x="668" y="206" width="70" height="9" rx="4.5" fill="#f59e0b" opacity="0.8"/>
+    <rect x="748" y="206" width="150" height="9" rx="4.5" fill="#f59e0b" opacity="0.8"/>
+    <text x="616" y="235" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="13" fill="#22c55e">+</text>
+    <rect x="652" y="226" width="130" height="9" rx="4.5" fill="#22c55e" opacity="0.5"/>
+    <text x="616" y="255" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="13" fill="#5b5b68"> </text>
+    <rect x="652" y="246" width="60" height="9" rx="4.5" fill="#3a3a48" opacity="1"/>
+    <text x="616" y="275" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="13" fill="#5b5b68"> </text>
+    <rect x="636" y="266" width="40" height="9" rx="4.5" fill="#3a3a48" opacity="1"/>
+    <text x="616" y="295" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="13" fill="#5b5b68"> </text>
+    <rect x="636" y="286" width="100" height="9" rx="4.5" fill="#3a3a48" opacity="1"/>
+  </g>
+
+  <g id="target" fill="none" stroke="#f59e0b" stroke-width="1.5">
+    <circle cx="954" cy="210" r="9"/><circle cx="954" cy="210" r="3" fill="#f59e0b"/>
+  </g>
+  <g id="lenses">
+    <text x="1008" y="54" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="12" letter-spacing="1" fill="#5b5b68">LENSES</text>
+    <path d="M1008 84 C 984 84, 994 210, 963 210" fill="none" stroke="#60a5fa" stroke-width="1.5" opacity="0.7"/>
+    <path d="M1008 136 C 984 136, 994 210, 963 210" fill="none" stroke="#fb923c" stroke-width="1.5" opacity="0.7"/>
+    <path d="M1008 188 C 984 188, 994 210, 963 210" fill="none" stroke="#60a5fa" stroke-width="1.5" opacity="0.7"/>
+    <rect x="1008" y="64" width="128" height="40" rx="10" fill="#0d0d14" stroke="#2a2a36" stroke-width="1.5"/>
+    <circle cx="1024" cy="84" r="4" fill="#60a5fa"/>
+    <text x="1036" y="82" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="13" fill="#e5e5e5">intent</text>
+    <text x="1036" y="97" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="11" fill="#60a5fa">codex</text>
+    <rect x="1008" y="116" width="128" height="40" rx="10" fill="#0d0d14" stroke="#2a2a36" stroke-width="1.5"/>
+    <circle cx="1024" cy="136" r="4" fill="#fb923c"/>
+    <text x="1036" y="134" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="13" fill="#e5e5e5">reliability</text>
+    <text x="1036" y="149" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="11" fill="#fb923c">claude</text>
+    <rect x="1008" y="168" width="128" height="40" rx="10" fill="#0d0d14" stroke="#2a2a36" stroke-width="1.5"/>
+    <circle cx="1024" cy="188" r="4" fill="#60a5fa"/>
+    <text x="1036" y="186" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="13" fill="#e5e5e5">security</text>
+    <text x="1036" y="201" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="11" fill="#60a5fa">codex</text>
+    <text x="1008" y="234" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="12" fill="#8b8b9a"><tspan fill="#fb923c">●</tspan> coordinator</text>
+    <text x="1008" y="252" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="12" fill="#8b8b9a"><tspan fill="#60a5fa">●</tspan> judge</text>
+  </g>
+  <path d="M954 219 V272" stroke="#f59e0b" stroke-width="1.5" stroke-dasharray="3 3"/>
+  <g id="finding" filter="url(#shadow)">
+    <rect x="700" y="272" width="436" height="76" rx="12" fill="#17110a" stroke="#f59e0b" stroke-width="1.5"/>
+  </g>
+  <text x="720" y="302" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="16" font-weight="600" fill="#f5f5f5">Publishing follows a reviewer-planted out/ symlink</text>
+  <text x="720" y="328" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="13" fill="#a3a3a3"><tspan fill="#fbbf24" font-weight="700">P2</tspan> · confidence 0.70 · coordinator</text>
+  <rect x="1046" y="312" width="72" height="22" rx="11" fill="#451a03"/>
+  <text x="1082" y="328" text-anchor="middle" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="13" fill="#fbbf24">gated</text>
+</svg>
