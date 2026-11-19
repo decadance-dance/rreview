@@ -8,7 +8,7 @@
   <img alt="Release 0.1.0" src="https://img.shields.io/badge/release-0.1.0-16a34a?style=flat-square&labelColor=000000">
   <img alt="Reviewers: Claude Code and Codex" src="https://img.shields.io/badge/reviewers-Claude%20Code%20%C2%B7%20Codex-334155?style=flat-square&labelColor=000000">
   <img alt="Runners: headless, Orca" src="https://img.shields.io/badge/runners-headless%20%C2%B7%20Orca-334155?style=flat-square&labelColor=000000">
-  <img alt="Sandbox: read-only by the OS" src="https://img.shields.io/badge/sandbox-read--only%20by%20the%20OS-334155?style=flat-square&labelColor=000000">
+  <img alt="Sandbox: enforced by the OS" src="https://img.shields.io/badge/sandbox-enforced%20by%20the%20OS-334155?style=flat-square&labelColor=000000">
   <img alt="Platform: macOS" src="https://img.shields.io/badge/platform-macOS-334155?style=flat-square&labelColor=000000&logo=apple&logoColor=white">
   <img alt="Rust stable" src="https://img.shields.io/badge/rust-stable-334155?style=flat-square&labelColor=000000&logo=rust&logoColor=white">
   <img alt="License: Apache-2.0" src="https://img.shields.io/badge/license-Apache--2.0-334155?style=flat-square&labelColor=000000">
@@ -30,7 +30,7 @@
 **lenses** review it in parallel, a **coordinator** tries to disprove every candidate finding, and
 a **judge** of the other model family re-examines only the dropped ones. Reviewers run through the
 official `claude` and `codex` CLIs on your own subscriptions, **isolated** from your personal agent
-config and **read-only by the OS sandbox**, not by the prompt. The exit code says whether anything
+config, and kept from changing your repo **by the OS sandbox**, not by the prompt. The exit code says whether anything
 cleared the gate, so a script or an agent can act on it.
 
 <p align="center">
@@ -47,15 +47,19 @@ cleared the gate, so a script or an agent can act on it.
 - **A cross-model panel reviews your PR**: `rreview <pr>` runs three lenses (intent and contracts,
   reliability, security) on Claude and Codex, then a coordinator and a judge, and gates the
   findings into `result.json` (exit 0 none gated, 1 gated, 2 failed).
-- **Reviewers cannot touch your repo or your secrets**: each runs sandboxed in its own worktree,
-  with only an allowlist of environment variables and none of your shell startup files;
-  `rreview doctor` proves it on your machine.
+- **Reviewers cannot change your repo**: the sandbox denies writes to the review worktree and its
+  git dir, reviewers inherit only an allowlist of environment variables and none of your shell
+  startup files, and `rreview doctor` checks these boundaries on your machine. They can still read
+  files outside the denied paths, your dotfiles included.
 - **Watch the review or run it headless**: `--runner orca` puts every reviewer in a visible Orca
-  terminal, and a pass stuck on a permission dialog fails at once instead of waiting out its timeout.
+  terminal, and the runner gives up on a pass stuck on a permission dialog instead of waiting out
+  its timeout.
 - **Run and cancel from Orca**: the Orca plugin reviews the focused workspace's PR, lists the
-  findings by file, sends the ones you pick to the PR's author agent, and cancels a run cleanly.
+  findings by file, sends the ones you pick to an agent you choose in that workspace, and cancels
+  a run.
 - **Upgrade note**: tested with Claude Code 2.1.316, codex-cli 0.167.0 and Orca 1.4.262 on macOS.
-  The default gate (P0-P2, confidence >= 0.5) is provisional; review quality is the focus of 0.2.0.
+  On Linux, Claude's sandbox needs bubblewrap and socat. The default gate (P0-P2 and confidence
+  >= 0.5) is provisional; review quality is the focus of 0.2.0.
   [Release notes](https://github.com/decadance-dance/rreview/releases/tag/0.1.0)
 
 ## 🚀 Key features
@@ -72,7 +76,7 @@ cleared the gate, so a script or an agent can act on it.
   mapping that would give them the same one is refused before any work. `--author codex` flips
   the defaults when Codex wrote the change.
 * **A gate and an exit code**: findings at P0-P2 with confidence >= 0.5 are gated (`--gate`
-  moves the bar, `--all` shows everything); exit 0 means none, 1 means some, 2 means the review failed.
+  moves the bar, `--all` reports every kept and restored finding); exit 0 means none, 1 means some, 2 means the review failed.
 
 | Lens | Looks for | Sees | Default agent |
 |---|---|---|---|
@@ -80,17 +84,20 @@ cleared the gate, so a script or an agent can act on it.
 | `reliability` | Failure at each call, partial success, races, cleanup, unbounded growth, rollback | diff, PR text | claude |
 | `security` | Trust boundaries, authz, injection, secrets, supply chain | diff only | codex |
 
-### 🔒 Reviewers that cannot change anything
+### 🔒 Reviewers that cannot change your repo
 > *Isolation is enforced by the OS and checked on your machine, not asked for in a prompt.*
 
-* **Read-only by the sandbox**: a reviewer cannot write to the review worktree, its git dir or
-  anywhere outside its own scratch dir; Claude's launch fails closed when its sandbox cannot start.
-* **None of your setup leaks in**: no personal `CLAUDE.md`, `AGENTS.md`, plugins, skills, hooks
-  or MCP, no shell startup files, and only an allowlist of environment variables.
-* **The PR is evidence, not instructions**: the reviewed repo's `AGENTS.md`, `.claude/` config,
-  PR body and task text reach reviewers as untrusted data.
-* **`rreview doctor` proves it**: a self-test on a throwaway repo through the same launch code a
-  review uses; a check passes only when the effects on disk and the agent's own logs agree.
+* **Write-protected by the sandbox**: writes to the review worktree and its git dir are denied,
+  so a reviewer cannot edit, commit or branch; each pass gets its own scratch dir for its reply.
+  A Claude launch fails closed when its sandbox cannot start or a settings file would weaken it.
+* **Your setup stays out**: no personal `CLAUDE.md`, `AGENTS.md`, plugins, skills, hooks or MCP,
+  no shell startup files, and only an allowlist of environment variables (it passes proxy
+  credentials and Claude's OAuth token when they are set).
+* **The PR is evidence, not instructions**: the reviewed repo's `AGENTS.md`, the PR body and the
+  task text reach reviewers as untrusted data.
+* **`rreview doctor` checks it**: a self-test on a throwaway repo through the same launch code a
+  review uses (writes, commits and branches fail, a planted hook does not fire, startup files stay
+  out); a check passes only when the effects on disk and the agent's own logs agree.
 
 ### 🖥️ Headless or in plain sight
 > *The same review runs like a CI job or with every reviewer in a terminal you can watch.*
@@ -98,13 +105,16 @@ cleared the gate, so a script or an agent can act on it.
 * **Headless by default**: reviewers run as child processes; `--json` prints `result.json`, and
   `rreview show <pr>` prints the latest result again.
 * **Orca runner**: `--runner orca` opens each pass in a visible [Orca](https://github.com/stablyai/orca)
-  terminal, and the [Orca plugin](orca-plugin/README.md) runs a review from a sidebar panel.
-* **Stopping cleans up**: Ctrl-C, SIGTERM or the plugin's Cancel stop every reviewer and remove the
-  review worktree, its branch and the reviewers' terminals; run dirs are private (0700).
+  terminal (the Orca app must be running, with this repo added to it), and the [Orca plugin](orca-plugin/README.md) runs a review from a sidebar panel.
+* **Stopping cleans up**: Ctrl-C, SIGTERM or the plugin's Cancel stops every reviewer, removes the
+  review worktree (unless `--keep-worktree`) and, with the Orca runner, its branch and the
+  reviewers' terminals, then exits 2. A cleanup step that fails is reported and can leave that
+  resource behind. Run dirs are private (0700).
 
 ## ⚡ Quick start
 
-You need macOS (the tested platform), [rustup](https://rustup.rs/) with a stable toolchain, `zsh`, and the
+You need macOS (the tested platform; Linux is untested, and Claude's sandbox there needs bubblewrap
+and socat), [rustup](https://rustup.rs/) with a stable toolchain, `zsh`, and the
 [`gh`](https://cli.github.com/), [`claude`](https://docs.anthropic.com/en/docs/claude-code) and
 [`codex`](https://github.com/openai/codex) CLIs, each logged in. No API keys: reviewers run on
 your Claude and ChatGPT subscriptions.
@@ -126,8 +136,9 @@ A review takes a few minutes (2-5 in the [calibration](docs/calibration.md)). It
 dir on stderr; `result.json`, the progress log and each pass's validated output stay there.
 
 > [!WARNING]
-> Isolation covers files, config and environment, not the network: a reviewer can still reach
-> the internet beyond the sandbox's deny rules. With `--runner orca`, answering Claude's workspace
+> Isolation keeps reviewers from changing your repo; it does not keep your files secret. A
+> reviewer can read files outside the denied paths, your dotfiles included, and reach the network
+> beyond the sandbox's deny rules. With `--runner orca`, answering Claude's workspace
 > trust dialog is recorded in your Claude config (`.claude.json`), as accepting it by hand would be.
 
 ## 🧭 How it works
@@ -137,7 +148,7 @@ flowchart TB
     pr(["<b>GitHub PR</b><br/>gh pr view · head and base"])
     wt["<b>Review worktree</b><br/>detached at the PR head<br/>never the author's checkout"]
 
-    subgraph panel["Panel · parallel, sandboxed, read-only"]
+    subgraph panel["Panel · parallel, sandboxed, repo write-protected"]
         direction LR
         intent["<b>intent_contracts</b><br/>codex"]
         rel["<b>reliability</b><br/>claude"]
@@ -213,7 +224,7 @@ contract and the CLI in full.
 <br>
 
 ```bash
-bin/check                              # the merge gate: fmt, clippy, tests, the Orca plugin's check and tests
+bin/check                              # the merge gate: fmt, clippy, tests, the Orca plugin's check and tests (needs zsh and the orca CLI)
 cargo test <name>                      # one test first; agents are faked, no logins needed
 RREVIEW_LIVE=1 cargo test -- --ignored # live tests against your real claude and codex logins
 cargo run -- doctor                    # after any change to how a reviewer is launched or isolated
