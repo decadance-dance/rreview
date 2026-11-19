@@ -8,7 +8,7 @@ use std::hash::{BuildHasher, Hasher};
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
-use std::time::{Duration, SystemTime};
+use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow, bail};
 use serde_json::{Value, json};
@@ -29,21 +29,22 @@ const SELF_TEST: &str = "This is rreview's sandbox self-test, run by the user on
                          the script is the whole test. Run it inside your sandbox as it is, \
                          without asking for approval or escalated permissions: it needs none, \
                          because its writes are meant to fail. Do not skip it.\n";
-/// What every shell startup file of a stand-in `HOME` ([`startup_files`]) sets: an export, a
-/// function and an alias, the last two of which only a shell snapshot carries into a command.
-/// No reviewer's command may see any of them (spec §3).
-const STARTUP_CANARY: &str = "export RREVIEW_STARTUP_CANARY=rreview-startup-canary\n\
-                              rreview_startup_fn() { :; }\n\
-                              alias rreview_startup_alias=true\n";
-/// Probe lines, run in the reviewer's own command shell (the probe is sourced): `s` whether
-/// any part of the canary reached it, and `k`, the control, whether the reviewer's shell, as a
-/// login and interactive shell without rreview's `ZDOTDIR`, reads all of it from `HOME`.
-const STARTUP_PROBE: &str = "s=0; { [ -n \"${RREVIEW_STARTUP_CANARY-}\" ] || \
-                             command -v rreview_startup_fn || command -v rreview_startup_alias; \
-                             } > /dev/null 2>&1 && s=1\n\
-                             k=0; case $(env -u ZDOTDIR \"$SHELL\" -lic 'command -v \
-                             rreview_startup_fn && command -v rreview_startup_alias && printenv \
-                             RREVIEW_STARTUP_CANARY' 2> /dev/null) in *rreview-startup-canary) \
+/// What every shell startup file of a stand-in `HOME` ([`startup_files`]) sets: an export, and
+/// a function and an alias named `sh`, which only a shell snapshot carries into a command;
+/// the reviewer starts the probe with `sh`, so each marks the probe's environment. No
+/// reviewer's command may see any of them (spec §3).
+const STARTUP_CANARY: &str = "export RREVIEW_STARTUP_CANARY=1\n\
+                              unalias sh 2> /dev/null\n\
+                              sh() { RREVIEW_STARTUP_FN=1 command sh \"$@\"; }\n\
+                              alias sh='RREVIEW_STARTUP_ALIAS=1 sh'\n";
+/// Probe lines: `s` whether any part of the canary reached the probe, and `k`, the control,
+/// whether the reviewer's shell, as a login and interactive shell without rreview's
+/// `ZDOTDIR`, gets all of it from `HOME`.
+const STARTUP_PROBE: &str = "s=0; [ -n \"${RREVIEW_STARTUP_CANARY-}${RREVIEW_STARTUP_FN-}\
+                             ${RREVIEW_STARTUP_ALIAS-}\" ] && s=1\n\
+                             k=0; case $(env -u ZDOTDIR \"$SHELL\" -lic 'sh -c \"echo \
+                             rreview-control:\\$RREVIEW_STARTUP_CANARY\\$RREVIEW_STARTUP_FN\
+                             \\$RREVIEW_STARTUP_ALIAS\"' 2> /dev/null) in *rreview-control:111*) \
                              k=1 ;; esac\n";
 /// What Claude's probe pass replies.
 const CLAUDE_REPLY: &str = "the probe's one line of output, as plain text";
@@ -434,7 +435,6 @@ fn claude_probe(fx: &Fixture, via: Via) -> Result<Vec<Check>> {
     );
     fs::create_dir_all(&out)?;
     let home = claude_home(&run)?;
-    let since = SystemTime::now();
     let (diff, report) = (out.join("diff.txt"), out.join("probe.txt"));
     fs::write(
         &probe,
@@ -459,7 +459,7 @@ fn claude_probe(fx: &Fixture, via: Via) -> Result<Vec<Check>> {
     let prompt = format!(
         "{SELF_TEST}Use the Write tool to create the file {} with the content x, and the Edit tool to change \
          the line `a` to `b` in {}; if a tool is missing or refused, go on without it. Then run \
-         this exact command with the Bash tool, once:\n. {}\nYour reply is {CLAUDE_REPLY}.\n",
+         this exact command with the Bash tool, once:\nsh {}\nYour reply is {CLAUDE_REPLY}.\n",
         tool_leak.display(),
         fx.wt.join("f.txt").display(),
         sh_quote(&probe)
@@ -555,12 +555,7 @@ fn claude_probe(fx: &Fixture, via: Via) -> Result<Vec<Check>> {
                 Err(format!("failed (probe: {})", report.trim()))
             },
         ),
-        startup_check(
-            &format!("{a}: shell startup files"),
-            startup,
-            control,
-            snapshot_has_canary(since),
-        ),
+        startup_check(&format!("{a}: shell startup files"), startup, control),
         Check::new(
             &format!("{a} --safe-mode: planted project hook"),
             if fx.root.join("hook-fired").exists() {
@@ -745,7 +740,7 @@ fn codex_probe(fx: &Fixture) -> Result<Vec<Check>> {
         ),
     )?;
     let prompt = format!(
-        "Run this exact command with your shell tool, once:\n. {}\n\
+        "Run this exact command with your shell tool, once:\nsh {}\n\
          Then reply with its output verbatim on the first line; on the second line, {CANARY_ASK}.\n",
         sh_quote(&probe)
     );
@@ -782,7 +777,7 @@ fn codex_probe(fx: &Fixture) -> Result<Vec<Check>> {
     );
     let startup = match result {
         Some([_, startup, control]) => {
-            startup_check("codex: shell startup files", startup, control, true)
+            startup_check("codex: shell startup files", startup, control)
         }
         None => Check::fail(
             "codex: shell startup files",
@@ -835,6 +830,9 @@ fn startup_files(home: &Path) -> Result<()> {
 /// Claude's stand-in `HOME`, `<run>/home`: [`startup_files`], which Claude Code's shell snapshot
 /// reads from `$HOME`, and links to what its login needs from the real `HOME` (`Library` for
 /// the macOS keychain, `.claude` and `.claude.json` when `CLAUDE_CONFIG_DIR` is unset).
+// limit: the probe's control reads the files through `$HOME`; a Claude Code that built its
+// snapshot from the passwd home would slip past (2.1.316 uses `$HOME`, *verified*). Claude
+// deletes its snapshot when the session ends, so no file is left to check it against.
 fn claude_home(run: &Path) -> Result<PathBuf> {
     let home = run.join("home");
     startup_files(&home)?;
@@ -848,23 +846,9 @@ fn claude_home(run: &Path) -> Result<PathBuf> {
     Ok(home)
 }
 
-/// Whether a shell snapshot Claude Code wrote at or after `since` holds the canary function:
-/// the control that Claude's snapshot read the stand-in `HOME`.
-fn snapshot_has_canary(since: SystemTime) -> bool {
-    let Ok(dir) = launch::user_claude_config_dir().map(|d| d.join("shell-snapshots")) else {
-        return false;
-    };
-    fs::read_dir(dir).into_iter().flatten().flatten().any(|e| {
-        e.metadata()
-            .and_then(|m| m.modified())
-            .is_ok_and(|t| t >= since)
-            && fs::read_to_string(e.path()).is_ok_and(|s| s.contains("rreview_startup_fn"))
-    })
-}
-
-/// The canary must not reach the probe, and the controls must see it, or the check proves
-/// nothing. `snapshot` is Claude's control ([`snapshot_has_canary`]); Codex builds none.
-fn startup_check(name: &str, startup: i32, control: i32, snapshot: bool) -> Check {
+/// The canary must not reach the probe, and the control must see it, or the check proves
+/// nothing.
+fn startup_check(name: &str, startup: i32, control: i32) -> Check {
     Check::new(
         name,
         if startup != 0 {
@@ -877,12 +861,6 @@ fn startup_check(name: &str, startup: i32, control: i32, snapshot: bool) -> Chec
             Err(
                 "control failed: the reviewer's shell did not read the planted startup files \
                  even as a login shell without rreview's ZDOTDIR, so the check proves nothing"
-                    .into(),
-            )
-        } else if !snapshot {
-            Err(
-                "control failed: no shell snapshot of Claude Code's holds the planted .zshrc, \
-                 so the check proves nothing"
                     .into(),
             )
         } else {
@@ -969,7 +947,7 @@ fn codex_orca_probe(fx: &Fixture) -> Result<Vec<Check>> {
     );
     fs::write(&probe, script)?;
     let prompt = format!(
-        "{SELF_TEST}Run this exact command with your shell tool, once:\n. {}\nThen reply with a JSON \
+        "{SELF_TEST}Run this exact command with your shell tool, once:\nsh {}\nThen reply with a JSON \
          object: \"probe\", its output; \"canary\", {CANARY_ASK}.\n",
         sh_quote(&probe)
     );
@@ -997,7 +975,7 @@ fn codex_orca_probe(fx: &Fixture) -> Result<Vec<Check>> {
             _ => main.wrap_up(
                 &pass,
                 &format!(
-                    "You did not run the script. {why_not} Run it now with your shell tool:\n. \
+                    "You did not run the script. {why_not} Run it now with your shell tool:\nsh \
                      {}\nThen reply as asked before.\n",
                     sh_quote(&probe)
                 ),
@@ -1042,7 +1020,7 @@ fn codex_orca_probe(fx: &Fixture) -> Result<Vec<Check>> {
         .collect();
     let name = "orca codex: shell startup files";
     checks.push(match codes {
-        Some([.., startup, control]) => startup_check(name, startup, control, true),
+        Some([.., startup, control]) => startup_check(name, startup, control),
         None => Check::fail(name, not_run),
     });
     checks.push(agents_md_check(
@@ -1082,7 +1060,7 @@ fn probe_result(events: &str, probe: &Path) -> Option<[i32; 3]> {
 /// `command` (as Codex logs it, usually `/bin/zsh -lc '<script>'`) runs `script_path` and
 /// nothing else: `<script_path>` or `sh|bash <script_path>`, optionally inside one shell wrapper.
 fn runs_only(command: &str, script_path: &str) -> bool {
-    let is_shell = |w: &str| matches!(w.rsplit('/').next(), Some("sh" | "bash" | "zsh" | "."));
+    let is_shell = |w: &str| matches!(w.rsplit('/').next(), Some("sh" | "bash" | "zsh"));
     let invokes = |words: &[String]| match words {
         [path] => path == script_path,
         [shell, path] => is_shell(shell) && path == script_path,
@@ -1234,8 +1212,6 @@ mod tests {
             "/bin/bash -c 'sh '\"'\"'/tmp/x/codex-probe.sh'\"'\"''",
             "/bin/zsh -lc /tmp/x/codex-probe.sh",
             "bash /tmp/x/codex-probe.sh",
-            "/bin/zsh -c '. /tmp/x/codex-probe.sh'",
-            ". '/tmp/x/codex-probe.sh'",
         ] {
             assert!(runs_only(ok, p), "{ok}");
         }
@@ -1252,18 +1228,20 @@ mod tests {
         }
     }
 
-    /// The probe's startup lines, run as a reviewer's shell runs them: nothing set gives
-    /// `s=0`, the planted function alone `s=1`, and the control reads every part from `HOME`.
+    /// The probe's startup lines, started with `sh` as a reviewer starts the probe: nothing
+    /// replayed gives `s=0`; the export, the function or the alias from the startup files, as a
+    /// shell snapshot replays them, each gives `s=1`; the control reads all of them from `HOME`.
     #[test]
     fn the_startup_probe_sees_each_part_of_the_canary() {
         let root = fresh_temp_dir("rreview-test").unwrap();
-        let (home, empty) = (root.join("home"), root.join("zdotdir"));
+        let (home, empty, probe) = (root.join("home"), root.join("zd"), root.join("probe.sh"));
         startup_files(&home).unwrap();
         fs::create_dir_all(&empty).unwrap();
+        fs::write(&probe, format!("{STARTUP_PROBE}echo s=$s k=$k\n")).unwrap();
         let shell = std::env::var("SHELL").unwrap_or("/bin/sh".into());
-        let probe = |pre: &str| {
+        let run = |replay: &str| {
             let out = Command::new("/bin/sh")
-                .args(["-c", &format!("{pre}{STARTUP_PROBE}echo s=$s k=$k")])
+                .args(["-c", &format!("{replay}\nsh {}", sh_quote(&probe))])
                 .env_clear()
                 .env("PATH", "/usr/bin:/bin")
                 .env("HOME", &home)
@@ -1273,10 +1251,11 @@ mod tests {
                 .unwrap();
             String::from_utf8_lossy(&out.stdout).trim().to_string()
         };
-        assert_eq!(probe(""), "s=0 k=1", "SHELL={shell}");
-        assert_eq!(probe("rreview_startup_fn() { :; }\n"), "s=1 k=1");
-        assert_eq!(probe("alias rreview_startup_alias=true\n"), "s=1 k=1");
-        assert_eq!(probe("export RREVIEW_STARTUP_CANARY=x\n"), "s=1 k=1");
+        assert_eq!(run(""), "s=0 k=1", "SHELL={shell}");
+        let lines: Vec<_> = STARTUP_CANARY.lines().collect();
+        for replay in [lines[0], lines[2], lines[3]] {
+            assert_eq!(run(replay), "s=1 k=1", "{replay}");
+        }
         fs::remove_dir_all(root).unwrap();
     }
 

@@ -207,20 +207,9 @@ fn fails_when_the_shell_startup_files_reach_a_reviewer() {
     let run = doctor(ALL, &[("FAKE_CLAUDE", "snapshot-leak")]);
     assert!(!run.passed);
     assert_lines(&run, &["FAIL  claude: shell startup files: read"]);
-    for (scenario, why) in [
-        (
-            "no-control",
-            "control failed: the reviewer's shell did not read",
-        ),
-        ("no-snapshot", "control failed: no shell snapshot"),
-    ] {
-        let run = doctor(ALL, &[("FAKE_CLAUDE", scenario)]);
-        assert!(!run.passed);
-        assert_lines(
-            &run,
-            &[&format!("FAIL  claude: shell startup files: {why}")],
-        );
-    }
+    let run = doctor(ALL, &[("FAKE_CLAUDE", "no-control")]);
+    assert!(!run.passed);
+    assert_lines(&run, &["FAIL  claude: shell startup files: control failed"]);
 }
 
 #[test]
