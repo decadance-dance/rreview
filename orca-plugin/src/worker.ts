@@ -388,7 +388,7 @@ export default function activate(orca: OrcaWorkerApi): void {
       }
       publish(true)
     }
-    child.on('error', (e) => void finish(null, `cannot run ${bin}: ${e.message} (set its path in Settings > Plugins > rreview)`))
+    child.on('error', (e) => void finish(null, `cannot run ${bin}: ${e.message} (set its path in Settings > Plugins > Rreview)`))
     child.on('close', (code, signal) => void finish(code, signal ? `rreview was stopped by ${signal}` : null))
   }
 

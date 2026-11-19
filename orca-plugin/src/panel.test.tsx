@@ -34,6 +34,7 @@ function setup(run: Run | null = null) {
 test('shows the workspace PR and starts a review with the chosen runner', async () => {
   const { host, calls } = setup()
   const view = await mount(panel, { host })
+  assert.equal(view.find({ text: 'Rreview' })?.text, 'Rreview')
   assert.match(view.summary().join('\n') + JSON.stringify(view.tree()), /Orca runner/)
   await view.select({ label: 'Runner' }, 'orca')
   await view.press({ text: 'Run review' })
