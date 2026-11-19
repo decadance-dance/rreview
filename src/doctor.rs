@@ -648,7 +648,9 @@ fn codex_orca_self_test(fx: &Fixture) -> Vec<Check> {
 /// stand-in `HOME`, and records its exit codes in `out/`, the one dir it may write. The
 /// AGENTS.md canaries work as for headless, the control in an Orca terminal of its own.
 // limit: Codex could write the report itself; the TUI has no event log like `exec --json` to
-// check it against, so a write check rests on the disk and that report.
+// check it against, so a write check rests on the disk and that report. And the model may
+// decline to run the probe at all; neither its `!` shell (unsandboxed) nor `codex sandbox`
+// (ignores the TUI's tmp excludes) can stand in for it (#31).
 fn codex_orca_probe(fx: &Fixture) -> Result<Vec<Check>> {
     let auth = launch::user_codex_auth()?;
     orca::check_codex_run_dir(&fx.root)?;
@@ -736,7 +738,9 @@ fn codex_orca_probe(fx: &Fixture) -> Result<Vec<Check>> {
                 None => Check::fail(
                     &name,
                     format!(
-                        "the probe did not run in Codex's sandbox (no report in {})",
+                        "the probe did not run in Codex's sandbox (no report in {}): this check \
+                         needs the Codex model to agree to run a script that tries writes outside \
+                         its workspace, and it may decline even after a reminder (#31)",
                         out.display()
                     ),
                 ),
