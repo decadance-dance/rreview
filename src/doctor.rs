@@ -489,6 +489,10 @@ fn claude_probe(fx: &Fixture, via: Via) -> Result<Vec<Check>> {
         let outcome = match &tools {
             _ if landed => Err("went through".into()),
             Err(e) => Err(format!("no evidence that Claude could not use it: {e:#}")),
+            Ok(t) if t.used.contains(tool) => Err(format!(
+                "Claude Code did not refuse a call of {tool} for want of permission, so the \
+                 unchanged worktree proves nothing"
+            )),
             Ok(t) if !t.offered.contains(tool) => Ok("blocked (not offered to Claude)".into()),
             Ok(t) if t.refused.contains(tool) => Ok("blocked (refused)".into()),
             Ok(_) => Err(format!(
@@ -539,19 +543,23 @@ fn claude_probe(fx: &Fixture, via: Via) -> Result<Vec<Check>> {
 }
 
 /// What Claude Code's own session transcript in `cwd` shows: the tools it offered the model
-/// (`api-request-shape` records, one per distinct request) and the tools whose call it refused.
+/// (`api-request-shape` records, one per distinct request), the tools it refused a call of for
+/// want of permission, and the tools with any other call: one that ran, failed otherwise or has
+/// no result. Only a tool in `refused` and not in `used` counts as refused.
 #[derive(Debug, Default)]
 struct ClaudeTools {
     offered: std::collections::HashSet<String>,
     refused: std::collections::HashSet<String>,
+    used: std::collections::HashSet<String>,
 }
 
 /// Reads the session transcripts Claude Code keeps for `cwd` under
 /// `$CLAUDE_CONFIG_DIR` (else `~/.claude`)`/projects/<cwd, each non-alphanumeric as ->/`. Only
 /// the probe pass runs there with that config dir (the hook control has its own).
 // limit: an internal format of Claude Code (2.1.316); a change makes the Write and Edit checks
-// fail for want of evidence, never pass. Paths over 200 characters, which Claude Code shortens,
-// are not found.
+// fail for want of evidence, never pass: every request shape must list its tools by name,
+// Bash among them, and a refusal counts only with the one permission-denial text seen
+// (`PERMISSION_DENIED`). Paths over 200 characters, which Claude Code shortens, are not found.
 fn claude_tools(cwd: &Path) -> Result<ClaudeTools> {
     let config = std::env::var_os("CLAUDE_CONFIG_DIR")
         .filter(|v| !v.is_empty())
@@ -564,7 +572,11 @@ fn claude_tools(cwd: &Path) -> Result<ClaudeTools> {
         .collect();
     let dir = config.join("projects").join(key);
     let mut t = ClaudeTools::default();
-    let (mut calls, mut shapes) = (std::collections::HashMap::new(), 0);
+    let (mut calls, mut denied) = (
+        std::collections::HashMap::new(),
+        std::collections::HashMap::new(),
+    );
+    let mut shapes = 0;
     let entries = fs::read_dir(&dir)
         .with_context(|| format!("no Claude session transcript in {}", dir.display()))?;
     for entry in entries {
@@ -578,8 +590,17 @@ fn claude_tools(cwd: &Path) -> Result<ClaudeTools> {
             };
             if v["type"] == "api-request-shape" {
                 shapes += 1;
-                for tool in v["shape"]["tools"].as_array().into_iter().flatten() {
-                    t.offered.extend(tool["name"].as_str().map(String::from));
+                let names: Option<Vec<&str>> = v["shape"]["tools"]
+                    .as_array()
+                    .and_then(|tools| tools.iter().map(|tool| tool["name"].as_str()).collect());
+                match names {
+                    Some(names) if names.contains(&"Bash") => {
+                        t.offered.extend(names.into_iter().map(String::from));
+                    }
+                    _ => bail!(
+                        "an incomplete record of the tools Claude offered in {}",
+                        path.display()
+                    ),
                 }
             }
             for item in v["message"]["content"].as_array().into_iter().flatten() {
@@ -590,9 +611,15 @@ fn claude_tools(cwd: &Path) -> Result<ClaudeTools> {
                             calls.insert(id.to_string(), name.to_string());
                         }
                     }
-                    Some("tool_result") if item["is_error"] == true => {
-                        let name = item["tool_use_id"].as_str().and_then(|id| calls.get(id));
-                        t.refused.extend(name.cloned());
+                    Some("tool_result") => {
+                        if let Some(id) = item["tool_use_id"].as_str() {
+                            let refused = item["is_error"] == true
+                                && item["content"]
+                                    .as_str()
+                                    .is_some_and(|c| c.starts_with(PERMISSION_DENIED));
+                            // Any result of the call other than a denial makes it used.
+                            *denied.entry(id.to_string()).or_insert(refused) &= refused;
+                        }
                     }
                     _ => {}
                 }
@@ -602,8 +629,19 @@ fn claude_tools(cwd: &Path) -> Result<ClaudeTools> {
     if shapes == 0 {
         bail!("no record of the tools Claude offered in {}", dir.display());
     }
+    for (id, name) in calls {
+        if denied.get(&id) == Some(&true) {
+            t.refused.insert(name);
+        } else {
+            t.used.insert(name);
+        }
+    }
     Ok(t)
 }
+
+/// How Claude Code's tool result starts when it refused a call for want of permission
+/// (*verified*, 2.1.316, on Read).
+const PERMISSION_DENIED: &str = "Claude requested permissions to ";
 
 /// Positive control for the planted hook, without a model call: the same launch minus
 /// `--safe-mode`, with an empty `CLAUDE_CONFIG_DIR` (no user config, no login), fires the

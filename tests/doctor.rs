@@ -495,6 +495,9 @@ fn write_and_edit_need_evidence_that_claude_could_not_use_them() {
     for (scenario, ok) in [
         ("offered", false),
         ("no-transcript", false),
+        ("bare-shape", false),
+        ("error", false),
+        ("mixed", false),
         ("refused", true),
     ] {
         let run = doctor_orca(&[("FAKE_CLAUDE", scenario)]);

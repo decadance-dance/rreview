@@ -12,7 +12,10 @@
 #   dead-hook       never fires hooks, as if the planted hook were broken
 #   tools           the Write and Edit tools are offered and work in the worktree
 #   offered         the Write and Edit tools are offered but never tried
-#   refused         the Write and Edit tools are offered, tried and refused
+#   refused         the Write and Edit tools are offered, tried and refused for want of permission
+#   error           the Write and Edit tools are offered, tried and fail for another reason
+#   mixed           the Write and Edit tools are offered, tried twice: refused, then they work
+#   bare-shape      the transcript records a request shape without its tools
 #   no-transcript   leaves no session transcript
 #   nudge           (TUI) does nothing until the runner's reminder, then plays the probe
 # A probe pass leaves a session transcript as Claude Code does, under
@@ -106,15 +109,29 @@ transcript() {
   [ "$FAKE_CLAUDE" = no-transcript ] && return
   dir=${CLAUDE_CONFIG_DIR:-$HOME/.claude}/projects/$(printf '%s' "$PWD" | sed 's/[^A-Za-z0-9]/-/g')
   mkdir -p "$dir"
-  case "$FAKE_CLAUDE" in tools | offered | refused) tools='"Bash","Read","Write","Edit"' ;; *) tools='"Bash","Read"' ;; esac
-  echo '{"type":"api-request-shape","shape":{"tools":['"$(echo "$tools" | sed 's/"\([A-Za-z]*\)"/{"name":"\1"}/g')"']}}' > "$dir/fake.jsonl"
-  case "$FAKE_CLAUDE" in tools | refused)
-    [ "$FAKE_CLAUDE" = refused ] && err=true || err=false
-    for t in Write Edit; do
-      echo '{"type":"assistant","message":{"content":[{"type":"tool_use","id":"t'$t'","name":"'$t'","input":{}}]}}'
-      echo '{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"t'$t'","is_error":'$err',"content":"x"}]}}'
-    done >> "$dir/fake.jsonl" ;;
+  case "$FAKE_CLAUDE" in
+  bare-shape) echo '{"type":"api-request-shape","shape":{}}' > "$dir/fake.jsonl"; return ;;
+  tools | offered | refused | error | mixed) tools='"Bash","Read","Write","Edit"' ;;
+  *) tools='"Bash","Read"' ;;
   esac
+  echo '{"type":"api-request-shape","shape":{"tools":['"$(echo "$tools" | sed 's/"\([A-Za-z]*\)"/{"name":"\1"}/g')"']}}' > "$dir/fake.jsonl"
+  denied='"Claude requested permissions to write to '"$PWD"', but you haven'"'"'t granted it yet."'
+  case "$FAKE_CLAUDE" in
+  tools) results='false,"ok"' ;;
+  refused) results="true,$denied" ;;
+  error) results='true,"String to replace not found in file."' ;;
+  mixed) results="true,$denied
+false,\"ok\"" ;;
+  *) results= ;;
+  esac
+  # One line per round of calls: is_error, then the result's JSON content.
+  [ -n "$results" ] && printf '%s\n' "$results" | while read -r r; do
+    for t in Write Edit; do
+      id=t$t$(grep -c tool_use "$dir/fake.jsonl")
+      echo '{"type":"assistant","message":{"content":[{"type":"tool_use","id":"'$id'","name":"'$t'","input":{}}]}}'
+      echo '{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"'$id'","is_error":'"${r%%,*}"',"content":'"${r#*,}"'}]}}'
+    done >> "$dir/fake.jsonl"
+  done
 }
 transcript
 if [ "$FAKE_CLAUDE" = tools ]; then
