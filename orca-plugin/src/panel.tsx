@@ -41,6 +41,9 @@ import {
 import { findingKey, TEXT_CAP, type Finding, type PassEvent, type Result, type Run, type Runner, type Target } from './protocol'
 
 const ROLES = ['intent_contracts', 'reliability', 'security', 'coordinator', 'judge']
+const LENSES = ['intent_contracts', 'reliability', 'security']
+/** The passes every run has; the judge runs only when the coordinator dropped findings. */
+const FIXED = ROLES.filter((x) => x !== 'judge')
 
 const target = atom<Target | null>(null)
 const loading = atom(true)
@@ -108,8 +111,8 @@ async function showRun(r: Run | null): Promise<void> {
     if (read(run)?.token !== r.token) return
     set(result, res)
     set(picked, res ? res.findings.map(findingKey) : [])
-    // The first finding shown (rreview lists the most urgent first) opens with its detail.
-    const first = res && (read(showAll) ? res.ungated_findings : res.findings)[0]
+    // The most urgent finding shown opens with its detail.
+    const first = res && mostUrgent(read(showAll) ? res.ungated_findings : res.findings)
     set(selected, first ? findingKey(first) : null)
   }
 }
@@ -227,14 +230,27 @@ export function duration(ms: number): string {
   return s < 60 ? `${s}s` : `${Math.floor(s / 60)}m ${s % 60}s`
 }
 
-/** Each pass's last event, in pipeline order; the judge only once it ran. */
+/** The lowest `P<n>` first; among equals, rreview's order. */
+const mostUrgent = (list: Finding[]): Finding | undefined =>
+  list.reduce<Finding | undefined>((best, f) => (!best || f.priority < best.priority ? f : best), undefined)
+
+/** Each pass's last event, in pipeline order; the judge only once it ran. A finished run's
+ * result.json reports win: rreview records a pass's outcome there even when its last progress
+ * line was lost. */
 function passes(r: Run): { role: string; e?: PassEvent }[] {
   // The `run` line records a stop; it is no pass.
   const last = new Map(r.events.filter((e) => e.role !== 'run').map((e) => [e.role, e]))
+  const res = r.status === 'done' ? read(result) : null
+  for (const p of res?.passes ?? []) {
+    const e = last.get(p.role)
+    last.set(p.role, { ts: e?.ts ?? r.startedAt, model: e?.model ?? '', ...p })
+  }
   const roles = [...ROLES.filter((x) => x !== 'judge' || last.has('judge')), ...[...last.keys()].filter((x) => !ROLES.includes(x))]
   return roles.map((role) => ({ role, e: last.get(role) }))
 }
 
+/** The time of the run's last progress line. */
+const runEnd = (r: Run) => Math.max(r.startedAt, ...r.events.map((e) => e.ts))
 const finished = (e?: PassEvent) => e?.status === 'completed' || e?.status === 'failed'
 /** A glyph and a word: the status reads without color. */
 const STATUS: Record<string, string> = { completed: '✓ done', failed: '✗ failed', started: '● running', wrapup: '● wrapping up' }
@@ -256,7 +272,10 @@ function PassRows({ r }: { r: Run }) {
             </Text>
             {/* Grows to the line's end, so a status wrapped under a narrow panel stays right-aligned. */}
             <Box grow direction="row" justify="end">
-              {e ? (
+              {e && !finished(e) && r.status !== 'running' ? (
+                // The run ended without this pass's last line: its clock stops with the run.
+                <Text size="sm" muted>{`${r.status === 'done' ? '? unknown' : '■ interrupted'} · ${duration(runEnd(r) - (e.ts - e.duration_ms))}`}</Text>
+              ) : e ? (
                 <Text size="sm" tone={STATUS_TONE[e.status]}>
                   {`${STATUS[e.status] ?? e.status} · `}
                   {finished(e) ? duration(e.duration_ms) : <RelativeTime at={e.ts - e.duration_ms} format="duration" />}
@@ -362,8 +381,10 @@ function Status({ r }: { r: Run }) {
   const res = read(result)
   const list = passes(r)
   const done = list.filter(({ e }) => finished(e)).length
+  const fixedDone = list.filter(({ role, e }) => FIXED.includes(role) && finished(e)).length
+  const judge = list.find(({ role }) => role === 'judge')?.e
   const running = r.status === 'running'
-  const last = Math.max(r.startedAt, ...r.events.map((e) => e.ts))
+  const last = runEnd(r)
   return (
     <Stack gap="sm">
       <Separator />
@@ -372,10 +393,13 @@ function Status({ r }: { r: Run }) {
         <StatusBadge r={r} />
         {r.summary?.degraded ? <Badge tone="warning">degraded</Badge> : null}
       </Row>
-      {running ? <Progress label="Passes done" labelHidden value={Math.round((100 * done) / list.length)} /> : null}
+      {/* Once the fixed passes are done, whether the judge runs is unknown: no value, no 100 %. */}
+      {running ? (
+        <Progress label="Passes done" labelHidden value={fixedDone < FIXED.length ? Math.round((100 * fixedDone) / FIXED.length) : undefined} />
+      ) : null}
       {running ? (
         <Text size="sm" muted>
-          {`${done} of ${list.length} passes done · elapsed `}
+          {`${fixedDone} of ${FIXED.length} passes done${judge ? `, judge ${finished(judge) ? judge.status : 'running'}` : ''} · elapsed `}
           <RelativeTime at={r.startedAt} format="duration" />
         </Text>
       ) : r.events.length ? (
@@ -418,8 +442,8 @@ function Status({ r }: { r: Run }) {
 
 /** Each pass and why any failed: under the findings once there are any, the run's detail. */
 function Passes({ r }: { r: Run }) {
-  const res = read(result)
   const failures = passes(r).filter(({ e }) => e?.status === 'failed')
+  const done = r.status === 'done'
   return (
     <Stack gap="sm">
       <Separator />
@@ -430,7 +454,12 @@ function Passes({ r }: { r: Run }) {
           {failures.map(({ role, e }) => (
             <Failure key={`failure:${role}`} role={role} e={e} />
           ))}
-          {res?.degraded ? <Text size="sm">The coordinator covered the failed lens, so the findings still stand.</Text> : null}
+          {done && failures.some(({ role }) => LENSES.includes(role)) ? (
+            <Text size="sm">The coordinator covered the failed lens, so the findings still stand.</Text>
+          ) : null}
+          {done && failures.some(({ role }) => role === 'judge') ? (
+            <Text size="sm">The coordinator's findings stand, but the findings it dropped could not be re-examined.</Text>
+          ) : null}
         </Callout>
       ) : null}
     </Stack>
@@ -503,7 +532,10 @@ function Findings({ r }: { r: Run }) {
   const toggle = (v: boolean) => {
     set(showAll, v)
     const next = v ? res.ungated_findings : res.findings
-    if (!next.some((f) => findingKey(f) === read(selected))) set(selected, next[0] ? findingKey(next[0]) : null)
+    if (!next.some((f) => findingKey(f) === read(selected))) {
+      const first = mostUrgent(next)
+      set(selected, first ? findingKey(first) : null)
+    }
   }
   return (
     <Stack gap="sm">

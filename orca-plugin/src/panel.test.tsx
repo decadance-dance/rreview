@@ -3,7 +3,7 @@ import type { TreeItem } from 'orca'
 import { assert, mockHost, mount, test, type TestPanel } from 'orca/testing'
 import { cancelled, done, doneResult, failed, running, target } from './fixtures'
 import * as panel from './panel'
-import type { Run } from './protocol'
+import type { Result, Run } from './protocol'
 
 /** Agents per workspace: ws1 is the reviewed run's, ws2 another one. */
 const AGENTS: Record<string, unknown[]> = {
@@ -250,6 +250,92 @@ test('a long failure reason shows its start and the rest behind Full reason', as
   assert.match(JSON.stringify(view.find({ type: 'Collapsible' })), /Full reason.*the end/)
   assert.ok(callout)
   await view.unmount()
+})
+
+/** The panel on a run whose result is `res`. */
+const mountRun = (run: Run, res: Result | null = null) =>
+  mount(panel, {
+    host: mockHost({
+      results: { 'agents.list': { agents: [] } },
+      requests: { 'target.get': () => target, 'review.get': () => run, 'review.result': () => res }
+    })
+  })
+
+test('a finished run takes a pass outcome from result.json when its last progress line was lost', async () => {
+  // security's `failed` line never reached progress.jsonl; result.json still reports the failure.
+  const lost = { ...done, events: done.events.filter((e) => !(e.role === 'security' && e.status === 'failed')) }
+  const view = await mountRun(lost, doneResult)
+  assert.equal(cells(view)[2], 'security codex ✗ failed · 40s')
+  assert.match(JSON.stringify(view.find({ type: 'Callout', text: /1 pass failed/ })), /security \(codex\).*no reply/)
+  assert.equal(view.findAll({ type: 'RelativeTime' }).length, 0)
+  await view.unmount()
+})
+
+test('a stopped run shows a pass that never finished as interrupted, with a stopped clock', async () => {
+  // In the cancelled fixture security started and has no later line.
+  const view = await mountRun(cancelled)
+  assert.equal(cells(view)[2], 'security codex ■ interrupted · 1m 11s')
+  assert.equal(view.findAll({ type: 'RelativeTime' }).length, 0)
+  // A done run that lost a pass's last line and has no report for it: unknown, not running.
+  const lost = { ...done, events: done.events.filter((e) => !(e.role === 'reliability' && e.status === 'completed')) }
+  const again = await mountRun(lost, { ...doneResult, passes: [] })
+  assert.match(cells(again)[1], /^reliability claude \? unknown · /)
+  await again.unmount()
+})
+
+test('overall progress never reaches 100 % before the judge decision, and never goes back', async () => {
+  const { host } = setup(running)
+  const view = await mount(panel, { host })
+  const progress = () => view.find({ type: 'Progress' })?.props?.value
+  const at = (ms: number) => 1_700_000_000_000 + ms
+  const ev = (role: string, status: string, agent: string, ms: number) => ({ ts: at(ms), role, status, agent, model: 'default', duration_ms: ms })
+  const lensesDone = [...running.events, ev('reliability', 'completed', 'claude', 90_000), ev('security', 'completed', 'codex', 91_000)]
+  await view.post('review.changed', { ...running, events: [...lensesDone, ev('coordinator', 'started', 'claude', 0)] })
+  assert.equal(progress(), 75)
+  const coordinatorDone = [...lensesDone, ev('coordinator', 'completed', 'claude', 100_000)]
+  await view.post('review.changed', { ...running, events: coordinatorDone })
+  // The judge may or may not run: the bar has no value rather than 100 %.
+  assert.equal(progress(), undefined)
+  assert.match(JSON.stringify(view.tree()), /4 of 4 passes done · elapsed/)
+  await view.post('review.changed', { ...running, events: [...coordinatorDone, ev('judge', 'started', 'codex', 0)] })
+  assert.equal(progress(), undefined)
+  assert.match(JSON.stringify(view.tree()), /4 of 4 passes done, judge running · elapsed/)
+  await view.unmount()
+})
+
+test('a judge-only failure says the dropped findings were not re-examined, not that a lens was covered', async () => {
+  const ev = (role: string, status: string, agent: string, ms: number, error?: string) => ({
+    ts: 1_700_000_000_000 + ms, role, status, agent, model: 'default', duration_ms: ms, ...(error ? { error } : {})
+  })
+  const events = [
+    ...['intent_contracts', 'reliability', 'security', 'coordinator'].map((role) => ev(role, 'completed', 'claude', 60_000)),
+    ev('judge', 'failed', 'codex', 20_000, 'pass judge (codex): no reply')
+  ]
+  const res: Result = {
+    ...doneResult, degraded: true,
+    passes: [{ role: 'judge', agent: 'codex', status: 'failed', duration_ms: 20_000, error: 'pass judge (codex): no reply' }]
+  }
+  const view = await mountRun({ ...done, events }, res)
+  const callout = JSON.stringify(view.find({ type: 'Callout', text: /1 pass failed/ }))
+  assert.match(callout, /judge \(codex\).*no reply/)
+  assert.match(callout, /the findings it dropped could not be re-examined/)
+  assert.ok(!/covered the failed lens/.test(callout))
+  await view.unmount()
+})
+
+test('the most urgent finding opens first, whatever order rreview listed them in', async () => {
+  // P2 first in the result, P1 second.
+  const res: Result = { ...doneResult, findings: [...doneResult.findings].reverse(), ungated_findings: [...doneResult.ungated_findings].reverse() }
+  const view = await mountRun(done, res)
+  assert.equal(view.valueOf({ label: 'File and line (select to copy)' }), 'src/orca.rs:120-124')
+  await view.unmount()
+  // A gate toggle that drops the open finding opens the most urgent one left.
+  const below = await mountRun(done, res)
+  await below.toggle({ label: 'All 3, below the gate too' })
+  await below.selectItem({ label: 'Findings by file' }, 'src/orca.rs#300#Unclear error text')
+  await below.toggle({ label: 'All 3, below the gate too' })
+  assert.equal(below.valueOf({ label: 'File and line (select to copy)' }), 'src/orca.rs:120-124')
+  await below.unmount()
 })
 
 test('no PR and no workspace each say what to do next', async () => {
