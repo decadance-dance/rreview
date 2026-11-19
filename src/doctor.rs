@@ -38,11 +38,12 @@ const STARTUP_CANARY: &str = "export RREVIEW_STARTUP_CANARY=1\n\
                               sh() { RREVIEW_STARTUP_FN=1 command sh \"$@\"; }\n\
                               alias sh='RREVIEW_STARTUP_ALIAS=1 sh'\n";
 /// Probe lines: `s` whether any part of the canary reached the probe, and `k`, the control,
-/// whether the reviewer's shell, as a login and interactive shell without rreview's
-/// `ZDOTDIR`, gets all of it from `HOME`.
+/// whether `/bin/sh` as a login and interactive shell without rreview's `ZDOTDIR` gets all of
+/// it from `HOME` (`.profile`). A fixed POSIX shell, not `$SHELL`: the caller's may be one that
+/// reads neither the files nor this syntax (tcsh), and the agents pick their own.
 const STARTUP_PROBE: &str = "s=0; [ -n \"${RREVIEW_STARTUP_CANARY-}${RREVIEW_STARTUP_FN-}\
                              ${RREVIEW_STARTUP_ALIAS-}\" ] && s=1\n\
-                             k=0; case $(env -u ZDOTDIR \"$SHELL\" -lic 'sh -c \"echo \
+                             k=0; case $(env -u ZDOTDIR /bin/sh -lic 'sh -c \"echo \
                              rreview-control:\\$RREVIEW_STARTUP_CANARY\\$RREVIEW_STARTUP_FN\
                              \\$RREVIEW_STARTUP_ALIAS\"' 2> /dev/null) in *rreview-control:111*) \
                              k=1 ;; esac\n";
@@ -859,8 +860,8 @@ fn startup_check(name: &str, startup: i32, control: i32) -> Check {
             )
         } else if control != 1 {
             Err(
-                "control failed: the reviewer's shell did not read the planted startup files \
-                 even as a login shell without rreview's ZDOTDIR, so the check proves nothing"
+                "control failed: /bin/sh did not read the planted startup files even as a \
+                 login shell without rreview's ZDOTDIR, so the check proves nothing"
                     .into(),
             )
         } else {
@@ -1238,7 +1239,8 @@ mod tests {
         startup_files(&home).unwrap();
         fs::create_dir_all(&empty).unwrap();
         fs::write(&probe, format!("{STARTUP_PROBE}echo s=$s k=$k\n")).unwrap();
-        let shell = std::env::var("SHELL").unwrap_or("/bin/sh".into());
+        // The caller's own shell must not matter (review of PR #39, round 2).
+        let shell = "/bin/tcsh";
         let run = |replay: &str| {
             let out = Command::new("/bin/sh")
                 .args(["-c", &format!("{replay}\nsh {}", sh_quote(&probe))])
@@ -1246,7 +1248,7 @@ mod tests {
                 .env("PATH", "/usr/bin:/bin")
                 .env("HOME", &home)
                 .env("ZDOTDIR", &empty)
-                .env("SHELL", &shell)
+                .env("SHELL", shell)
                 .output()
                 .unwrap();
             String::from_utf8_lossy(&out.stdout).trim().to_string()
