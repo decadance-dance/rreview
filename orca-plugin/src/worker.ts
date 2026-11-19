@@ -8,13 +8,15 @@ import { isAbsolute, join } from 'node:path'
 import { findingKey, TEXT_CAP, type Finding, type PassEvent, type Pr, type Result, type Run, type Runner, type Target } from './protocol'
 
 const GH_TIMEOUT_MS = 30_000
-// rreview bounds itself by its --budget (default 3600 s) and its bounded cleanup; this only stops a
-// CLI that hangs past both, with SIGTERM, so rreview still cleans up.
-const RUN_LIMIT_MS = 70 * 60_000
-// A SIGTERM'd rreview that is still running this much later (its Orca cleanup calls are bounded at
-// 5 minutes each) is killed.
-// limit: that kill skips what is left of rreview's cleanup.
-const STOP_GRACE_MS = 10 * 60_000
+export const LIMITS = {
+  // rreview bounds itself by its --budget (default 3600 s) and its bounded cleanup; this only stops
+  // a CLI that hangs past both, with SIGTERM, so rreview still cleans up.
+  runMs: 70 * 60_000,
+  // A SIGTERM'd rreview that is still running this much later (its Orca cleanup calls are bounded
+  // at 5 minutes each) is killed.
+  // limit: that kill skips what is left of rreview's cleanup.
+  graceMs: 10 * 60_000
+}
 const TAIL_MS = 1000
 const STDOUT_CAP = 16 << 20
 const STDERR_KEEP = 16 << 10
@@ -135,6 +137,14 @@ export function parseProgress(text: string): PassEvent[] {
   })
 }
 
+/** Whether rreview reported that SIGTERM stopped it: the stop line that ends progress.jsonl once
+ * it has a run dir, else (stopped while preparing) its `error:` line. */
+export function stoppedBySigterm(r: Run, stderr: string): boolean {
+  if (!r.runDir) return /^error: (.*: )?interrupted by SIGTERM$/m.test(stderr)
+  const last = r.events.at(-1)
+  return last?.role === 'run' && last.status === 'interrupted' && last.error === 'interrupted by SIGTERM'
+}
+
 /** The `error:` lines rreview printed, else the tail of its stderr. */
 export function errorOf(stderr: string): string {
   const errors = stderr.split('\n').filter((l) => l.startsWith('error: '))
@@ -245,9 +255,11 @@ export default function activate(orca: OrcaWorkerApi): void {
     return r && boundResult(r)
   })
 
-  orca.panels.handle('review.cancel', async () => {
+  orca.panels.handle('review.cancel', async ({ startedAt }) => {
     await loaded
     if (!run || run.status !== 'running' || !cancel) throw fail('not_running', 'no review is running')
+    // A Cancel meant for an earlier run must not stop this one.
+    if (run.startedAt !== startedAt) throw fail('not_running', 'that review is no longer running')
     cancel()
     return run
   })
@@ -330,7 +342,7 @@ export default function activate(orca: OrcaWorkerApi): void {
     const stop = () => {
       if (killer) return
       child.kill('SIGTERM')
-      killer = setTimeout(() => child.kill('SIGKILL'), STOP_GRACE_MS)
+      killer = setTimeout(() => child.kill('SIGKILL'), LIMITS.graceMs)
     }
     let cancelled = false
     cancel = () => {
@@ -338,9 +350,11 @@ export default function activate(orca: OrcaWorkerApi): void {
       stop()
     }
     const limit = setTimeout(() => {
-      r.error = `rreview ran past ${RUN_LIMIT_MS / 60_000} minutes and was stopped`
+      // A Cancel already sent keeps its reason and its SIGKILL grace.
+      if (killer) return
+      r.error = `rreview ran past ${LIMITS.runMs / 60_000} minutes and was stopped`
       stop()
-    }, RUN_LIMIT_MS)
+    }, LIMITS.runMs)
     const finish = async (code: number | null, error: string | null) => {
       if (ended) return
       ended = true
@@ -363,8 +377,9 @@ export default function activate(orca: OrcaWorkerApi): void {
           r.status = 'failed'
           r.error = `rreview exited ${code} without a valid result: ${(e as Error).message}`
         }
-      } else if (cancelled) {
-        // A run that finished before the signal reached it stays done (above).
+      } else if (cancelled && stoppedBySigterm(r, stderr)) {
+        // A run that finished before the signal reached it stays done (above), and one that
+        // failed on its own shows its error (below).
         r.status = 'cancelled'
       } else {
         r.status = 'failed'

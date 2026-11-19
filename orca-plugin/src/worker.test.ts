@@ -222,23 +222,84 @@ test('one run at a time', async () => {
   assert.equal(log().match(/^rreview \//gm)?.length, 1)
 })
 
+/** Waits until the fake rreview has its SIGTERM handler in place, then for its first progress. */
+async function waitingForTerm(worker: { posts: readonly { payload?: unknown }[] }): Promise<Run> {
+  for (let i = 0; i < 250; i++) {
+    const r = worker.posts.at(-1)?.payload as Run
+    if (/^rreview waits for TERM$/m.test(log()) && r?.events.length) return r
+    await new Promise((res) => setTimeout(res, 20))
+  }
+  throw new Error('the fake rreview never got to wait for SIGTERM')
+}
+
 test('cancel sends rreview SIGTERM and shows the run as cancelled once it has cleaned up', async () => {
   const worker = await mountWorker(main, { host: host() })
-  await assert.rejects(worker.request('review.cancel'), /no review is running/)
+  await assert.rejects(worker.request('review.cancel', { startedAt: 1 }), /no review is running/)
   process.env.FAKE_RREVIEW = 'hang'
-  await worker.request('review.start', { workspaceId: 'ws1', runner: 'orca' })
-  for (let i = 0; i < 100 && !(worker.posts.at(-1)?.payload as Run).events.length; i++) {
-    await new Promise((r) => setTimeout(r, 20))
-  }
+  const started = await worker.request('review.start', { workspaceId: 'ws1', runner: 'orca' })
+  await waitingForTerm(worker)
   // Still running until rreview exits: its cleanup takes a while.
-  assert.equal((await worker.request('review.cancel')).status, 'running')
+  assert.equal((await worker.request('review.cancel', { startedAt: started.startedAt })).status, 'running')
   const run = await ended(worker)
   assert.equal(run.status, 'cancelled')
   assert.equal(run.exitCode, 2)
   assert.equal(run.error, null)
   assert.match(log(), /^rreview got TERM$/m)
   assert.deepEqual([run.events.at(-1)?.role, run.events.at(-1)?.status], ['run', 'interrupted'])
-  await assert.rejects(worker.request('review.cancel'), /no review is running/)
+  await assert.rejects(worker.request('review.cancel', { startedAt: started.startedAt }), /no review is running/)
+})
+
+// Review of PR #34, finding 2: a Cancel the panel sent for a review that has since ended must not
+// stop the next one.
+test('a cancel for an earlier run does not stop the running one', async () => {
+  const worker = await mountWorker(main, { host: host() })
+  const a = await worker.request('review.start', { workspaceId: 'ws1', runner: 'headless' })
+  assert.equal((await ended(worker)).status, 'done')
+  process.env.FAKE_RREVIEW = 'hang'
+  await new Promise((res) => setTimeout(res, 5)) // a later startedAt
+  const b = await worker.request('review.start', { workspaceId: 'ws1', runner: 'headless' })
+  await waitingForTerm(worker)
+  await assert.rejects(worker.request('review.cancel', { startedAt: a.startedAt }), /no longer running/)
+  assert.ok(!/rreview got TERM/.test(log()))
+  await worker.request('review.cancel', { startedAt: b.startedAt })
+  assert.equal((await ended(worker)).status, 'cancelled')
+})
+
+// Review of PR #34, finding 5: an rreview that fails on its own while a Cancel is pending shows its
+// own error, not a cancel.
+test('an exit 2 without the stop rreview reports is a failure, Cancel or not', async () => {
+  process.env.FAKE_RREVIEW = 'ignore-term'
+  const worker = await mountWorker(main, { host: host() })
+  const started = await worker.request('review.start', { workspaceId: 'ws1', runner: 'headless' })
+  for (let i = 0; i < 100 && !(worker.posts.at(-1)?.payload as Run).events.length; i++) {
+    await new Promise((r) => setTimeout(r, 20))
+  }
+  await worker.request('review.cancel', { startedAt: started.startedAt })
+  const run = await ended(worker)
+  assert.equal(run.status, 'failed')
+  assert.equal(run.error, 'error: coordinator: bad JSON')
+})
+
+// Review of PR #34, finding 6: the safety limit firing while a Cancel's cleanup runs keeps the
+// Cancel.
+test('the run limit does not overwrite a cancel already sent', async () => {
+  const runMs = main.LIMITS.runMs
+  main.LIMITS.runMs = 1500
+  process.env.FAKE_RREVIEW = 'hang'
+  process.env.FAKE_STOP_DELAY = '2'
+  try {
+    const worker = await mountWorker(main, { host: host() })
+    const started = await worker.request('review.start', { workspaceId: 'ws1', runner: 'headless' })
+    await waitingForTerm(worker)
+    await worker.request('review.cancel', { startedAt: started.startedAt })
+    const run = await ended(worker)
+    assert.ok(Date.now() - started.startedAt > 1500, 'the limit fired during the cleanup')
+    assert.equal(run.status, 'cancelled', run.error ?? '')
+    assert.equal(run.error, null)
+  } finally {
+    main.LIMITS.runMs = runMs
+    delete process.env.FAKE_STOP_DELAY
+  }
 })
 
 test('a run the worker lost on restart is reported failed, not running', async () => {

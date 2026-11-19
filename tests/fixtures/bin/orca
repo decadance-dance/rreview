@@ -29,6 +29,9 @@
 #   refused         `terminal send` of a prompt answers "accepted": false
 #   blocked         after the prompt the agent waits on a permission dialog
 #   lost-create     `terminal create` opens the terminal, then fails without JSON
+#   late-worktree   `worktree create` never answers; 1 s after rreview killed it, the app makes
+#                   the worktree anyway and writes $FAKE_LOG.late
+#   late-terminal   `terminal create` likewise: the terminal opens 1 s after its CLI was killed
 #   no-handle       `terminal create` opens the terminal, then answers ok without a handle
 #   play            the agent plays each prompt itself: the terminal's launch line runs again
 #                   with the prompt on stdin (through rreview's shim), and the fake agent writes
@@ -54,6 +57,16 @@ timeout() {
   sleep "$(awk "BEGIN { print $(arg --timeout-ms "$@") / 1000 }")"
   echo '{"ok":false,"error":{"code":"timeout","message":"timeout"}}'; exit 1
 }
+# The app finishing a request whose CLI never answers: once this CLI is dead (rreview killed it),
+# `sh -c "$1" _ <args>` runs 1 s later in a process group of its own; this CLI waits to be killed.
+late() {
+  script=$1; shift
+  cli=$$
+  perl -e 'setpgrp; exec @ARGV' sh -c \
+    'cli=$1; shift; while kill -0 "$cli" 2> /dev/null; do sleep 0.1; done; sleep 1; '"$script"' && echo made > "$FAKE_LOG.late"' \
+    _ "$cli" _ "$@" < /dev/null > /dev/null 2>&1 &
+  sleep 60; exit 1
+}
 handle=$(arg --terminal "$@"); role=${handle#term_}; role=${role%~*}
 state="$FAKE_LOG.orca-$role"
 sent() { grep -c '^sent' "$state" 2> /dev/null || echo 0; }
@@ -74,6 +87,9 @@ case "$1 $2" in
   name=$(arg --name "$@"); branch=$(arg --branch "$@"); base=$(arg --base-branch "$@")
   [ "$scenario" = wrong-head ] && base="$base^"
   path="$TMPDIR/orca-wt/$name"
+  if [ "$scenario" = late-worktree ]; then
+    late 'git worktree add -q -b "$2" "$3" "$4"' "$branch" "$path" "$base"
+  fi
   git worktree add -q -b "$branch" "$path" "$base" >&2 || exit 1
   [ "$scenario" = lost-reply ] && { echo "transport closed" >&2; exit 1; }
   [ "$scenario" = foreign-branch ] && branch=victim
@@ -84,6 +100,9 @@ case "$1 $2" in
 "terminal create")
   [ "$scenario" = no-ok ] && { echo '{"ok":false,"error":{"code":"boom","message":"no terminal"}}'; exit 0; }
   title=$(arg --title "$@"); role=${title#rreview:}
+  if [ "$scenario" = late-terminal ]; then
+    late 'echo open >> "$2" && printf %s "$3" > "$2.title"' "$FAKE_LOG.orca-$role" "$title"
+  fi
   echo open >> "$FAKE_LOG.orca-$role"
   printf '%s' "$title" > "$FAKE_LOG.orca-$role.title"
   cmd=$(arg --command "$@")

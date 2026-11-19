@@ -245,9 +245,27 @@ pub fn run(args: &Args) -> Result<u8> {
     eprintln!("run id: {run_id}\nrun dir: {}", runroot.display());
     // Before the worktree guard, so it records a stop once the cleanup is done.
     let mut stop = StopRecord(Some(Progress(runroot.join("progress.jsonl"))));
-    // The guard exists before the checkout: a failed one (a post-checkout hook) can leave a
-    // registered, half-made worktree behind.
     let ran = |r: &str| panel.iter().any(|p| p.id == r) || args.only.is_none();
+    // Written before any step that can stop the run: the Orca plugin reads progress.jsonl, the
+    // stop line too, only while meta.json names this run.
+    let roles: BTreeMap<_, _> = settings
+        .agents
+        .iter()
+        .filter(|(r, _)| ran(r))
+        .map(|(r, a)| (*r, a.to_string()))
+        .collect();
+    let meta = json!({
+        "run_id": run_id,
+        "pr": { "number": pr.number, "title": pr.title, "url": pr.url, "repo": format!("{owner}/{name}"),
+                "head_ref": pr.head_ref_name, "base_ref": pr.base_ref_name },
+        "base": base, "head": head, "runner": if args.orca { "orca" } else { "headless" }, "roles": roles,
+        "versions": { "claude": version("claude", deadline), "codex": version("codex", deadline) },
+    });
+    fs::write(
+        runroot.join("meta.json"),
+        serde_json::to_string_pretty(&meta)?,
+    )?;
+
     if args.orca
         && settings
             .agents
@@ -256,10 +274,13 @@ pub fn run(args: &Args) -> Result<u8> {
     {
         orca::check_codex_run_dir(&runroot)?;
     }
+    // The guard exists before the checkout: a failed one (a post-checkout hook) can leave a
+    // registered, half-made worktree behind.
     let mut wt = Worktree {
         path: runroot.join("wt"),
         keep: false,
         orca_name: None,
+        orca_unanswered: false,
     };
     if args.orca {
         // The pid and start time make the name the run's own: a concurrent run for the same
@@ -274,11 +295,14 @@ pub fn run(args: &Args) -> Result<u8> {
             &head[..12],
             std::process::id()
         );
-        orca::check_branch_free(&name)?;
-        // Set before the create: a create whose reply is lost is still found by its name.
+        orca::check_branch_free(&name, deadline)?;
+        // Armed only for a create that starts, and before it: a create whose reply is lost is
+        // still found by its name. Once started, a create runs to its answer or its deadline.
+        launch::interrupted()?;
         wt.orca_name = Some(name.clone());
-        wt.path = orca::create_worktree(&git_common_dir, &name, head, deadline)
-            .context("cannot create the review worktree")?;
+        let created = orca::create_worktree(&git_common_dir, &name, head, deadline);
+        wt.orca_unanswered = created.as_ref().is_err_and(orca::unanswered);
+        wt.path = created.context("cannot create the review worktree")?;
         let at = git(
             &["-C", launch::utf8(&wt.path)?, "rev-parse", "HEAD"],
             deadline,
@@ -304,24 +328,6 @@ pub fn run(args: &Args) -> Result<u8> {
         .context("cannot create the review worktree")?;
     }
     wt.keep = args.keep_worktree;
-
-    let roles: BTreeMap<_, _> = settings
-        .agents
-        .iter()
-        .filter(|(r, _)| ran(r))
-        .map(|(r, a)| (*r, a.to_string()))
-        .collect();
-    let meta = json!({
-        "run_id": run_id,
-        "pr": { "number": pr.number, "title": pr.title, "url": pr.url, "repo": format!("{owner}/{name}"),
-                "head_ref": pr.head_ref_name, "base_ref": pr.base_ref_name },
-        "base": base, "head": head, "runner": if args.orca { "orca" } else { "headless" }, "roles": roles,
-        "versions": { "claude": version("claude", deadline), "codex": version("codex", deadline) },
-    });
-    fs::write(
-        runroot.join("meta.json"),
-        serde_json::to_string_pretty(&meta)?,
-    )?;
 
     let runner: Box<dyn Runner + Sync> = if args.orca {
         Box::new(Orca::new(
@@ -748,6 +754,8 @@ struct Worktree {
     keep: bool,
     /// Set for an Orca-created worktree: it and its branch are found by this name.
     orca_name: Option<String>,
+    /// Orca never answered the create: the app may still make the worktree.
+    orca_unanswered: bool,
 }
 
 impl Drop for Worktree {
@@ -757,7 +765,7 @@ impl Drop for Worktree {
             return;
         }
         if let Some(name) = &self.orca_name {
-            if let Err(e) = orca::remove_worktree(name) {
+            if let Err(e) = orca::remove_worktree(name, self.orca_unanswered) {
                 eprintln!("warning: cannot remove the review worktree: {e:#}");
             }
             return;

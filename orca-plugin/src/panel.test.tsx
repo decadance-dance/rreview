@@ -24,7 +24,7 @@ function setup(run: Run | null = null) {
       'review.get': () => run,
       'review.result': () => (calls.push({ name: 'review.result', input: null }), doneResult),
       'review.start': (input) => (calls.push({ name: 'review.start', input }), running),
-      'review.cancel': () => (calls.push({ name: 'review.cancel', input: null }), running),
+      'review.cancel': (input) => (calls.push({ name: 'review.cancel', input }), running),
       'findings.send': (input) => (calls.push({ name: 'findings.send', input }), { sent: input.keys.length, file: '/state/x/author-1.md' })
     }
   })
@@ -120,7 +120,8 @@ test('cancel stops the running review, which then shows as cancelled', async () 
   const { host, calls } = setup(running)
   const view = await mount(panel, { host })
   await view.press({ text: 'Cancel' })
-  assert.equal(calls.at(-1)?.name, 'review.cancel')
+  // The run it shows, so a stale Cancel cannot stop a later one.
+  assert.deepEqual(calls.at(-1), { name: 'review.cancel', input: { startedAt: running.startedAt } })
   assert.match(JSON.stringify(view.tree()), /Cancelling: rreview is stopping its reviewers/)
   await view.post('review.changed', cancelled)
   const s = view.summary().join('\n') + JSON.stringify(view.tree())

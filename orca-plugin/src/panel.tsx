@@ -114,8 +114,10 @@ async function startReview(): Promise<void> {
 }
 
 async function cancelReview(): Promise<void> {
+  const r = read(run)
+  if (!r) return
   try {
-    await plugin.request('review.cancel')
+    await plugin.request('review.cancel', { startedAt: r.startedAt })
     set(notice, { tone: 'neutral', text: 'Cancelling: rreview is stopping its reviewers and cleaning up.' })
   } catch (e) {
     set(notice, { tone: 'danger', text: errorText(e) })

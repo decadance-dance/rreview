@@ -35,7 +35,13 @@ impl Drop for Fixture {
         // single processes.
         if std::thread::panicking() {
             let read = |name: &str| fs::read_to_string(self.root.join(name)).unwrap_or_default();
-            for name in ["log.rreview", "log.reviewer", "log.cleanup", "log.orcawait"] {
+            for name in [
+                "log.rreview",
+                "log.reviewer",
+                "log.cleanup",
+                "log.orcawait",
+                "log.probe",
+            ] {
                 for pid in read(name).split_whitespace() {
                     kill("-KILL", &format!("-{pid}"));
                 }
@@ -194,7 +200,9 @@ impl Fixture {
             }
             // The real git, but a `git worktree remove` or `git branch -D` (rreview's cleanup,
             // in its own group) records its pid in $FAKE_LOG.cleanup and first stalls
-            // $FAKE_GIT_STALL seconds, a window to signal rreview during its cleanup.
+            // $FAKE_GIT_STALL seconds, a window to signal rreview during its cleanup. A probe for
+            // an `rreview/` branch records its pid in $FAKE_LOG.probe and stalls
+            // $FAKE_GIT_PROBE_STALL seconds.
             let out = Command::new("sh")
                 .args(["-c", "command -v git"])
                 .output()
@@ -203,7 +211,7 @@ impl Fixture {
             script(
                 &bin.join("git"),
                 &format!(
-                    "case \"$*\" in *\"worktree remove\"*|*\"branch -D\"*) echo $$ >> \"$FAKE_LOG.cleanup\"; sleep \"${{FAKE_GIT_STALL:-0}}\";; esac\nexec '{real}' \"$@\""
+                    "case \"$*\" in *\"worktree remove\"*|*\"branch -D\"*) echo $$ >> \"$FAKE_LOG.cleanup\"; sleep \"${{FAKE_GIT_STALL:-0}}\";; *\"--verify --quiet refs/heads/rreview/\"*) echo $$ >> \"$FAKE_LOG.probe\"; sleep \"${{FAKE_GIT_PROBE_STALL:-0}}\";; esac\nexec '{real}' \"$@\""
                 ),
             );
         }
@@ -2807,19 +2815,18 @@ fn orca_concurrent_runs_for_one_head_keep_their_own_worktrees() {
 fn orca_worktree_create_stays_within_the_budget() {
     let env = envelope("src/lib.rs");
     let fx = fixture();
-    let started = Instant::now();
     let run = orca_run_with(
         &fx,
-        &["--budget", "1"],
+        &["--budget", "3"],
         "ok",
         &[
             ("FAKE_REPLY", env.to_string()),
-            ("FAKE_ORCA_CREATE_DELAY", "3".into()),
+            ("FAKE_ORCA_CREATE_DELAY", "6".into()),
         ],
     );
-    let took = started.elapsed();
     assert_eq!(run.code, Some(2), "{run:?}");
-    assert!(took < Duration::from_millis(2500), "took {took:?}: {run:?}");
+    // Killed at the budget, before its 6 s delay ended: an unanswered create, so the cleanup
+    // waited for a worktree the app might still make (it made none).
     assert!(
         run.stderr.contains(
             "cannot create the review worktree: orca worktree create did not answer in time"
@@ -3176,5 +3183,68 @@ fn orca_an_interrupt_closes_every_terminal_and_removes_the_worktree() {
         );
         fx.assert_orca_worktree_removed();
         assert_stop_recorded(&fx, &name);
+        // The plugin reads the stop line only while meta.json names the run (review of PR #34,
+        // finding 3): it is written before the worktree.
+        let meta: Value =
+            serde_json::from_str(&fs::read_to_string(fx.runroot().join("meta.json")).unwrap())
+                .unwrap();
+        assert!(meta["run_id"].is_string(), "{phase}: {meta}");
     }
+}
+
+/// Review of PR #34, finding 1: Orca may finish a create whose CLI was killed at its deadline.
+/// The cleanup waits for what it makes, so neither the worktree and branch nor the terminal stays
+/// behind.
+#[test]
+fn orca_cleans_up_what_an_unanswered_create_makes_later() {
+    let reply = envelope("src/lib.rs").to_string();
+    for (scenario, args) in [
+        ("late-worktree", ["--budget", "5"]),
+        ("late-terminal", ["--timeout", "2"]),
+    ] {
+        let fx = fixture();
+        let run = orca_run_with(&fx, &args, scenario, &[("FAKE_REPLY", reply.clone())]);
+        assert_eq!(run.code, Some(2), "{scenario}: {run:?}");
+        assert!(
+            run.stderr.contains("did not answer in time"),
+            "{scenario}: {run:?}"
+        );
+        assert!(
+            fx.root.join("log.late").exists(),
+            "{scenario}: rreview ended before the app made what it asked for: {run:?}"
+        );
+        if scenario == "late-terminal" {
+            fx.assert_terminal_closed("reliability");
+        }
+        fx.assert_orca_worktree_removed();
+    }
+}
+
+/// Review of PR #34, finding 4: the branch probe before the Orca create is a preparation step.
+/// Ctrl-C stops it at once, and with no create started there is nothing for a cleanup to probe.
+#[test]
+fn orca_an_interrupt_stops_the_branch_probe() {
+    let fx = fixture();
+    let child = fx.spawn(
+        &["7", "--runner", "orca"],
+        &[
+            ("FAKE_REPLY", envelope("src/lib.rs").to_string()),
+            ("FAKE_GIT_PROBE_STALL", "30".into()),
+        ],
+    );
+    wait_for("the branch probe", || fx.lines("log.probe") == 1);
+    let signalled = Instant::now();
+    assert!(kill("-INT", &format!("-{}", child.id())));
+    let run = fx.finish(child);
+    assert!(
+        signalled.elapsed() < Duration::from_secs(10),
+        "took {:?}",
+        signalled.elapsed()
+    );
+    assert_eq!(run.code, Some(2), "{run:?}");
+    assert!(run.stderr.contains("interrupted by SIGINT"), "{run:?}");
+    assert!(!run.log.contains("orca worktree create"), "{run:?}");
+    let probes = fs::read_to_string(fx.root.join("log.probe")).unwrap();
+    assert_all_dead(&probes, 1);
+    fx.assert_orca_worktree_removed();
 }
