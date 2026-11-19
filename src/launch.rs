@@ -6,6 +6,7 @@ use std::io::{ErrorKind, Write};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
+use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
@@ -67,10 +68,10 @@ impl Launch {
     }
 
     /// Runs with `prompt` on stdin. Stdout and stderr go to `<log>.stdout` and `<log>.stderr`.
-    /// The child leads its own process group, so a timeout kills everything it started.
-    // limit: in its own group the child misses the terminal's Ctrl-C; an interrupted rreview
-    // leaves a running reviewer behind.
+    /// The child leads its own process group, so a timeout or an interrupt (see
+    /// [`catch_interrupts`]) kills everything it started.
     pub fn run(&self, prompt: &str, log: &Path, timeout: Duration) -> Result<ExitStatus> {
+        interrupted()?;
         let stdout = log.with_extension("stdout");
         let stderr = log.with_extension("stderr");
         let mut child = Command::new(&self.program)
@@ -92,8 +93,15 @@ impl Launch {
         }
         let started = Instant::now();
         loop {
-            if let Some(status) = child.try_wait()? {
-                return Ok(status);
+            if exited(&child)? {
+                // What the reviewer left running in its group goes with it; the unreaped leader
+                // keeps the group id from being reused before the signal.
+                kill_group(&mut child);
+                return Ok(child.wait()?);
+            }
+            if let Err(e) = interrupted() {
+                kill_group(&mut child);
+                return Err(e);
             }
             if started.elapsed() >= timeout {
                 kill_group(&mut child);
@@ -130,14 +138,34 @@ pub fn exec_reviewer(inherit: &[String], set: &[String], command: &[String]) -> 
     anyhow::Error::new(cmd.exec()).context(format!("cannot start {program}"))
 }
 
-/// Kills `child`, which leads its own process group, and everything it started.
+/// Kills `child`, which leads its own process group, and everything it started; reaps it.
+/// The signal goes straight from rreview: a `kill` helper would run in rreview's foreground
+/// group, where a second Ctrl-C could kill it before it signals.
 pub fn kill_group(child: &mut Child) {
-    let _ = Command::new("kill")
-        .args(["-KILL", "--", &format!("-{}", child.id())])
-        .stderr(Stdio::null())
-        .status();
+    // SAFETY: a plain syscall on our own child's group id; the unreaped child keeps it reserved.
+    unsafe { killpg(child.id() as i32, SIGKILL) };
     let _ = child.kill();
     let _ = child.wait();
+}
+
+/// Whether `child` has exited, without reaping it, so its pid and group id stay reserved.
+fn exited(child: &Child) -> std::io::Result<bool> {
+    // Larger than siginfo_t on Linux (128 bytes) and macOS (104); zeroed, and si_signo (the
+    // first field on both) is set only when the child has exited.
+    let mut info = [0u64; 32];
+    // SAFETY: `info` outlives the call and is larger than the siginfo_t it receives.
+    let r = unsafe {
+        waitid(
+            P_PID,
+            child.id(),
+            info.as_mut_ptr(),
+            WEXITED | WNOHANG | WNOWAIT,
+        )
+    };
+    if r != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(info[0] != 0)
 }
 
 /// A launch killed at its timeout; callers tell it from other failures to give a wrap-up turn.
@@ -151,6 +179,77 @@ impl std::fmt::Display for TimedOut {
 }
 
 impl std::error::Error for TimedOut {}
+
+/// The signal that interrupted rreview, 0 for none.
+static SIGNAL: AtomicI32 = AtomicI32::new(0);
+/// Whether [`catch_interrupts`] ran.
+static CATCHING: AtomicBool = AtomicBool::new(false);
+const SIGINT: i32 = 2;
+const SIGKILL: i32 = 9;
+const SIGTERM: i32 = 15;
+const P_PID: u32 = 1;
+const WNOHANG: i32 = 1;
+const WEXITED: i32 = 4;
+#[cfg(target_os = "macos")]
+const WNOWAIT: i32 = 0x20;
+#[cfg(not(target_os = "macos"))]
+const WNOWAIT: i32 = 0x0100_0000; // Linux
+
+// libc's (the same values on macOS and Linux unless marked); std exposes no signal or waitid
+// API, and a few declarations do not earn a crate.
+unsafe extern "C" {
+    fn signal(signum: i32, handler: usize) -> usize;
+    fn killpg(pgrp: i32, sig: i32) -> i32;
+    fn waitid(idtype: u32, id: u32, infop: *mut u64, options: i32) -> i32;
+}
+
+/// Only stores the signal, so a second one cannot cut the cleanup short; SIGKILL still can.
+extern "C" fn on_signal(signum: i32) {
+    SIGNAL.store(signum, Ordering::SeqCst);
+}
+
+/// SIGINT and SIGTERM only set a flag: the waits that poll it ([`Launch::run`], the review's
+/// prepare steps) kill their process group and return [`Interrupted`], which unwinds through
+/// the run's cleanup guards (spec §4). Every reviewer and every cleanup step leads its own
+/// process group, so the terminal's Ctrl-C reaches rreview alone.
+pub fn catch_interrupts() {
+    CATCHING.store(true, Ordering::SeqCst);
+    for s in [SIGINT, SIGTERM] {
+        // SAFETY: the handler only stores an atomic, which is async-signal-safe.
+        unsafe { signal(s, on_signal as extern "C" fn(i32) as usize) };
+    }
+}
+
+/// Whether rreview catches SIGINT and SIGTERM. Without the handler (`rreview show`) a
+/// subprocess stays in rreview's group, so the terminal's Ctrl-C still ends it.
+pub fn catching() -> bool {
+    CATCHING.load(Ordering::SeqCst)
+}
+
+/// `Err(Interrupted)` once rreview has caught SIGINT or SIGTERM.
+pub fn interrupted() -> Result<()> {
+    match SIGNAL.load(Ordering::SeqCst) {
+        0 => Ok(()),
+        s => Err(Interrupted(s).into()),
+    }
+}
+
+/// rreview was told to stop; the run fails (exit 2) after its cleanup.
+#[derive(Debug)]
+pub struct Interrupted(i32);
+
+impl std::fmt::Display for Interrupted {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        let name = if self.0 == SIGINT {
+            "SIGINT"
+        } else {
+            "SIGTERM"
+        };
+        write!(f, "interrupted by {name}")
+    }
+}
+
+impl std::error::Error for Interrupted {}
 
 /// `claude -p --safe-mode --settings <runroot>/claude-settings.json --output-format json`.
 /// Writes the settings file: no edit/write/MCP tools, Bash sandboxed, writes denied in the
@@ -511,6 +610,18 @@ mod tests {
         }
         assert!(!alive(), "grandchild {pid} outlived the timeout");
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn exited_leaves_the_child_unreaped() {
+        let mut child = Command::new("true").spawn().unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !exited(&child).unwrap() {
+            assert!(Instant::now() < deadline, "true did not exit");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        // Still ours to reap: its pid, and so its group id, was reserved until now.
+        assert!(child.try_wait().unwrap().unwrap().success());
     }
 
     #[test]

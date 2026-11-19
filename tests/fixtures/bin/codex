@@ -74,7 +74,7 @@ if [ -n "$FAKE_REVIEW" ]; then
   eval "mode=\${FAKE_MODE_$role:-\$FAKE_REVIEW} reply=\${FAKE_OUT_$role-\$FAKE_REPLY}"
   [ $resumed = yes ] && eval "reply=\${FAKE_RESUME_$role-\$reply}"
   if [ "$mode" = hang ] || { [ "$mode" = hang-once ] && [ $resumed = no ]; }; then
-    sleep 60 & echo $! >> "$FAKE_LOG.grandchild"; sleep 60; exit 0
+    echo $$ >> "$FAKE_LOG.reviewer"; sleep 60 & echo $! >> "$FAKE_LOG.grandchild"; sleep 60; exit 0
   fi
   [ "$mode" = crash ] && exit 1
   [ "$mode" = no-reply ] && [ $resumed = no ] && exit 0
