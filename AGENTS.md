@@ -1,6 +1,6 @@
 # rreview: project instructions
 
-These rules hold for every contributor and every coding agent. They need git, the `gh` CLI, a stable Rust toolchain, zsh and the Orca CLI (`bin/check` runs the plugin's checks with `orca`); running rreview or its live tests needs the [prerequisites](README.md#prerequisites) too, logged-in `claude` and `codex` among them.
+These rules hold for every contributor and every coding agent. They need git, the `gh` CLI, a stable Rust toolchain, zsh and the Orca CLI (`bin/check` runs the plugin's checks with `orca`); running rreview or its live tests needs the [prerequisites](README.md#-quick-start) too, logged-in `claude` and `codex` among them.
 
 Write documentation, code comments, commits, issues and PRs in English.
 

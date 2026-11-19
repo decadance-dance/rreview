@@ -32,7 +32,7 @@ focused workspace's pull request, shows each pass while it runs, and lists the f
 ## Install for development
 
 Needs Orca 1.4.248 or later and an `rreview` binary (`cargo build --release` in this repo), with
-rreview's [prerequisites](../README.md#prerequisites).
+rreview's [prerequisites](../README.md#-quick-start).
 
 ```sh
 orca plugin dev load orca-plugin     # prints the access it asks for; approve with --approve <fingerprint>
