@@ -32,6 +32,8 @@
 #   late-worktree   `worktree create` never answers; 1 s after rreview killed it, the app makes
 #                   the worktree anyway and writes $FAKE_LOG.late
 #   late-terminal   `terminal create` likewise: the terminal opens 1 s after its CLI was killed
+#                   (with FAKE_ORCA_LATE=runtime-timeout both instead answer at once with Orca's
+#                   runtime_timeout error, and what they asked for is made 1 s after they exit)
 #   no-handle       `terminal create` opens the terminal, then answers ok without a handle
 #   play            the agent plays each prompt itself: the terminal's launch line runs again
 #                   with the prompt on stdin (through rreview's shim), and the fake agent writes
@@ -65,6 +67,10 @@ late() {
   perl -e 'setpgrp; exec @ARGV' sh -c \
     'cli=$1; shift; while kill -0 "$cli" 2> /dev/null; do sleep 0.1; done; sleep 1; '"$script"' && echo made > "$FAKE_LOG.late"' \
     _ "$cli" _ "$@" < /dev/null > /dev/null 2>&1 &
+  # Orca's CLI gives up on a create after its transport timeout, which proves nothing about it.
+  [ "$FAKE_ORCA_LATE" = runtime-timeout ] && {
+    echo '{"ok":false,"error":{"code":"runtime_timeout","message":"Timed out waiting for the Orca runtime"}}'; exit 1
+  }
   sleep 60; exit 1
 }
 handle=$(arg --terminal "$@"); role=${handle#term_}; role=${role%~*}

@@ -280,7 +280,7 @@ pub fn run(args: &Args) -> Result<u8> {
         path: runroot.join("wt"),
         keep: false,
         orca_name: None,
-        orca_unanswered: false,
+        orca_unconfirmed: false,
     };
     if args.orca {
         // The pid and start time make the name the run's own: a concurrent run for the same
@@ -301,7 +301,7 @@ pub fn run(args: &Args) -> Result<u8> {
         launch::interrupted()?;
         wt.orca_name = Some(name.clone());
         let created = orca::create_worktree(&git_common_dir, &name, head, deadline);
-        wt.orca_unanswered = created.as_ref().is_err_and(orca::unanswered);
+        wt.orca_unconfirmed = created.is_err();
         wt.path = created.context("cannot create the review worktree")?;
         let at = git(
             &["-C", launch::utf8(&wt.path)?, "rev-parse", "HEAD"],
@@ -754,8 +754,8 @@ struct Worktree {
     keep: bool,
     /// Set for an Orca-created worktree: it and its branch are found by this name.
     orca_name: Option<String>,
-    /// Orca never answered the create: the app may still make the worktree.
-    orca_unanswered: bool,
+    /// The create failed, so Orca did not confirm it: the app may still make the worktree.
+    orca_unconfirmed: bool,
 }
 
 impl Drop for Worktree {
@@ -765,7 +765,7 @@ impl Drop for Worktree {
             return;
         }
         if let Some(name) = &self.orca_name {
-            if let Err(e) = orca::remove_worktree(name, self.orca_unanswered) {
+            if let Err(e) = orca::remove_worktree(name, self.orca_unconfirmed) {
                 eprintln!("warning: cannot remove the review worktree: {e:#}");
             }
             return;

@@ -3220,6 +3220,39 @@ fn orca_cleans_up_what_an_unanswered_create_makes_later() {
     }
 }
 
+/// Review of PR #34, round 2, finding 1: Orca's own transport timeout (`runtime_timeout`) does not
+/// prove a create was refused; the app may still finish it, and the cleanup waits for it as for a
+/// killed CLI.
+#[test]
+fn orca_cleans_up_what_a_create_orca_gave_up_on_makes_later() {
+    let reply = envelope("src/lib.rs").to_string();
+    for scenario in ["late-worktree", "late-terminal"] {
+        let fx = fixture();
+        let run = orca_run_with(
+            &fx,
+            &[],
+            scenario,
+            &[
+                ("FAKE_REPLY", reply.clone()),
+                ("FAKE_ORCA_LATE", "runtime-timeout".into()),
+            ],
+        );
+        assert_eq!(run.code, Some(2), "{scenario}: {run:?}");
+        assert!(
+            run.stderr.contains("runtime_timeout"),
+            "{scenario}: {run:?}"
+        );
+        assert!(
+            fx.root.join("log.late").exists(),
+            "{scenario}: rreview ended before the app made what it asked for: {run:?}"
+        );
+        if scenario == "late-terminal" {
+            fx.assert_terminal_closed("reliability");
+        }
+        fx.assert_orca_worktree_removed();
+    }
+}
+
 /// Review of PR #34, finding 4: the branch probe before the Orca create is a preparation step.
 /// Ctrl-C stops it at once, and with no create started there is nothing for a cleanup to probe.
 #[test]

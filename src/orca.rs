@@ -27,8 +27,10 @@ const MAX_REPLY: u64 = 4 << 20;
 /// budget) and cleanup.
 const SETUP: Duration = Duration::from_secs(300);
 const CLOSE: Duration = Duration::from_secs(30);
-/// How long the cleanup waits for what a create Orca never answered (its CLI killed at its
-/// deadline, or its reply lost) may still make: the app can finish such a create on its own.
+/// How long the cleanup waits for what a create Orca did not confirm may still make: the app can
+/// finish such a create on its own. Any failure leaves it unconfirmed: its CLI killed at its
+/// deadline, no JSON reply, or an error such as `runtime_timeout` (the CLI's own transport
+/// timeout), none of which proves the create was refused.
 const SETTLE: Duration = Duration::from_secs(30);
 
 /// The runner drives Orca through its CLI, which needs the app running with its runtime
@@ -135,8 +137,8 @@ pub fn check_branch_free(name: &str, deadline: Option<Instant>) -> Result<()> {
 /// terminals in it (spec §4). Repo setup hooks are skipped: they would run the reviewed PR's
 /// code. Returns the worktree path.
 /// `deadline` is the review's budget; it is capped at `SETUP`. An interrupt does not cut it short:
-/// the app may finish a create whose CLI was killed. One killed at its deadline is unanswered
-/// (see [`unanswered`]), and the cleanup waits for what it may still make.
+/// the app may finish a create whose CLI was killed. One that failed is unconfirmed (see
+/// `SETTLE`), and the cleanup waits for what it may still make.
 pub fn create_worktree(
     git_common_dir: &Path,
     name: &str,
@@ -178,13 +180,13 @@ pub fn create_worktree(
 }
 
 /// Removes the worktree on `branch_for(name)` and that branch, found through git rather than
-/// Orca's reply, so a create whose reply was lost is cleaned up as well. After an `unanswered`
+/// Orca's reply, so a create whose reply was lost is cleaned up as well. After an `unconfirmed`
 /// create it waits up to `SETTLE` for the worktree to appear. A cleanup step: every call runs to
 /// its end in its own process group, whatever the interrupt flag says.
-// limit: a worktree the app makes more than `SETTLE` after its create was killed stays behind.
-pub fn remove_worktree(name: &str, unanswered: bool) -> Result<()> {
+// limit: a worktree the app makes more than `SETTLE` after its create failed stays behind.
+pub fn remove_worktree(name: &str, unconfirmed: bool) -> Result<()> {
     let branch = branch_for(name);
-    let settle = Instant::now() + if unanswered { SETTLE } else { Duration::ZERO };
+    let settle = Instant::now() + if unconfirmed { SETTLE } else { Duration::ZERO };
     let path = loop {
         let list = git(&["worktree", "list", "--porcelain"])?;
         let path = list.split("\n\n").find_map(|entry| {
@@ -313,11 +315,11 @@ impl Orca {
     }
 
     /// Closes the terminals titled `title` in the terminals' worktree: a create that failed may
-    /// still have opened one. After an `unanswered` create it waits up to `SETTLE` for one to
-    /// appear. Best effort; a failure is a warning.
-    // limit: a terminal the app opens more than `SETTLE` after its create was killed stays open.
-    fn close_titled(&self, title: &str, unanswered: bool) {
-        let settle = Instant::now() + if unanswered { SETTLE } else { Duration::ZERO };
+    /// still have opened one, so it waits up to `SETTLE` for one to appear. Best effort; a
+    /// failure is a warning.
+    // limit: a terminal the app opens more than `SETTLE` after its create failed stays open.
+    fn close_titled(&self, title: &str) {
+        let settle = Instant::now() + SETTLE;
         loop {
             let listed = orca_to_end(
                 &[
@@ -515,7 +517,7 @@ impl Runner for Orca {
                 .map(String::from)
                 .context("orca terminal create: no handle")
         })
-        .inspect_err(|e| self.close_titled(&title, unanswered(e)))?;
+        .inspect_err(|_| self.close_titled(&title))?;
         // Registered before anything else can fail, so `Drop` closes it at the latest.
         self.set(
             pass.role,
@@ -906,31 +908,13 @@ fn run_orca(
         }
     })?;
     let v = serde_json::from_slice(&out.stdout).map_err(|_| {
-        NoReply(format!(
+        anyhow::anyhow!(
             "orca {name}: no JSON reply ({}): {}",
             out.status,
             String::from_utf8_lossy(&out.stderr).trim()
-        ))
+        )
     })?;
     Ok((v, out.status.success()))
-}
-
-/// An Orca call that ended without a JSON reply.
-#[derive(Debug)]
-struct NoReply(String);
-
-impl std::fmt::Display for NoReply {
-    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
-        f.write_str(&self.0)
-    }
-}
-
-impl std::error::Error for NoReply {}
-
-/// Whether `e` leaves an Orca call unanswered: killed at its deadline, or no JSON reply. What a
-/// create was asked for may then still happen.
-pub fn unanswered(e: &anyhow::Error) -> bool {
-    e.is::<TimedOut>() || e.is::<NoReply>()
 }
 
 fn error(v: &Value) -> String {
