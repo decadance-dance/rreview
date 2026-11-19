@@ -50,6 +50,9 @@ const run = atom<Run | null>(null)
 /** The finished run's result, as `review.result` gives it. */
 const result = atom<Result | null>(null)
 const prArg = atom('prArg', '', { persist: 'workspace' })
+/** The `prArg` the shown target was resolved from: Run review starts that PR, not a value typed
+ * under Other PR… and never submitted. */
+const targetArg = atom('')
 const runner = atom<Runner>('runner', 'headless', { persist: 'plugin' })
 const showAll = atom('showAll', false, { persist: 'plugin' })
 const selected = atom<string | null>(null)
@@ -60,6 +63,8 @@ const agents = atom<{ value: string; label: string; session: string | null }[]>(
 /** The terminal the person chose; never picked for them. */
 const author = atom<{ terminalId: string; sessionId: string | null } | null>(null)
 const notice = atom<{ tone: Tone; text: string } | null>(null)
+/** "Passes" as the person left it for the shown run; null: open while a pass failed. */
+const passesOpen = atom<boolean | null>(null)
 /** "Other PR…" as the person left it; null: open only when the workspace has no PR. */
 const otherPr = atom<boolean | null>(null)
 /** The last "Send to author" of a run, kept so a reopened panel still shows this run's were sent. */
@@ -70,7 +75,9 @@ const errorText = (e: unknown) => (e instanceof Error ? e.message : String(e))
 async function loadTarget(): Promise<void> {
   set(loading, true)
   try {
-    set(target, await plugin.request('target.get', { pr: read(prArg) }, { timeoutMs: 60_000 }))
+    const pr = read(prArg)
+    set(target, await plugin.request('target.get', { pr }, { timeoutMs: 60_000 }))
+    set(targetArg, pr)
     set(otherPr, null)
   } catch (e) {
     set(notice, { tone: 'danger', text: errorText(e) })
@@ -104,6 +111,7 @@ async function showRun(r: Run | null): Promise<void> {
   const fresh = !was || !r || was.token !== r.token
   if (fresh) {
     set(result, null)
+    set(passesOpen, null)
     set(author, null)
     void loadAgents()
   }
@@ -124,7 +132,7 @@ async function startReview(): Promise<void> {
   if (!t) return
   set(notice, null)
   try {
-    showRun(await plugin.request('review.start', { workspaceId: t.workspaceId, pr: read(prArg), runner: read(runner) }, { timeoutMs: 60_000 }))
+    showRun(await plugin.request('review.start', { workspaceId: t.workspaceId, pr: read(targetArg), runner: read(runner) }, { timeoutMs: 60_000 }))
   } catch (e) {
     set(notice, { tone: 'danger', text: errorText(e) })
   }
@@ -260,6 +268,9 @@ function Failure({ role, e }: { role: string; e?: PassEvent }) {
   )
 }
 
+/** Whether `r` reviewed the PR the header shows, which Run review would start. */
+const isShown = (r: Run) => r.pr.url === read(target)?.pr?.url
+
 function Header() {
   const t = read(target)
   const r = read(run)
@@ -290,9 +301,10 @@ function Header() {
           <Text size="sm">Open a PR for this branch, or type a PR number or URL under Other PR, then press Refresh.</Text>
         </Callout>
       )}
-      {/* Orca has no segmented control: a horizontal RadioGroup is the closest. A small button with
-          no icon keeps both on one row at 280 px; Cancel sits on the run's status line. */}
-      <Row justify="between" align="center" gap="sm" wrap>
+      {/* Orca has no segmented control: a horizontal RadioGroup is the closest. An xs button with
+          no icon and an xs gap keep both on one row at 280 px with a scrollbar; Cancel sits on the
+          run's status line. */}
+      <Row justify="between" align="center" gap="xs" wrap>
         <RadioGroup
           label="Runner"
           labelHidden
@@ -304,8 +316,8 @@ function Header() {
           ]}
           onChange={(v) => set(runner, v as Runner)}
         />
-        <Button size="sm" tone="accent" disabled={running || !t?.pr} onPress={startReview}>
-          {running ? 'Running…' : r && r.pr.url === t?.pr?.url ? 'Run again' : 'Run review'}
+        <Button size="xs" tone="accent" disabled={running || read(loading) || !t?.pr} onPress={startReview}>
+          {running ? 'Running…' : r && isShown(r) ? 'Run again' : 'Run review'}
         </Button>
       </Row>
       {t || !read(loading) ? (
@@ -328,7 +340,11 @@ function Header() {
   )
 }
 
-/** One line of counts: findings at and below the gate, passes done, the run's time, degraded. */
+/** `17m` from 17m 6s; seconds under a minute. Short, so the counts stay on one line. */
+const minutes = (ms: number) => (ms < 60_000 ? duration(ms) : `${Math.round(ms / 60_000)}m`)
+
+/** One line of counts at 280 px: findings at and below the gate, passes completed of all, the
+ * run's time, degraded. The Passes fold under the findings spells the pass counts out. */
 function Counts({ r }: { r: Run }) {
   const res = read(result)
   const list = passes(r)
@@ -338,7 +354,7 @@ function Counts({ r }: { r: Run }) {
   const degraded = r.summary?.degraded ?? res?.degraded
   return (
     <Text size="xs" muted>
-      {`${gated} gated · ${all - gated} below gate · ${ok}/${list.length} passes · ${duration(runEnd(r) - r.startedAt)}`}
+      {`${gated} gated · ${all - gated} below · ${ok}/${list.length} · ${minutes(runEnd(r) - r.startedAt)}`}
       {degraded ? ' · ' : null}
       {degraded ? (
         <Text size="xs" tone="warning">
@@ -348,6 +364,10 @@ function Counts({ r }: { r: Run }) {
     </Text>
   )
 }
+
+/** How to retry a run of another PR than the one shown: Run review would start the shown one. */
+const retryElsewhere = (r: Run) =>
+  `To review #${r.pr.number} again, focus its workspace or type it under Other PR…, then press Run review.`
 
 function Status({ r }: { r: Run }) {
   const res = read(result)
@@ -376,7 +396,7 @@ function Status({ r }: { r: Run }) {
     return (
       <Callout tone="danger" title="The review failed">
         <Text size="sm">{r.error ?? ''}</Text>
-        <Text size="sm">Fix the cause, then press Run again.</Text>
+        <Text size="sm">{isShown(r) ? 'Fix the cause, then press Run again.' : retryElsewhere(r)}</Text>
         {r.runDir ? (
           <Text size="xs" muted>
             Run dir: <Code>{r.runDir}</Code>
@@ -387,7 +407,9 @@ function Status({ r }: { r: Run }) {
   if (r.status === 'cancelled')
     return (
       <Callout tone="neutral" title="The review was cancelled">
-        <Text size="sm">rreview stopped its reviewers and ran its cleanup before it exited. Run again starts a new run.</Text>
+        <Text size="sm">
+          {`rreview stopped its reviewers and ran its cleanup before it exited. ${isShown(r) ? 'Run again starts a new run.' : retryElsewhere(r)}`}
+        </Text>
         {r.runDir ? (
           <Text size="xs" muted>
             Run dir: <Code>{r.runDir}</Code>
@@ -436,10 +458,11 @@ function Passes({ r }: { r: Run }) {
   if (r.status === 'running') return body
   const ok = list.filter(({ e }) => e?.status === 'completed').length
   return (
+    // Controlled: a failure the result reports after the fold appeared still opens it.
     <Collapsible
-      key={`passes:${r.token}`}
       title={`Passes · ${ok}/${list.length} done${failures.length ? `, ${failures.length} failed` : ''}`}
-      defaultOpen={failures.length > 0}
+      open={read(passesOpen) ?? failures.length > 0}
+      onChange={(open) => set(passesOpen, open)}
     >
       {body}
     </Collapsible>
@@ -533,7 +556,7 @@ function Findings({ r }: { r: Run }) {
               // The title as a child, not `title`, which Orca cuts with an ellipsis.
               <ListItem key={key} icon={severityIcon(f.priority)} current={key === read(selected)} onPress={() => set(selected, key)}>
                 <Text size="sm">{f.title}</Text>
-                <Text size="xs" muted>{`P${f.priority} · ${f.file.split('/').pop()}:${lines(f)} · conf ${f.confidence_score}`}</Text>
+                <Text size="xs" muted>{`P${f.priority} · ${f.file}:${lines(f)} · conf ${f.confidence_score}`}</Text>
               </ListItem>
             )
           })}
@@ -573,7 +596,7 @@ export default function Panel() {
       {n ? <Callout tone={n.tone}>{n.text}</Callout> : null}
       {r || read(target)?.pr ? <Separator /> : null}
       {/* The run shown is another PR's (the workspace changed, or another PR was typed). */}
-      {r && r.pr.url !== read(target)?.pr?.url ? (
+      {r && !isShown(r) ? (
         <Text size="sm" muted>
           Review of <Link href={r.pr.url}>#{r.pr.number}</Link> {r.pr.title}
         </Text>

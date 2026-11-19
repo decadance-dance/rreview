@@ -2,7 +2,7 @@
 import { assert, mockHost, mount, test, type TestPanel } from 'orca/testing'
 import { cancelled, done, doneResult, failed, running, target } from './fixtures'
 import * as panel from './panel'
-import type { Result, Run } from './protocol'
+import type { Result, Run, Target } from './protocol'
 
 /** Agents per workspace: ws1 is the reviewed run's, ws2 another one. */
 const AGENTS: Record<string, unknown[]> = {
@@ -76,7 +76,7 @@ test('shows the workspace PR and starts a review with the chosen runner', async 
   assert.match(String(leaves(view)[0][0]), /^Terminal leaks when close fails /)
   assert.equal(view.find({ type: 'Progress' }), null)
   // The verdict's one line of counts replaces the status heading.
-  assert.match(JSON.stringify(view.find({ type: 'Callout', text: /Patch is incorrect/ })), /2 gated · 1 below gate · 3\/4 passes · 2m 0s · .*degraded/)
+  assert.match(JSON.stringify(view.find({ type: 'Callout', text: /Patch is incorrect/ })), /2 gated · 1 below · 3\/4 · 2m · .*degraded/)
   assert.equal(view.find({ type: 'Heading', text: /PR #11/ }), null)
   // Run again, for the PR it just reviewed.
   assert.ok(view.find({ text: 'Run again' }))
@@ -90,8 +90,8 @@ test('a finished review lists the findings and sends the picked ones', async () 
   const view = await mount(panel, { host })
   // Full titles; severity as `P<n>` text and an icon per severity, never color alone.
   assert.deepEqual(leaves(view), [
-    ['Terminal leaks when close fails P1 · orca.rs:120-124 · conf 0.9', 'error'],
-    ['Budget skips setup P2 · review.rs:40-44 · conf 0.85', 'warning']
+    ['Terminal leaks when close fails P1 · src/orca.rs:120-124 · conf 0.9', 'error'],
+    ['Budget skips setup P2 · src/review.rs:40-44 · conf 0.85', 'warning']
   ])
   assert.ok(view.find({ type: 'Text', text: 'degraded' }))
   // The failed pass is named with its reason, rreview's own prefix cut.
@@ -115,7 +115,7 @@ test('a finished review lists the findings and sends the picked ones', async () 
   assert.match(JSON.stringify(view.find({ type: 'Markdown' })), /Terminal leaks when close fails\*\*: what fails/)
 
   await view.toggle({ label: 'Below the gate too' })
-  assert.deepEqual(leaves(view)[2], ['Unclear error text P3 · orca.rs:300-304 · conf 0.6', 'info'])
+  assert.deepEqual(leaves(view)[2], ['Unclear error text P3 · src/orca.rs:300-304 · conf 0.6', 'info'])
 
   // Both gated findings start picked; unpick one through its detail.
   await view.press({ type: 'ListItem', text: /Budget skips setup/ })
@@ -189,7 +189,7 @@ test('a failed review is shown as failed with its error', async () => {
   assert.equal(cells(view).at(-1), 'coordinator claude ✗ failed · 30s')
   assert.equal(view.find({ type: 'List' }), null)
   // A failed pass opens the folded passes.
-  assert.equal(view.find({ type: 'Collapsible', text: /Passes · 2\/4 done, 2 failed/ })?.props?.defaultOpen, true)
+  assert.equal(view.find({ type: 'Collapsible', text: /Passes · 2\/4 done, 2 failed/ })?.props?.open, true)
   await view.unmount()
 })
 
@@ -228,9 +228,9 @@ test('no findings above the gate says how many are below it and how to see them'
   const s = view.summary().join('\n') + JSON.stringify(view.tree())
   assert.match(s, /EmptyState "No findings above the gate"/)
   assert.match(s, /1 below the gate: turn on the switch above to see them/)
-  assert.match(s, /0 gated · 1 below gate/)
+  assert.match(s, /0 gated · 1 below · /)
   // No pass failed: the passes stay folded.
-  assert.equal(view.find({ type: 'Collapsible', text: /Passes · / })?.props?.defaultOpen, false)
+  assert.equal(view.find({ type: 'Collapsible', text: /Passes · / })?.props?.open, false)
   await view.toggle({ label: 'Below the gate too' })
   // The one below the gate opens at once.
   assert.equal(view.valueOf({ label: 'File and line (select to copy)' }), 'src/orca.rs:300-304')
@@ -243,7 +243,7 @@ test('a run that failed before any pass says so without a time', async () => {
   assert.match(s, /cannot run rreview: ENOENT/)
   assert.ok(!/passes finished/.test(s))
   // No pass failed: the passes stay folded until opened.
-  assert.equal(view.find({ type: 'Collapsible', text: /Passes · 0\/4 done/ })?.props?.defaultOpen, false)
+  assert.equal(view.find({ type: 'Collapsible', text: /Passes · 0\/4 done/ })?.props?.open, false)
   await view.toggle({ label: /Passes/ })
   assert.equal(cells(view)[0], 'intent_contracts – not run')
   await view.unmount()
@@ -377,6 +377,75 @@ test('a run of another PR than the one shown says which PR it reviewed', async (
   const same = await mountRun(done, doneResult)
   assert.ok(!/Review of /.test(JSON.stringify(same.tree())))
   await same.unmount()
+})
+
+test('Run again starts the PR the header shows, not one typed under Other PR and never submitted', async () => {
+  const { host, calls } = setup(done)
+  const view = await mount(panel, { host })
+  await view.toggle({ label: /Other PR/ })
+  await view.type({ label: 'PR number or URL' }, '12')
+  await view.toggle({ label: /Other PR/ })
+  await view.press({ text: 'Run again' })
+  assert.deepEqual(calls.at(-1), { name: 'review.start', input: { workspaceId: 'ws1', pr: '', runner: 'headless' } })
+  // Submitted, the typed PR becomes the shown one, and the one Run review starts.
+  await view.post('review.changed', done)
+  await view.toggle({ label: /Other PR/ })
+  await view.type({ label: 'PR number or URL' }, '', { submit: true })
+  await view.press({ text: /Run/ })
+  assert.deepEqual(calls.at(-1)?.input, { workspaceId: 'ws1', pr: '12', runner: 'headless' })
+  await view.unmount()
+})
+
+test('Passes opens when the result reports a failure after the fold appeared', async () => {
+  // security's `failed` line never reached progress.jsonl, and the result comes late.
+  const lost = { ...done, events: done.events.filter((e) => !(e.role === 'security' && e.status === 'failed')) }
+  const view = await mount(panel, {
+    host: mockHost({
+      results: { 'agents.list': { agents: [] } },
+      requests: {
+        'target.get': () => target,
+        'review.get': () => running,
+        'review.result': () => new Promise<Result>((resolve) => setTimeout(() => resolve(doneResult), 100))
+      }
+    })
+  })
+  // The fold appears with the done run, before its result reports security's failure.
+  await view.post('review.changed', lost)
+  await view.settled()
+  assert.equal(view.find({ type: 'Collapsible', text: /Passes · 3\/4 done, 1 failed/ })?.props?.open, true)
+  // Closed by the person, it stays closed.
+  await view.toggle({ label: /Passes · / })
+  await view.rerender()
+  assert.equal(view.find({ type: 'Collapsible', text: /Passes · / })?.props?.open, false)
+  await view.unmount()
+})
+
+test('a failed or cancelled run of another PR says how to retry that PR, not Run again', async () => {
+  let shown: Target = target
+  const pr12: Target = { ...target, workspaceId: 'ws2', pr: { ...target.pr!, number: 12, url: 'https://github.com/acme/repo/pull/12' } }
+  for (const run of [failed, cancelled]) {
+    shown = target
+    const view = await mount(panel, {
+      host: mockHost({ results: { 'agents.list': { agents: [] } }, requests: { 'target.get': () => shown, 'review.get': () => run } })
+    })
+    assert.match(JSON.stringify(view.tree()), /Run again/)
+    shown = pr12
+    await view.emit('workspace.changed', { context: { workspaceId: 'ws2' } } as never)
+    const s = JSON.stringify(view.find({ type: 'Callout', text: /The review (failed|was cancelled)/ }))
+    assert.match(s, /To review #11 again, focus its workspace or type it under Other PR…, then press Run review/)
+    assert.ok(!/Run again/.test(s), run.status)
+    await view.unmount()
+  }
+})
+
+test('findings in files with the same name show their whole path', async () => {
+  const twin = (file: string) => ({ ...doneResult.findings[0], file })
+  const res: Result = { ...doneResult, findings: [twin('src/index.ts'), twin('tests/index.ts')], ungated_findings: [twin('src/index.ts'), twin('tests/index.ts')] }
+  const view = await mountRun(done, res)
+  const [a, b] = leaves(view).map((l) => l[0])
+  assert.notEqual(a, b)
+  assert.match(String(b), / tests\/index\.ts:120-124 /)
+  await view.unmount()
 })
 
 test('durations read as minutes and seconds', () => {
