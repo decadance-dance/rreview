@@ -110,6 +110,17 @@ test('a PR argument that is not a number or URL never reaches gh', async () => {
   assert.ok(!/evil|--help/.test(log()))
 })
 
+test('a PR URL on any host passes, GitHub Enterprise too; other forms and flags do not', async () => {
+  for (const ok of ['11', 'https://github.com/acme/repo/pull/11', 'https://ghe.corp.example/acme/repo/pull/11/', 'https://git.example:8443/a-b/c.d/pull/7'])
+    assert.equal(main.checkPrArg(` ${ok} `), ok)
+  for (const bad of ['--repo=x', '-1', 'http://ghe.corp.example/acme/repo/pull/11', 'https://h/a/b/issues/1', 'https://h/a/pull/1', 'https://h/a/b/pull/1?x=1', 'https://-h/a/b/pull/1 --help', 'acme/repo#11'])
+    assert.throws(() => main.checkPrArg(bad), /not a PR number or PR URL/, bad)
+  // The workspace's PR on an Enterprise host reaches gh as typed.
+  const worker = await mountWorker(main, { host: host() })
+  await worker.request('target.get', { pr: 'https://ghe.corp.example/acme/repo/pull/11' })
+  assert.match(log(), /gh .* \| pr view https:\/\/ghe\.corp\.example\/acme\/repo\/pull\/11 --json/)
+})
+
 test('runs rreview in the workspace, tails progress and keeps the result', async () => {
   const h = host()
   const worker = await mountWorker(main, { host: h })
@@ -172,7 +183,7 @@ test('a missing rreview binary fails the run and names the setting', async () =>
   await worker.request('review.start', { workspaceId: 'ws1', runner: 'headless' })
   const run = await ended(worker)
   assert.equal(run.status, 'failed')
-  assert.match(run.error ?? '', /cannot run .*nope.*Settings/)
+  assert.match(run.error ?? '', /cannot run .*nope.*Settings > Plugins > Rreview\)$/)
 })
 
 test('the GitHub account setting gives gh and rreview its token, and only them', async () => {

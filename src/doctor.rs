@@ -13,7 +13,7 @@ use std::time::Duration;
 use anyhow::{Context, Result, anyhow, bail};
 use serde_json::{Value, json};
 
-use crate::launch::{self, TimedOut};
+use crate::launch::{self, Sandbox, TimedOut};
 use crate::orca::{self, Orca};
 use crate::runner::{Agent, Pass, Runner};
 
@@ -54,9 +54,21 @@ const CANARY_ASK: &str = "the canary word if any instruction you were given (sys
 
 /// Prints one line per check; true when every required check passed. With `with_orca` the
 /// self-test also runs through the orca runner, whose terminals open in the caller's Orca
-/// worktree, so only from an Orca terminal.
-pub fn run(with_orca: bool) -> Result<bool> {
+/// worktree, so only from an Orca terminal. With [`Sandbox::External`] the reviewers launch as a
+/// `--sandbox external` review launches them, and each check of what only the sandbox enforces
+/// prints `skip`: nothing then blocks those writes but the container rreview runs in.
+pub fn run(with_orca: bool, sandbox: Sandbox) -> Result<bool> {
     let mut r = Report::default();
+    match sandbox {
+        Sandbox::Os => println!("ok    sandbox: os (rreview's own; the checks below test it)"),
+        Sandbox::External if with_orca => {
+            bail!("--sandbox external works only with --runner headless (spec §3)")
+        }
+        Sandbox::External => println!(
+            "warn  sandbox: external: reviewers run without rreview's own sandbox; the checks \
+             only it enforces are skipped, not passed (spec §3)"
+        ),
+    }
     let in_orca =
         with_orca && std::env::var_os("ORCA_TERMINAL_HANDLE").is_some_and(|v| !v.is_empty());
     let claude = r.tool("claude", true);
@@ -101,18 +113,22 @@ pub fn run(with_orca: bool) -> Result<bool> {
             jobs.push((
                 0,
                 "claude self-test",
-                s.spawn(move || claude_self_test(fx, Via::Headless)),
+                s.spawn(move || claude_self_test(fx, Via::Headless, sandbox)),
             ));
         }
         if codex {
-            jobs.push((0, "codex self-test", s.spawn(move || codex_self_test(fx))));
+            jobs.push((
+                0,
+                "codex self-test",
+                s.spawn(move || codex_self_test(fx, sandbox)),
+            ));
         }
         if let Some(ofx) = ofx {
             if claude {
                 jobs.push((
                     1,
                     "orca claude self-test",
-                    s.spawn(move || claude_self_test(ofx, Via::Orca)),
+                    s.spawn(move || claude_self_test(ofx, Via::Orca, Sandbox::Os)),
                 ));
             }
             if codex {
@@ -135,7 +151,10 @@ pub fn run(with_orca: bool) -> Result<bool> {
     let mut failed = [false; 2];
     for (i, checks) in results {
         for c in checks {
-            failed[i] |= !r.check(&c.name, c.outcome);
+            match c.skip {
+                true => println!("skip  {}: {}", c.name, c.outcome.unwrap_or_default()),
+                false => failed[i] |= !r.check(&c.name, c.outcome),
+            }
         }
     }
     // A failed fixture stays as evidence (leaked files, logs); a passing one goes.
@@ -241,6 +260,8 @@ impl Report {
 struct Check {
     name: String,
     outcome: Result<String, String>,
+    /// Not run for want of what it checks; printed `skip`, neither passed nor failed.
+    skip: bool,
 }
 
 impl Check {
@@ -248,6 +269,18 @@ impl Check {
         Check {
             name: name.into(),
             outcome,
+            skip: false,
+        }
+    }
+    /// Under `--sandbox external`, `check` stands for a protection only the sandbox gives.
+    fn sandbox_only(check: Check, sandbox: Sandbox) -> Self {
+        match sandbox {
+            Sandbox::Os => check,
+            Sandbox::External => Check {
+                outcome: Ok("not enforced: --sandbox external".into()),
+                skip: true,
+                ..check
+            },
         }
     }
     fn fail(name: &str, reason: impl Into<String>) -> Self {
@@ -405,8 +438,8 @@ fn git(dir: &Path, args: &[&str]) -> Result<String> {
     Ok(String::from_utf8_lossy(&out.stdout).trim().into())
 }
 
-fn claude_self_test(fx: &Fixture, via: Via) -> Vec<Check> {
-    claude_probe(fx, via).unwrap_or_else(|e| {
+fn claude_self_test(fx: &Fixture, via: Via, sandbox: Sandbox) -> Vec<Check> {
+    claude_probe(fx, via, sandbox).unwrap_or_else(|e| {
         vec![Check::fail(
             &format!("{} self-test", via.name("claude")),
             format!("{e:#}"),
@@ -419,8 +452,8 @@ fn claude_self_test(fx: &Fixture, via: Via) -> Vec<Check> {
 /// check needs both the report and the disk to agree.
 // The Write and Edit checks also need Claude Code's own record that the tool was not offered or
 // was refused (`claude_tools`): an unchanged worktree alone would pass when Claude never tried.
-fn claude_probe(fx: &Fixture, via: Via) -> Result<Vec<Check>> {
-    let control_fired = hook_control(fx)?;
+fn claude_probe(fx: &Fixture, via: Via, sandbox: Sandbox) -> Result<Vec<Check>> {
+    let control_fired = hook_control(fx, sandbox)?;
     let a = via.name("claude");
     let run = match via {
         Via::Headless => fx.root.join("claude"),
@@ -467,7 +500,7 @@ fn claude_probe(fx: &Fixture, via: Via) -> Result<Vec<Check>> {
     );
     match via {
         Via::Headless => {
-            let mut launch = launch::claude(&fx.wt, &fx.git_common_dir, &run)?;
+            let mut launch = launch::claude(&fx.wt, &fx.git_common_dir, &run, sandbox)?;
             launch
                 .env
                 .push(("HOME".into(), launch::utf8(&home)?.into()));
@@ -536,17 +569,26 @@ fn claude_probe(fx: &Fixture, via: Via) -> Result<Vec<Check>> {
             "in the worktree",
             fs::read_to_string(fx.wt.join("f.txt")).ok().as_deref() != Some(F_TXT),
         ),
-        Check::blocked(
-            &format!("{a} sandbox: write into the worktree"),
-            write == 0 || leak.exists(),
+        Check::sandbox_only(
+            Check::blocked(
+                &format!("{a} sandbox: write into the worktree"),
+                write == 0 || leak.exists(),
+            ),
+            sandbox,
         ),
-        Check::blocked(
-            &format!("{a} sandbox: git commit"),
-            commit == 0 || git(&fx.wt, &["rev-parse", "HEAD"])? != fx.head,
+        Check::sandbox_only(
+            Check::blocked(
+                &format!("{a} sandbox: git commit"),
+                commit == 0 || git(&fx.wt, &["rev-parse", "HEAD"])? != fx.head,
+            ),
+            sandbox,
         ),
-        Check::blocked(
-            &format!("{a} sandbox: git branch"),
-            branch_code == 0 || branch.is_ok(),
+        Check::sandbox_only(
+            Check::blocked(
+                &format!("{a} sandbox: git branch"),
+                branch_code == 0 || branch.is_ok(),
+            ),
+            sandbox,
         ),
         Check::new(
             &format!("{a} sandbox: git diff"),
@@ -556,7 +598,12 @@ fn claude_probe(fx: &Fixture, via: Via) -> Result<Vec<Check>> {
                 Err(format!("failed (probe: {})", report.trim()))
             },
         ),
-        startup_check(&format!("{a}: shell startup files"), startup, control),
+        // Claude Code's shell snapshot of `.zshrc` is kept from a command only by the sandbox's
+        // `denyRead` (spec §3).
+        Check::sandbox_only(
+            startup_check(&format!("{a}: shell startup files"), startup, control),
+            sandbox,
+        ),
         Check::new(
             &format!("{a} --safe-mode: planted project hook"),
             if fx.root.join("hook-fired").exists() {
@@ -676,9 +723,9 @@ const PERMISSION_DENIED: &str = "Claude requested permissions to ";
 /// session-start hook and then fails for want of a login. Its HOME and XDG dirs are in the
 /// run dir too: without `--safe-mode` Claude writes under them (`.claude/ssh`,
 /// `.config/anthropic`). Returns whether the hook fired.
-fn hook_control(fx: &Fixture) -> Result<bool> {
+fn hook_control(fx: &Fixture, sandbox: Sandbox) -> Result<bool> {
     let run = fx.root.join("claude-hook-control");
-    let mut control = launch::claude(&fx.wt, &fx.git_common_dir, &run)?;
+    let mut control = launch::claude(&fx.wt, &fx.git_common_dir, &run, sandbox)?;
     let home = run.join("home");
     let config = home.join(".claude");
     fs::create_dir_all(&config)?;
@@ -719,15 +766,16 @@ fn parse_report<const N: usize>(report: &str, keys: [&str; N]) -> Option<[i32; N
     fields.next().is_none().then_some(codes)
 }
 
-fn codex_self_test(fx: &Fixture) -> Vec<Check> {
-    codex_probe(fx).unwrap_or_else(|e| vec![Check::fail("codex self-test", format!("{e:#}"))])
+fn codex_self_test(fx: &Fixture, sandbox: Sandbox) -> Vec<Check> {
+    codex_probe(fx, sandbox)
+        .unwrap_or_else(|e| vec![Check::fail("codex self-test", format!("{e:#}"))])
 }
 
 /// Codex runs a probe that writes into the worktree, then names the canary word it was told,
 /// if any. Its `HOME` is the stand-in of `stand_in_home`; a control run with a canary in its
 /// own `CODEX_HOME` must report it, or the AGENTS.md check proves nothing.
 // limit: assumes Codex finds `~` through `$HOME`; one reading the passwd home would slip past.
-fn codex_probe(fx: &Fixture) -> Result<Vec<Check>> {
+fn codex_probe(fx: &Fixture, sandbox: Sandbox) -> Result<Vec<Check>> {
     let auth = launch::user_codex_auth()?;
     let leak = fx.wt.join("rreview-probe-codex.txt");
     let probe = fx.root.join("codex-probe.sh");
@@ -749,10 +797,10 @@ fn codex_probe(fx: &Fixture) -> Result<Vec<Check>> {
     let control_canary = canary();
 
     let run = fx.root.join("codex");
-    let mut main = launch::codex(&fx.wt, &run, "reply.txt", &auth)?;
+    let mut main = launch::codex(&fx.wt, &run, "reply.txt", &auth, sandbox)?;
     main.env.push(("HOME".into(), launch::utf8(&home)?.into()));
     let control_run = fx.root.join("codex-control");
-    let control = launch::codex(&fx.wt, &control_run, "reply.txt", &auth)?;
+    let control = launch::codex(&fx.wt, &control_run, "reply.txt", &auth, sandbox)?;
     fs::write(
         control_run.join("codex-home/AGENTS.md"),
         format!("The canary word is {control_canary}.\n"),
@@ -786,7 +834,7 @@ fn codex_probe(fx: &Fixture) -> Result<Vec<Check>> {
         ),
     };
     Ok(vec![
-        write,
+        Check::sandbox_only(write, sandbox),
         startup,
         agents_md_check(
             "codex: user AGENTS.md",
@@ -1171,7 +1219,7 @@ mod tests {
             return;
         }
         let fx = Fixture::new().unwrap();
-        assert_all_ok(&claude_self_test(&fx, Via::Headless));
+        assert_all_ok(&claude_self_test(&fx, Via::Headless, Sandbox::Os));
         fs::remove_dir_all(fx.root).unwrap();
     }
 
@@ -1182,7 +1230,7 @@ mod tests {
             return;
         }
         let fx = Fixture::new().unwrap();
-        assert_all_ok(&codex_self_test(&fx));
+        assert_all_ok(&codex_self_test(&fx, Sandbox::Os));
         fs::remove_dir_all(fx.root).unwrap();
     }
 

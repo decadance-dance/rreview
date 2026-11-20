@@ -309,11 +309,37 @@ impl std::fmt::Display for Interrupted {
 
 impl std::error::Error for Interrupted {}
 
+/// What confines a reviewer's commands (spec §3): rreview's OS sandbox, or, with
+/// `--sandbox external`, an outer container the caller already made the isolation boundary.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
+pub enum Sandbox {
+    /// Claude Code's sandbox and Codex's `-s read-only`, required to start.
+    Os,
+    /// No inner sandbox: for a container that is the boundary (bubblewrap and Codex's own
+    /// sandbox may not start there). Everything else of spec §3 still applies.
+    External,
+}
+
+impl Sandbox {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Sandbox::Os => "os",
+            Sandbox::External => "external",
+        }
+    }
+}
+
 /// `claude -p --safe-mode --settings <runroot>/claude-settings.json --output-format json`.
 /// Writes the settings file: no edit/write/MCP tools, Bash sandboxed, writes denied in the
-/// worktree and the git common dir, allowed only in `<runroot>/out`.
-pub fn claude(worktree: &Path, git_common_dir: &Path, runroot: &Path) -> Result<Launch> {
-    let (settings, cwd) = claude_settings(worktree, git_common_dir, runroot)?;
+/// worktree and the git common dir, allowed only in `<runroot>/out`. With
+/// [`Sandbox::External`] Bash runs unsandboxed instead (see [`claude_settings`]).
+pub fn claude(
+    worktree: &Path,
+    git_common_dir: &Path,
+    runroot: &Path,
+    sandbox: Sandbox,
+) -> Result<Launch> {
+    let (settings, cwd) = claude_settings(worktree, git_common_dir, runroot, sandbox)?;
     Ok(Launch {
         program: "claude".into(),
         args: [
@@ -339,7 +365,7 @@ pub fn claude(worktree: &Path, git_common_dir: &Path, runroot: &Path) -> Result<
 /// reviewer's heredoc reply twice (*verified*, Claude Code 2.1.316). The deny rules still remove
 /// Edit and Write, and the sandbox still refuses every other write.
 pub fn claude_tui(worktree: &Path, git_common_dir: &Path, runroot: &Path) -> Result<Launch> {
-    let (settings, cwd) = claude_settings(worktree, git_common_dir, runroot)?;
+    let (settings, cwd) = claude_settings(worktree, git_common_dir, runroot, Sandbox::Os)?;
     let out = absolute(&runroot.join("out"))?;
     Ok(Launch {
         program: "claude".into(),
@@ -360,11 +386,15 @@ pub fn claude_tui(worktree: &Path, git_common_dir: &Path, runroot: &Path) -> Res
     })
 }
 
-/// Writes `<runroot>/claude-settings.json`; returns its path and the resolved worktree.
+/// Writes `<runroot>/claude-settings.json`; returns its path and the resolved worktree. With
+/// [`Sandbox::External`] the sandbox is off and Bash allowed outright (in `-p` nobody would
+/// answer its permission prompt); the deny rules still win over that allow. The other settings
+/// files are not checked then: what they could weaken is the sandbox that is off.
 fn claude_settings(
     worktree: &Path,
     git_common_dir: &Path,
     runroot: &Path,
+    sandbox: Sandbox,
 ) -> Result<(String, PathBuf)> {
     let worktree = absolute(worktree)?;
     let git_common_dir = absolute(git_common_dir)?;
@@ -373,7 +403,7 @@ fn claude_settings(
     let out = runroot.join("out");
     let snapshots = user_claude_config_dir()?.join("shell-snapshots");
     let settings_path = runroot.join("claude-settings.json");
-    let settings = json!({
+    let mut settings = json!({
         "permissions": { "deny": [
             "Edit", "Write", "NotebookEdit", "mcp__*",
             "Bash(gh *)", "Bash(git push*)", "Bash(curl *)", "Bash(wget *)",
@@ -399,7 +429,13 @@ fn claude_settings(
         },
         "disableBundledSkills": true
     });
-    refuse_weakened_sandbox(&claude_settings_sources(&worktree)?)?;
+    match sandbox {
+        Sandbox::Os => refuse_weakened_sandbox(&claude_settings_sources(&worktree)?)?,
+        Sandbox::External => {
+            settings["permissions"]["allow"] = json!(["Bash"]);
+            settings["sandbox"] = json!({ "enabled": false });
+        }
+    }
     fs::write(&settings_path, serde_json::to_string_pretty(&settings)?)
         .with_context(|| format!("{}", settings_path.display()))?;
     Ok((utf8(&settings_path)?.into(), worktree))
@@ -550,14 +586,25 @@ fn refuse_weakened_sandbox(sources: &[(PathBuf, bool)]) -> Result<()> {
 /// Codex's JSONL event log (the commands it ran and their output), the last message goes to `-o`.
 /// Not `--ephemeral`: the wrap-up resumes the session, which then lives in that run-scoped home.
 /// The reply goes outside `out/`: a Claude reviewer may write there and could plant a symlink
-/// that Codex, writing unsandboxed, would follow.
-pub fn codex(worktree: &Path, runroot: &Path, out_name: &str, user_auth: &Path) -> Result<Launch> {
+/// that Codex, writing unsandboxed, would follow. With [`Sandbox::External`] it runs
+/// `-s danger-full-access`: Codex's own sandbox may not start nested in a container.
+pub fn codex(
+    worktree: &Path,
+    runroot: &Path,
+    out_name: &str,
+    user_auth: &Path,
+    sandbox: Sandbox,
+) -> Result<Launch> {
     let worktree = absolute(worktree)?;
     fs::create_dir_all(runroot.join("replies"))
         .with_context(|| format!("{}", runroot.display()))?;
     let (runroot, env) = codex_home(runroot, user_auth)?;
     let reply = runroot.join("replies").join(out_name);
-    let args = ["exec", "--json", "-s", "read-only", "-C", utf8(&worktree)?];
+    let mode = match sandbox {
+        Sandbox::Os => "read-only",
+        Sandbox::External => "danger-full-access",
+    };
+    let args = ["exec", "--json", "-s", mode, "-C", utf8(&worktree)?];
     let args = [&args[..], &["-o", utf8(&reply)?], &CODEX_NO_STARTUP, &["-"]].concat();
     Ok(Launch {
         program: "codex".into(),
@@ -710,7 +757,7 @@ mod tests {
         fs::create_dir_all(&wt).unwrap();
         fs::create_dir_all(&git).unwrap();
 
-        let launch = claude(&wt, &git, &run).unwrap();
+        let launch = claude(&wt, &git, &run, Sandbox::Os).unwrap();
 
         let settings_path = root.join("run/claude-settings.json");
         assert_eq!(launch.program, "claude");
@@ -788,7 +835,7 @@ mod tests {
         let wt = root.join("wt");
         fs::create_dir_all(wt.join("sub")).unwrap();
         // `wt/sub/..` is wt; the settings must name the resolved, absolute path.
-        let launch = claude(&wt.join("sub/.."), &wt, &root.join("run")).unwrap();
+        let launch = claude(&wt.join("sub/.."), &wt, &root.join("run"), Sandbox::Os).unwrap();
         let s: Value = serde_json::from_str(
             &fs::read_to_string(root.join("run/claude-settings.json")).unwrap(),
         )
@@ -880,7 +927,9 @@ mod tests {
             r#"{"sandbox":{"excludedCommands":["git"]}}"#,
         )
         .unwrap();
-        let err = claude(&wt, &wt, &root.join("run")).unwrap_err().to_string();
+        let err = claude(&wt, &wt, &root.join("run"), Sandbox::Os)
+            .unwrap_err()
+            .to_string();
         assert!(
             err.contains("wt/.claude/settings.json: sandbox.excludedCommands"),
             "{err}"
@@ -900,9 +949,9 @@ mod tests {
         fs::create_dir_all(auth.parent().unwrap()).unwrap();
         fs::write(&auth, "{}").unwrap();
 
-        let launch = codex(&wt, &run, "security.json", &auth).unwrap();
+        let launch = codex(&wt, &run, "security.json", &auth, Sandbox::Os).unwrap();
         // A second pass of the same run reuses the home.
-        codex(&wt, &run, "intent.json", &auth).unwrap();
+        codex(&wt, &run, "intent.json", &auth, Sandbox::Os).unwrap();
 
         let home = root.join("run/codex-home");
         assert_eq!(launch.program, "codex");
@@ -949,6 +998,70 @@ mod tests {
         fs::remove_dir_all(root).unwrap();
     }
 
+    /// `--sandbox external` drops only the inner sandbox: Claude's sandbox is off with Bash
+    /// allowed and every deny rule kept, Codex runs `danger-full-access`; the env, the clean
+    /// Codex home and the startup-file flags are the same as with the OS sandbox.
+    #[test]
+    fn an_external_sandbox_drops_only_the_inner_sandbox() {
+        let root = fresh_temp_dir("rreview-test").unwrap();
+        let (wt, auth) = (root.join("wt"), root.join("auth.json"));
+        fs::create_dir_all(wt.join(".claude")).unwrap();
+        fs::write(&auth, "{}").unwrap();
+        // Would refuse an OS-sandboxed launch; there is no sandbox for it to weaken here.
+        fs::write(
+            wt.join(".claude/settings.json"),
+            r#"{"sandbox":{"excludedCommands":["git"]}}"#,
+        )
+        .unwrap();
+        assert!(claude(&wt, &wt, &root.join("os"), Sandbox::Os).is_err());
+        let ext = claude(&wt, &wt, &root.join("ext"), Sandbox::External).unwrap();
+        let settings = |run: &str| -> Value {
+            serde_json::from_str(
+                &fs::read_to_string(root.join(run).join("claude-settings.json")).unwrap(),
+            )
+            .unwrap()
+        };
+        let s = settings("ext");
+        assert_eq!(s["sandbox"], json!({ "enabled": false }));
+        assert_eq!(s["permissions"]["allow"], json!(["Bash"]));
+        assert_eq!(s["permissions"]["deny"].as_array().unwrap().len(), 10);
+        assert_eq!(s["disableBundledSkills"], true);
+        assert!(ext.args.contains(&"--safe-mode".to_string()));
+        assert!(!ext.inherits("HOME") && ext.inherits("CLAUDE_CODE_OAUTH_TOKEN"));
+        assert!(ext.env.iter().any(|(k, _)| k == "ZDOTDIR"));
+        assert!(ext.env.iter().any(|(k, _)| k == "CLAUDE_CODE_SHELL"));
+
+        let os = codex(&wt, &root.join("x"), "r.txt", &auth, Sandbox::Os).unwrap();
+        let ext = codex(&wt, &root.join("y"), "r.txt", &auth, Sandbox::External).unwrap();
+        let swapped: Vec<_> = os
+            .args
+            .iter()
+            .map(|a| {
+                let a = a.replace(
+                    root.join("x").to_str().unwrap(),
+                    root.join("y").to_str().unwrap(),
+                );
+                if a == "read-only" {
+                    "danger-full-access".into()
+                } else {
+                    a
+                }
+            })
+            .collect();
+        assert_eq!(ext.args, swapped);
+        assert!(
+            ext.args
+                .windows(2)
+                .any(|w| w == ["-s", "danger-full-access"])
+        );
+        assert_eq!(ext.inherit, os.inherit);
+        assert_eq!(
+            ext.env.iter().map(|(k, _)| k.as_str()).collect::<Vec<_>>(),
+            ["CODEX_HOME", "ZDOTDIR"]
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
     /// A `.zshenv` in `HOME` exports a canary; zsh run with a reviewer's env must not see it,
     /// while the same env without `ZDOTDIR` does, or the check proves nothing.
     #[test]
@@ -969,9 +1082,11 @@ mod tests {
             fs::write(home.join(f), format!("export RREVIEW_STARTUP={f}\n")).unwrap();
         }
         let launches = [
-            claude(&wt, &wt, &root.join("c")).unwrap(),
+            claude(&wt, &wt, &root.join("c"), Sandbox::Os).unwrap(),
+            claude(&wt, &wt, &root.join("ce"), Sandbox::External).unwrap(),
             claude_tui(&wt, &wt, &root.join("ct")).unwrap(),
-            codex(&wt, &root.join("x"), "r.json", &auth).unwrap(),
+            codex(&wt, &root.join("x"), "r.json", &auth, Sandbox::Os).unwrap(),
+            codex(&wt, &root.join("xe"), "r.json", &auth, Sandbox::External).unwrap(),
             codex_tui(&wt, &root.join("xt"), &auth).unwrap(),
         ];
         for (i, mut launch) in launches.into_iter().enumerate() {
@@ -1050,6 +1165,7 @@ mod tests {
             &root.join("run"),
             "x.json",
             &root.join("missing/auth.json"),
+            Sandbox::Os,
         )
         .unwrap_err();
         assert!(
