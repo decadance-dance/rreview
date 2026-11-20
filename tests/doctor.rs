@@ -127,6 +127,58 @@ fn passes_with_working_isolation_and_launches_through_the_builders() {
     assert!(run.log.contains("/codex-home\n"), "{}", run.log);
 }
 
+/// On a host where the sandbox cannot start (a container without bubblewrap),
+/// `--sandbox external` launches without it and skips, never passes, what only it enforces;
+/// the default still fails closed there.
+#[test]
+fn an_external_sandbox_skips_the_write_checks_instead_of_passing_them() {
+    let scenario = [("FAKE_CLAUDE", "no-sandbox"), ("FAKE_CODEX", "leak")];
+    let run = doctor_with(&["--sandbox", "external"], ALL, &scenario);
+    assert!(run.passed, "{}", run.stdout);
+    for line in [
+        "warn  sandbox: external: reviewers run without rreview's own sandbox",
+        "skip  claude sandbox: write into the worktree: not enforced: --sandbox external",
+        "skip  claude sandbox: git commit: not enforced: --sandbox external",
+        "skip  claude sandbox: git branch: not enforced: --sandbox external",
+        "skip  claude: shell startup files: not enforced: --sandbox external",
+        "skip  codex sandbox: write into the worktree: not enforced: --sandbox external",
+        "ok    claude sandbox: git diff: works",
+        "ok    claude --safe-mode: planted project hook: did not fire",
+        "ok    codex: shell startup files: not read",
+        "ok    codex: user AGENTS.md: not loaded",
+    ] {
+        assert!(
+            run.stdout.contains(line),
+            "missing {line:?} in\n{}",
+            run.stdout
+        );
+    }
+    assert!(
+        !run.stdout.contains("worktree: blocked\n"),
+        "{}",
+        run.stdout
+    );
+    assert!(
+        run.log
+            .contains("codex exec --json -s danger-full-access -C /"),
+        "{}",
+        run.log
+    );
+    assert!(!run.log.contains("read-only"), "{}", run.log);
+
+    let run = doctor(ALL, &[("FAKE_CLAUDE", "no-sandbox")]);
+    assert!(!run.passed, "{}", run.stdout);
+    assert!(
+        run.stdout.contains("ok    sandbox: os") && run.stdout.contains("FAIL  claude self-test"),
+        "{}",
+        run.stdout
+    );
+
+    let run = doctor_with(&["--sandbox", "external", "--runner", "orca"], ALL, &[]);
+    assert!(!run.passed);
+    assert!(!run.log.contains("claude -p"), "{}", run.log);
+}
+
 #[test]
 fn fails_when_a_binary_is_missing() {
     let run = doctor(&["claude", "gh"], &[]);

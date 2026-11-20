@@ -76,6 +76,7 @@ pub struct Headless {
     pub git_common_dir: PathBuf,
     pub runroot: PathBuf,
     pub codex_auth: PathBuf,
+    pub sandbox: launch::Sandbox,
 }
 
 impl Headless {
@@ -86,8 +87,12 @@ impl Headless {
     fn launch(&self, pass: &Pass) -> Result<Launch> {
         let dir = self.scratch(pass);
         let mut launch = match pass.agent {
-            Agent::Claude => launch::claude(&self.worktree, &self.git_common_dir, &dir)?,
-            Agent::Codex => launch::codex(&self.worktree, &dir, REPLY, &self.codex_auth)?,
+            Agent::Claude => {
+                launch::claude(&self.worktree, &self.git_common_dir, &dir, self.sandbox)?
+            }
+            Agent::Codex => {
+                launch::codex(&self.worktree, &dir, REPLY, &self.codex_auth, self.sandbox)?
+            }
         };
         // Codex's options go before its trailing `-` (the prompt on stdin).
         let stdin = (pass.agent == Agent::Codex).then(|| launch.args.pop());

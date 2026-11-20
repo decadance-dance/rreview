@@ -24,6 +24,7 @@ use crate::runner::{Agent, Headless, Pass, Runner};
 
 const WRAP_UP: &str = "Time is up. Stop reviewing now and reply with only the JSON object described in the first message, covering what you have checked so far.";
 const RETRY: &str = "Your reply was rejected. Reply again with only the JSON described in the first message, fixed; nothing else.";
+const EXTERNAL_NOTE: &str = "warning: --sandbox external: reviewers run without rreview's own sandbox (spec §3); the container they run in must be the isolation boundary";
 const WRAP_UP_TIMEOUT: Duration = Duration::from_secs(180);
 /// The passes after the panel, in order.
 const PIPELINE: [&str; 2] = ["coordinator", "judge"];
@@ -50,6 +51,8 @@ pub struct Args {
     pub budget: Duration,
     /// `--runner orca`: passes in visible Orca terminals (spec §4).
     pub orca: bool,
+    /// What confines the reviewers' commands (spec §3).
+    pub sandbox: launch::Sandbox,
 }
 
 #[derive(Deserialize)]
@@ -140,6 +143,14 @@ impl Settings {
 
 /// Runs the review; returns the exit code: 0 no gated findings, 1 gated findings, 2 failed.
 pub fn run(args: &Args) -> Result<u8> {
+    if args.sandbox == launch::Sandbox::External {
+        // The orca runner needs the desktop app, so it never runs in the outer container, and
+        // its Codex TUI is confined to `out/` by the very sandbox this flag turns off.
+        if args.orca {
+            bail!("--sandbox external works only with --runner headless (spec §3)");
+        }
+        eprintln!("{EXTERNAL_NOTE}");
+    }
     let settings = Settings::new(args)?;
     let panel: Vec<&Role> = match &args.only {
         Some(id) => vec![panelist::role(id)?],
@@ -258,7 +269,8 @@ pub fn run(args: &Args) -> Result<u8> {
         "run_id": run_id,
         "pr": { "number": pr.number, "title": pr.title, "url": pr.url, "repo": format!("{owner}/{name}"),
                 "head_ref": pr.head_ref_name, "base_ref": pr.base_ref_name },
-        "base": base, "head": head, "runner": if args.orca { "orca" } else { "headless" }, "roles": roles,
+        "base": base, "head": head, "runner": if args.orca { "orca" } else { "headless" },
+        "sandbox": args.sandbox.as_str(), "roles": roles,
         "versions": { "claude": version("claude", deadline), "codex": version("codex", deadline) },
     });
     fs::write(
@@ -342,6 +354,7 @@ pub fn run(args: &Args) -> Result<u8> {
             worktree: wt.path.clone(),
             runroot: runroot.clone(),
             codex_auth: launch::user_codex_auth()?,
+            sandbox: args.sandbox,
         })
     };
     let ctx = Ctx {
@@ -510,6 +523,7 @@ pub fn run(args: &Args) -> Result<u8> {
         head: head.into(),
         passes,
         degraded,
+        sandbox: args.sandbox.as_str().into(),
     };
     fs::write(
         runroot.join("result.json"),

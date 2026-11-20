@@ -26,6 +26,14 @@ pub struct ReviewResult {
     /// A panelist or the judge did not complete: the review ran without one of its
     /// independent passes.
     pub degraded: bool,
+    /// `os`, or `external` when the reviewers ran without rreview's own sandbox (spec §3);
+    /// a result written before this field existed was sandboxed.
+    #[serde(default = "os")]
+    pub sandbox: String,
+}
+
+fn os() -> String {
+    "os".into()
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -169,6 +177,13 @@ pub fn summary(r: &ReviewResult) -> String {
             s,
             "DEGRADED: not every independent pass completed (failed: {}).",
             failed.join(", ")
+        );
+    }
+    if r.sandbox != "os" {
+        let _ = writeln!(
+            s,
+            "SANDBOX {}: the reviewers ran without rreview's own sandbox; only the container they ran in confined them.",
+            r.sandbox.to_uppercase()
         );
     }
     s

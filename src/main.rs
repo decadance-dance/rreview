@@ -14,6 +14,7 @@ use std::time::Duration;
 
 use clap::{Parser, Subcommand, ValueEnum};
 
+use launch::Sandbox;
 use result::Gate;
 use runner::Agent;
 
@@ -79,6 +80,10 @@ struct Cli {
     /// Run this panelist alone, without coordinator and judge (a development flag).
     #[arg(long)]
     only: Option<String>,
+    /// What confines the reviewers: `os`, rreview's own sandbox, or `external`, none of its
+    /// own, for a container that already is the isolation boundary (headless runner only).
+    #[arg(long, value_enum, default_value_t = Sandbox::Os)]
+    sandbox: Sandbox,
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -95,6 +100,10 @@ enum Command {
         /// `orca` also runs the self-test through the orca runner (from an Orca terminal).
         #[arg(long, value_enum, default_value_t = RunnerKind::Headless)]
         runner: RunnerKind,
+        /// `external` checks the launches a `--sandbox external` review uses; the
+        /// write-protection checks are then skipped, not passed.
+        #[arg(long, value_enum, default_value_t = Sandbox::Os)]
+        sandbox: Sandbox,
     },
     /// Print the result of the latest finished review of a PR, or of a run dir.
     Show {
@@ -160,8 +169,8 @@ fn main() -> ExitCode {
     let cli = Cli::parse();
     // Spec §2: exit 2 when the review failed, whether in prepare or in a pass.
     let code = match cli.command {
-        Some(Command::Doctor { runner }) => {
-            return match doctor::run(matches!(runner, RunnerKind::Orca)) {
+        Some(Command::Doctor { runner, sandbox }) => {
+            return match doctor::run(matches!(runner, RunnerKind::Orca), sandbox) {
                 Ok(true) => ExitCode::SUCCESS,
                 Ok(false) => ExitCode::FAILURE,
                 Err(e) => {
@@ -200,6 +209,7 @@ fn main() -> ExitCode {
                 timeout: Duration::from_secs(cli.timeout),
                 budget: Duration::from_secs(cli.budget),
                 orca: matches!(cli.runner, RunnerKind::Orca),
+                sandbox: cli.sandbox,
             })
         }
     };
