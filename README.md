@@ -98,6 +98,10 @@ cleared the gate, so a script or an agent can act on it.
 * **`rreview doctor` checks it**: a self-test on a throwaway repo through the same launch code a
   review uses (writes, commits and branches fail, a planted hook does not fire, startup files stay
   out); a check passes only when the effects on disk and the agent's own logs agree.
+* **Inside a container**: `--sandbox external` runs reviewers without rreview's own sandbox, for a
+  container that already is the boundary (Claude's sandbox needs bubblewrap there). The rest of the
+  isolation stays, and `result.json` and the summary say the run was not sandboxed by rreview
+  ([spec §3](docs/VISION-AND-SPEC.md#3-isolation-and-sandbox-the-security-core)).
 
 ### 🖥️ Headless or in plain sight
 > *The same review runs like a CI job or with every reviewer in a terminal you can watch.*

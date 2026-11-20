@@ -1474,6 +1474,7 @@ fn full_pipeline_gates_findings_and_writes_result_json() {
     assert_eq!(result["base"], fx.base.as_str());
     assert_eq!(result["head"], fx.head.as_str());
     assert_eq!(result["degraded"], false);
+    assert_eq!(result["sandbox"], "os");
     let passes: Vec<_> = result["passes"]
         .as_array()
         .unwrap()
@@ -1522,6 +1523,21 @@ fn full_pipeline_gates_findings_and_writes_result_json() {
             .contains("1 gated findings (2 before the gate, 2 dropped candidates)")
     );
     assert!(!run.stdout.contains("DEGRADED"));
+    assert!(!run.stdout.contains("SANDBOX") && !run.stderr.contains("--sandbox"));
+    assert_eq!(meta["sandbox"], "os");
+    // The OS sandbox, required to start, for every pass.
+    assert!(
+        run.log.contains("codex exec --json -s read-only -C "),
+        "{run:?}"
+    );
+    for role in ["reliability", "coordinator"] {
+        let settings = fx
+            .runroot()
+            .join(format!("scratch/{role}/claude-settings.json"));
+        let s: Value = serde_json::from_str(&fs::read_to_string(settings).unwrap()).unwrap();
+        assert_eq!(s["sandbox"]["failIfUnavailable"], true, "{role}");
+        assert!(s["permissions"].get("allow").is_none(), "{role}");
+    }
 
     // The security lens is blind: no PR text, no task.
     let security = fx.prompt_of("security");
@@ -1550,6 +1566,75 @@ fn full_pipeline_gates_findings_and_writes_result_json() {
     let judge = fx.prompt_of("judge");
     assert!(judge.contains("\"Handle the error\"") && judge.contains("\"Overflow\""));
     fx.assert_worktree_removed();
+}
+
+/// `--sandbox external` launches every pass without the inner sandbox, says so on stderr, in
+/// the summary, `meta.json` and `result.json`, and `show` repeats it; the orca runner refuses it.
+#[test]
+fn an_external_sandbox_is_opt_in_and_recorded() {
+    let fx = fixture();
+    let run = fx.full(&["--sandbox", "external"], &pipeline());
+    assert_eq!(run.code, Some(1), "{run:?}");
+    assert!(
+        run.stderr
+            .contains("warning: --sandbox external: reviewers run without rreview's own sandbox"),
+        "{run:?}"
+    );
+    let result = fx.result().unwrap();
+    assert_eq!(result["sandbox"], "external");
+    let meta: Value =
+        serde_json::from_str(&fs::read_to_string(fx.runroot().join("meta.json")).unwrap()).unwrap();
+    assert_eq!(meta["sandbox"], "external");
+    let note = "SANDBOX EXTERNAL: the reviewers ran without rreview's own sandbox";
+    assert!(run.stdout.contains(note), "{run:?}");
+    // Every Codex pass, the judge included, and no read-only one.
+    assert_eq!(
+        run.log
+            .matches("codex exec --json -s danger-full-access -C ")
+            .count(),
+        3,
+        "{run:?}"
+    );
+    assert!(!run.log.contains("read-only"), "{run:?}");
+    for role in ["reliability", "coordinator"] {
+        let settings = fx
+            .runroot()
+            .join(format!("scratch/{role}/claude-settings.json"));
+        let s: Value = serde_json::from_str(&fs::read_to_string(settings).unwrap()).unwrap();
+        assert_eq!(s["sandbox"], json!({"enabled": false}), "{role}");
+        assert_eq!(s["permissions"]["allow"], json!(["Bash"]), "{role}");
+        assert!(
+            s["permissions"]["deny"]
+                .as_array()
+                .unwrap()
+                .contains(&json!("Write")),
+            "{role}"
+        );
+    }
+    assert!(
+        run.log.contains("claude -p --safe-mode --settings "),
+        "{run:?}"
+    );
+    let shown = fx.rreview(&fx.pr(), &["show", fx.runroot().to_str().unwrap()], &[]);
+    assert!(shown.stdout.contains(note), "{shown:?}");
+
+    // A result.json written before the field existed reads as sandboxed.
+    let mut old = result.clone();
+    old.as_object_mut().unwrap().remove("sandbox");
+    fs::write(fx.runroot().join("result.json"), old.to_string()).unwrap();
+    let shown = fx.rreview(&fx.pr(), &["show", fx.runroot().to_str().unwrap()], &[]);
+    assert_eq!(shown.code, Some(1), "{shown:?}");
+    assert!(!shown.stdout.contains("SANDBOX"), "{shown:?}");
+
+    let fx = fixture();
+    let run = fx.full(&["--sandbox", "external", "--runner", "orca"], &pipeline());
+    assert_eq!(run.code, Some(2), "{run:?}");
+    assert!(
+        run.stderr
+            .contains("--sandbox external works only with --runner headless"),
+        "{run:?}"
+    );
+    assert!(!run.log.contains("orca "), "{run:?}");
 }
 
 #[test]
