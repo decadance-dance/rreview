@@ -152,24 +152,25 @@ dir on stderr; `result.json`, the progress log and each pass's validated output 
 ## 🧭 How it works
 
 ```mermaid
+---
+config:
+  flowchart:
+    wrappingWidth: 400
+---
 flowchart TB
     pr(["<b>GitHub PR</b><br/>gh pr view · head and base"])
-    wt["<b>Review worktree</b><br/>detached at the PR head<br/>never the author's checkout"]
+    wt["<b>Review worktree</b><br/>detached at the PR head, never the author's checkout<br/>write-protected by every reviewer's sandbox"]
 
-    subgraph panel["Panel · parallel, sandboxed, repo write-protected"]
-        direction LR
-        intent["<b>intent_contracts</b><br/>codex"]
-        rel["<b>reliability</b><br/>claude"]
-        sec["<b>security</b><br/>codex · diff only"]
-    end
+    intent["<b>intent_contracts</b><br/>codex"]
+    rel["<b>reliability</b><br/>claude"]
+    sec["<b>security</b><br/>codex · diff only"]
 
-    coord["<b>Coordinator</b> · claude<br/>dedupe · disprove · account<br/>for every candidate"]
+    coord["<b>Coordinator</b> · claude<br/>reads the validated envelopes<br/>dedupe · disprove · account for every candidate"]
     judge["<b>Judge</b> · codex<br/>re-examines drops only"]
     gate{{"<b>Gate</b><br/>P0-P2 · conf ≥ 0.5"}}
     out(["<b>result.json</b> · summary<br/>exit 0 · 1 · 2"])
 
-    pr --> wt --> panel
-    panel -- "validated envelopes" --> coord
+    pr --> wt --> intent & rel & sec --> coord
     coord -- "dropped candidates" --> judge
     coord -- "kept findings" --> gate
     judge -- "restored findings" --> gate
@@ -179,7 +180,6 @@ flowchart TB
     classDef verdict fill:#fff7ed,stroke:#f97316,color:#0f172a
     class intent,rel,sec accent
     class gate,out verdict
-    style panel fill:#f0fdf4,stroke:#16a34a,stroke-width:2px,color:#16a34a
 ```
 
 - **Prepare**: rreview resolves the PR with `gh`, fetches only missing commits, and checks the head
